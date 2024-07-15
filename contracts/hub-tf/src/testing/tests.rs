@@ -3,7 +3,7 @@ use std::str::FromStr;
 use cosmwasm_std::{
     testing::{mock_env, mock_info, MockApi, MockStorage, MOCK_CONTRACT_ADDR},
     to_json_binary, Addr, BankMsg, Coin, CosmosMsg, Decimal, DistributionMsg, Order, OwnedDeps,
-    ReplyOn, StdError, SubMsg, Uint128, WasmMsg,
+    ReplyOn, StdError, StdResult, SubMsg, Uint128, WasmMsg,
 };
 use pfc_steak::{
     hub::{
@@ -2053,4 +2053,50 @@ fn dust_return_denom() {
             reply_on: ReplyOn::Never
         }
     );
+}
+#[test]
+fn test_128() {
+    let mut deps = mock_dependencies();
+
+    let user_addr = deps.api.addr_make("testing");
+
+    crate::state::unbond_requests()
+        .save(
+            deps.as_mut().storage,
+            (128u64, user_addr.as_str()),
+            &UnbondRequest {
+                id: 128u64,
+                user: user_addr.clone(),
+                shares: Uint128::new(18084001808),
+            },
+        )
+        .unwrap();
+
+    let mut_deps = deps.as_mut();
+
+    let elements = unbond_requests()
+        .range(mut_deps.storage, None, None, Order::Ascending)
+        .take(10)
+        .map(|item| {
+            let (_, v) = item?;
+            Ok(v.into())
+        })
+        .collect::<StdResult<Vec<UnbondRequest>>>()
+        .unwrap();
+    assert_eq!(elements.len(), 1);
+    let elements = unbond_requests()
+        .idx
+        .user
+        .prefix(user_addr.to_string())
+        //  .prefix(contract.to_string())
+        .range(mut_deps.storage, None, None, Order::Ascending)
+        .take(100)
+        .map(|item| {
+            let (_, v) = item?;
+            Ok(v.into())
+        })
+        .collect::<StdResult<Vec<UnbondRequest>>>()
+        .unwrap();
+
+    assert_eq!(elements.len(), 1);
 }
