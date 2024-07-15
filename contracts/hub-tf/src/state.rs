@@ -132,8 +132,8 @@ pub fn unbond_requests_user_idx(_pk: &[u8], d: &UnbondRequest) -> String {
     d.user.to_string()
 }
 
-pub fn unbond_requests<'a>(
-) -> IndexedMap<'a, (u64, &'a str), UnbondRequest, UnbondRequestsIndexes<'a>> {
+pub fn unbond_requests<'a>()
+-> IndexedMap<'a, (u64, &'a str), UnbondRequest, UnbondRequestsIndexes<'a>> {
     IndexedMap::new(
         UNBOND_KEY_V101,
         UnbondRequestsIndexes {
