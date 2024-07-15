@@ -2079,7 +2079,7 @@ fn test_128() {
         .take(10)
         .map(|item| {
             let (_, v) = item?;
-            Ok(v.into())
+            Ok(v)
         })
         .collect::<StdResult<Vec<UnbondRequest>>>()
         .unwrap();
@@ -2093,7 +2093,7 @@ fn test_128() {
         .take(100)
         .map(|item| {
             let (_, v) = item?;
-            Ok(v.into())
+            Ok(v)
         })
         .collect::<StdResult<Vec<UnbondRequest>>>()
         .unwrap();
