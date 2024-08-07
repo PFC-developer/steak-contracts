@@ -353,11 +353,10 @@ pub fn harvest(deps: DepsMut, env: Env) -> StdResult<Response> {
 
 /// NOTE:
 /// 1. When delegation Native denom here, we don't need to use a `SubMsg` to handle the received
-///    coins,
-/// because we have already withdrawn all claimable staking rewards previously in the same atomic
-/// execution.
+///    coins, because we have already withdrawn all claimable staking rewards previously in the same
+///    atomic execution.
 /// 2. Same as with `bond`, in the latest implementation we only delegate staking rewards with the
-/// validator that has the smallest delegation amount.
+///    validator that has the smallest delegation amount.
 pub fn reinvest(deps: DepsMut, env: Env) -> StdResult<Response> {
     let state = State::default();
     let denom = state.denom.load(deps.storage)?;
