@@ -712,27 +712,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pfc-steak-hub-dao"
-version = "3.0.18"
-dependencies = [
- "cosmwasm-std",
- "cw-item-set",
- "cw-ownable",
- "cw-storage-plus 1.2.0",
- "cw2 1.1.2",
- "osmosis-std-derive",
- "pfc-dust-collector",
- "pfc-fee-split 1.5.0",
- "pfc-steak",
- "pfc-steak-dao",
- "prost",
- "prost-types",
- "protobuf",
- "schemars",
- "serde",
-]
-
-[[package]]
 name = "pfc-steak-hub-tf"
 version = "3.0.19"
 dependencies = [
