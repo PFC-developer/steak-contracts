@@ -113,6 +113,18 @@ pub fn previous_batches(
         })
         .collect()
 }
+pub fn previous_batches_unreconciled(deps: Deps) -> StdResult<Vec<Batch>> {
+    state::previous_batches()
+        .idx
+        .reconciled
+        .prefix("false".into())
+        .range(deps.storage, None, None, Order::Ascending)
+        .map(|item| {
+            let (_, v) = item?;
+            Ok(v)
+        })
+        .collect()
+}
 
 pub fn unbond_requests_by_batch(
     deps: Deps,

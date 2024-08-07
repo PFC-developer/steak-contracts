@@ -1,5 +1,6 @@
 [workspace]
-members = ["contracts/token", "contracts/hub", "contracts/hub-tf", "packages/*"]
+members = ["contracts/token", "contracts/hub", "contracts/hub-tf",
+    "packages/*"]
 resolver = '1'
 
 [profile.release.package.pfc-steak]

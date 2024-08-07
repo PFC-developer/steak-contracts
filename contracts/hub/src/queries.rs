@@ -13,6 +13,7 @@ use pfc_steak::hub::{
 use crate::{
     helpers::{query_cw20_total_supply, query_delegations},
     state::State,
+    types::BooleanKey,
 };
 
 const MAX_LIMIT: u32 = 30;
@@ -110,7 +111,21 @@ pub fn previous_batches(
         })
         .collect()
 }
+pub fn previous_batches_unreconciled(deps: Deps) -> StdResult<Vec<Batch>> {
+    let state = State::default();
 
+    state
+        .previous_batches
+        .idx
+        .reconciled
+        .prefix(BooleanKey::new(false))
+        .range(deps.storage, None, None, Order::Ascending)
+        .map(|item| {
+            let (_, v) = item?;
+            Ok(v)
+        })
+        .collect()
+}
 pub fn unbond_requests_by_batch(
     deps: Deps,
     id: u64,
