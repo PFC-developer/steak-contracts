@@ -212,6 +212,7 @@ pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
             start_after,
             limit,
         } => to_json_binary(&queries::unbond_requests_by_user(deps, user, start_after, limit)?),
+        QueryMsg::Unreconciled {} => to_json_binary(&queries::previous_batches_unreconciled(deps)?),
     }
 }
 

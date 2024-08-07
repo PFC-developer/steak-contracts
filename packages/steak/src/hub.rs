@@ -188,6 +188,8 @@ pub enum QueryMsg {
     State {},
     /// The current batch on unbonding requests pending submission. Response: `PendingBatch`
     PendingBatch {},
+    /// list of batches with reconciled == false
+    Unreconciled {},
     /// Query an individual batch that has previously been submitted for unbonding but have not yet
     /// fully withdrawn. Response: `Batch`
     PreviousBatch(u64),

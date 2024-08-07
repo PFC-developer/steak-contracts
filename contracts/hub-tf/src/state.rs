@@ -144,7 +144,7 @@ pub fn unbond_requests<'a>()
 
 pub struct PreviousBatchesIndexes<'a> {
     // pk goes to second tuple element
-    pub reconciled: MultiIndex<'a, String, Batch, String>,
+    pub reconciled: MultiIndex<'a, String, Batch, u64>,
 }
 
 impl<'a> IndexList<Batch> for PreviousBatchesIndexes<'a> {

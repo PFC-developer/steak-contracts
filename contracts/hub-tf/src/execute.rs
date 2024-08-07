@@ -720,7 +720,7 @@ pub fn reconcile(deps: DepsMut, env: Env) -> StdResult<Response> {
     let all_batches = previous_batches()
         .idx
         .reconciled
-        .prefix("false".into())
+        .prefix("false".to_string())
         .range(deps.storage, None, None, Order::Ascending)
         .map(|item| {
             let (_, v) = item?;
