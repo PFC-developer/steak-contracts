@@ -18,8 +18,8 @@ use pfc_steak::{
 use crate::{
     contract::{REPLY_INSTANTIATE_TOKEN, REPLY_REGISTER_RECEIVED_COINS},
     helpers::{
-        get_denom_balance, parse_received_fund, query_cw20_total_supply, query_delegation,
-        query_delegations,
+        get_denom_balance, parse_received_fund, query_all_delegations, query_cw20_total_supply,
+        query_delegation, query_delegations,
     },
     math::{
         compute_mint_amount, compute_redelegations_for_rebalancing,
@@ -29,7 +29,6 @@ use crate::{
     state::State,
     types::{Coins, Delegation, Redelegation},
 };
-
 //--------------------------------------------------------------------------------------------------
 // Instantiation
 //--------------------------------------------------------------------------------------------------
@@ -136,23 +135,11 @@ pub fn bond(
     let steak_token = state.steak_token.load(deps.storage)?;
     let validators = state.validators_active.load(deps.storage)?;
 
-    let mut validators_wl: HashSet<String> =
-        HashSet::from_iter(state.validators.load(deps.storage)?);
-    for v in validators.iter() {
-        validators_wl.remove(v);
-    }
-    let non_active_validator_list = Vec::from_iter(validators_wl);
-
     // Query the current delegations made to validators, and find the validator with the smallest
     // delegated amount through a linear search
     // The code for linear search is a bit uglier than using `sort_by` but cheaper: O(n) vs O(n *
     // log(n))
-    let delegations_non_active = query_delegations(
-        &deps.querier,
-        &non_active_validator_list,
-        &env.contract.address,
-        &denom,
-    )?;
+    let all_delegations = query_all_delegations(&deps.querier, &env.contract.address)?;
     let delegations = query_delegations(&deps.querier, &validators, &env.contract.address, &denom)?;
 
     let mut validator = &delegations[0].validator;
@@ -171,8 +158,7 @@ pub fn bond(
 
     // Query the current supply of Steak and compute the amount to mint
     let usteak_supply = query_cw20_total_supply(&deps.querier, &steak_token)?;
-    let usteak_to_mint =
-        compute_mint_amount(usteak_supply, amount_to_bond, &delegations, &delegations_non_active);
+    let usteak_to_mint = compute_mint_amount(usteak_supply, amount_to_bond, &all_delegations);
     state.prev_denom.save(
         deps.storage,
         &get_denom_balance(&deps.querier, env.contract.address.clone(), denom.clone())?,
@@ -515,20 +501,16 @@ pub fn submit_batch(deps: DepsMut, env: Env) -> StdResult<Response> {
     for v in validators.iter() {
         validators_active.remove(v);
     }
-    let active_validator_list = Vec::from_iter(validators_active);
+    //    let active_validator_list = Vec::from_iter(validators_active);
 
     // for unbonding we still need to look at
-    let delegations = query_delegations(&deps.querier, &validators, &env.contract.address, &denom)?;
-    let delegations_active =
-        query_delegations(&deps.querier, &active_validator_list, &env.contract.address, &denom)?;
+    let delegations = query_all_delegations(&deps.querier, &env.contract.address)?;
+    //  let delegations_active =
+    //     query_delegations(&deps.querier, &active_validator_list, &env.contract.address, &denom)?;
     let usteak_supply = query_cw20_total_supply(&deps.querier, &steak_token)?;
 
-    let amount_to_bond = compute_unbond_amount(
-        usteak_supply,
-        pending_batch.usteak_to_burn,
-        &delegations,
-        &delegations_active,
-    );
+    let amount_to_bond =
+        compute_unbond_amount(usteak_supply, pending_batch.usteak_to_burn, &delegations);
     let new_undelegations = compute_undelegations(amount_to_bond, &delegations, &denom);
 
     // NOTE: Regarding the `amount_unclaimed` value
@@ -743,10 +725,10 @@ pub fn withdraw_unbonded(
 pub fn rebalance(deps: DepsMut, env: Env, minimum: Uint128) -> StdResult<Response> {
     let state = State::default();
     let denom = state.denom.load(deps.storage)?;
-    let validators = state.validators.load(deps.storage)?;
+    //let validators = state.validators.load(deps.storage)?;
     let validators_active = state.validators_active.load(deps.storage)?;
 
-    let delegations = query_delegations(&deps.querier, &validators, &env.contract.address, &denom)?;
+    let delegations = query_all_delegations(&deps.querier, &env.contract.address)?;
 
     let new_redelegations =
         compute_redelegations_for_rebalancing(validators_active, &delegations, minimum);

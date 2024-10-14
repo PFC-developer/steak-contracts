@@ -1,4 +1,4 @@
-use std::{collections::HashSet, iter::FromIterator, str::FromStr};
+use std::{collections::HashSet, str::FromStr};
 
 use cosmwasm_std::{
     Addr, BankMsg, Coin, CosmosMsg, Decimal, DepsMut, DistributionMsg, Env, Event, Order, ReplyOn,
@@ -145,25 +145,11 @@ pub fn bond(
         validators.push(v?);
     }
 
-    let mut validators_wl: HashSet<String> = Default::default();
-    for v in VALIDATORS.items(deps.storage, None, None, Order::Ascending) {
-        validators_wl.insert(v?);
-    }
-    for v in validators.iter() {
-        validators_wl.remove(v);
-    }
-    let non_active_validator_list = Vec::from_iter(validators_wl);
-
     // Query the current delegations made to validators, and find the validator with the smallest
     // delegated amount through a linear search
     // The code for linear search is a bit uglier than using `sort_by` but cheaper: O(n) vs O(n *
     // log(n))
-    let delegations_non_active = query_delegations(
-        &deps.querier,
-        &non_active_validator_list,
-        &env.contract.address,
-        &denom,
-    )?;
+    let delegations_all = query_all_delegations(&deps.querier, &env.contract.address)?;
     let delegations = query_delegations(&deps.querier, &validators, &env.contract.address, &denom)?;
 
     let mut validator = &delegations[0].validator;
@@ -189,12 +175,7 @@ pub fn bond(
     if mint_steak {
         // Query the current supply of Steak and compute the amount to mint
         //   let usteak_supply = steak_minted;
-        let usteak_to_mint = compute_mint_amount(
-            steak_minted,
-            amount_to_bond,
-            &delegations,
-            &delegations_non_active,
-        );
+        let usteak_to_mint = compute_mint_amount(steak_minted, amount_to_bond, &delegations_all);
         state.steak_minted.save(deps.storage, &(steak_minted + usteak_to_mint))?;
         // TODO deal with multiple token returns
         state.prev_denom.save(
@@ -583,20 +564,20 @@ pub fn submit_batch(deps: DepsMut, env: Env) -> StdResult<Response> {
     for v in validators.iter() {
         validators_active.remove(v);
     }
-    let active_validator_list = Vec::from_iter(validators_active);
+    //   let active_validator_list = Vec::from_iter(validators_active);
 
     // for unbonding we still need to look at
     // TODO verify denom
     let delegations = query_all_delegations(&deps.querier, &env.contract.address)?;
-    let delegations_active =
-        query_delegations(&deps.querier, &active_validator_list, &env.contract.address, &denom)?;
+    //  let delegations_active =
+    //     query_delegations(&deps.querier, &active_validator_list, &env.contract.address, &denom)?;
     // let usteak_supply = query_cw20_total_supply(&deps.querier, &steak_token)?;
 
     let amount_to_unbond = compute_unbond_amount(
         usteak_supply,
         pending_batch.usteak_to_burn,
         &delegations,
-        &delegations_active,
+        //   &delegations_active,
     );
 
     let new_undelegations = compute_undelegations(amount_to_unbond, &delegations, &denom);
@@ -846,16 +827,13 @@ pub fn withdraw_unbonded(
 pub fn rebalance(deps: DepsMut, env: Env, minimum: Uint128) -> StdResult<Response> {
     let state = State::default();
     let denom = state.denom.load(deps.storage)?;
-    let mut validators: Vec<String> = Default::default();
-    for v in VALIDATORS.items(deps.storage, None, None, Order::Ascending) {
-        validators.push(v?)
-    }
+
+    let delegations = query_all_delegations(&deps.querier, &env.contract.address)?;
+
     let mut validators_active: Vec<String> = Default::default();
     for v in VALIDATORS_ACTIVE.items(deps.storage, None, None, Order::Ascending) {
         validators_active.push(v?);
     }
-
-    let delegations = query_delegations(&deps.querier, &validators, &env.contract.address, &denom)?;
 
     let new_redelegations =
         compute_redelegations_for_rebalancing(validators_active, &delegations, minimum);

@@ -1,6 +1,6 @@
 [package]
 name = "pfc-steak-token"
-version = "2.0.2"
+version = "3.0.20"
 authors = ["larry <gm@larry.engineer>", "PFC <pfc-validator@protonmail.com>"]
 edition = "2018"
 license = "GPL-3.0-or-later"
@@ -10,9 +10,9 @@ repository = "https://github.com/st4k3h0us3/steak-contracts"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-backtraces = ["cosmwasm-std/backtraces"]
+# backtraces = ["cosmwasm-std/backtraces"]
 
 [dependencies]
-cosmwasm-std = { version = "1.5.4" }
+cosmwasm-std = { version = "1.5.8" }
 cw20 = "0.13"
 cw20-base = { version = "0.13", features = ["library"] }

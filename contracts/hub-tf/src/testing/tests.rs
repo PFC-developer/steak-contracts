@@ -1827,7 +1827,7 @@ fn dust_return_denom() {
         ExecuteMsg::ReturnDenom {},
     )
     .unwrap();
-    eprintln!("{:?}", res.messages);
+    //eprintln!("{:?}", res.messages);
     assert_eq!(res.messages.len(), 1);
     assert_eq!(res.messages[0], SubMsg {
         msg: Delegation::new("charlie", 12345, "uxyz").to_cosmos_msg(),

@@ -719,7 +719,7 @@ dependencies = [
 
 [[package]]
 name = "pfc-steak-token"
-version = "2.0.2"
+version = "3.0.20"
 dependencies = [
  "cosmwasm-std",
  "cw20 0.13.4",
