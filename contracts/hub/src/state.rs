@@ -84,7 +84,7 @@ impl Default for State<'static> {
     }
 }
 
-impl<'a> State<'a> {
+impl State<'_> {
     pub fn assert_owner(&self, storage: &dyn Storage, sender: &Addr) -> StdResult<()> {
         let owner = self.owner.load(storage)?;
         if *sender == owner {
@@ -100,7 +100,7 @@ pub(crate) struct PreviousBatchesIndexes<'a> {
     pub reconciled: MultiIndex<'a, BooleanKey, Batch, Vec<u8>>,
 }
 
-impl<'a> IndexList<Batch> for PreviousBatchesIndexes<'a> {
+impl IndexList<Batch> for PreviousBatchesIndexes<'_> {
     fn get_indexes(&'_ self) -> Box<dyn Iterator<Item = &'_ dyn Index<Batch>> + '_> {
         let v: Vec<&dyn Index<Batch>> = vec![&self.reconciled];
         Box::new(v.into_iter())
@@ -112,7 +112,7 @@ pub(crate) struct UnbondRequestsIndexes<'a> {
     pub user: MultiIndex<'a, String, UnbondRequest, Vec<u8>>,
 }
 
-impl<'a> IndexList<UnbondRequest> for UnbondRequestsIndexes<'a> {
+impl IndexList<UnbondRequest> for UnbondRequestsIndexes<'_> {
     fn get_indexes(&'_ self) -> Box<dyn Iterator<Item = &'_ dyn Index<UnbondRequest>> + '_> {
         let v: Vec<&dyn Index<UnbondRequest>> = vec![&self.user];
         Box::new(v.into_iter())

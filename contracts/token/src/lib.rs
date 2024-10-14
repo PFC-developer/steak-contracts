@@ -1,14 +1,15 @@
 use cosmwasm_std::{
     Addr, Binary, Deps, DepsMut, Env, MessageInfo, Response, StdError, StdResult, Storage,
+    entry_point,
 };
 use cw20_base::{
+    ContractError,
     contract::{execute as cw20_execute, instantiate as cw20_instantiate, query as cw20_query},
     msg::{ExecuteMsg, InstantiateMsg, QueryMsg},
     state::{MinterData, TOKEN_INFO},
-    ContractError,
 };
 
-//#[cfg_attr(not(feature = "library"), entry_point)]
+#[entry_point]
 pub fn instantiate(
     deps: DepsMut,
     env: Env,
@@ -18,7 +19,7 @@ pub fn instantiate(
     cw20_instantiate(deps, env, info, msg)
 }
 
-//#[cfg_attr(not(feature = "library"), entry_point)]
+#[entry_point]
 pub fn execute(
     deps: DepsMut,
     env: Env,
@@ -56,7 +57,7 @@ fn assert_minter(storage: &dyn Storage, sender: &Addr) -> Result<(), ContractErr
     Ok(())
 }
 
-//#[cfg_attr(not(feature = "library"), entry_point)]
+#[entry_point]
 pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
     cw20_query(deps, env, msg)
 }
@@ -64,10 +65,10 @@ pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
 #[cfg(test)]
 mod tests {
     use cosmwasm_std::{
-        testing::{mock_dependencies, mock_env, mock_info, MockApi, MockQuerier, MockStorage},
         OwnedDeps, Uint128,
+        testing::{MockApi, MockQuerier, MockStorage, mock_dependencies, mock_env, mock_info},
     };
-    use cw20_base::state::{TokenInfo, BALANCES};
+    use cw20_base::state::{BALANCES, TokenInfo};
 
     use super::*;
 
@@ -75,19 +76,16 @@ mod tests {
         let mut deps = mock_dependencies();
 
         TOKEN_INFO
-            .save(
-                deps.as_mut().storage,
-                &TokenInfo {
-                    name: "Steak Token".to_string(),
-                    symbol: "STEAK".to_string(),
-                    decimals: 6,
-                    total_supply: Uint128::new(200),
-                    mint: Some(MinterData {
-                        minter: Addr::unchecked("steak_hub"),
-                        cap: None,
-                    }),
-                },
-            )
+            .save(deps.as_mut().storage, &TokenInfo {
+                name: "Steak Token".to_string(),
+                symbol: "STEAK".to_string(),
+                decimals: 6,
+                total_supply: Uint128::new(200),
+                mint: Some(MinterData {
+                    minter: Addr::unchecked("steak_hub"),
+                    cap: None,
+                }),
+            })
             .unwrap();
 
         BALANCES
@@ -106,25 +104,16 @@ mod tests {
         let mut deps = setup_test();
 
         // Alice is not allowed to burn her balance
-        let res = execute(
-            deps.as_mut(),
-            mock_env(),
-            mock_info("alice", &[]),
-            ExecuteMsg::Burn {
-                amount: Uint128::new(100),
-            },
-        );
+        let res = execute(deps.as_mut(), mock_env(), mock_info("alice", &[]), ExecuteMsg::Burn {
+            amount: Uint128::new(100),
+        });
         assert_eq!(res, Err(StdError::generic_err("only minter can execute token burn").into()));
 
         // Steak Hub can burn
-        let res = execute(
-            deps.as_mut(),
-            mock_env(),
-            mock_info("steak_hub", &[]),
-            ExecuteMsg::Burn {
+        let res =
+            execute(deps.as_mut(), mock_env(), mock_info("steak_hub", &[]), ExecuteMsg::Burn {
                 amount: Uint128::new(100),
-            },
-        );
+            });
         assert!(res.is_ok());
 
         // Steak Hub's token balance should have been reduced
@@ -141,15 +130,11 @@ mod tests {
         let mut deps = setup_test();
 
         // Not even Steak Hub can invoke `burn_from`
-        let res = execute(
-            deps.as_mut(),
-            mock_env(),
-            mock_info("steak_hub", &[]),
-            ExecuteMsg::BurnFrom {
+        let res =
+            execute(deps.as_mut(), mock_env(), mock_info("steak_hub", &[]), ExecuteMsg::BurnFrom {
                 owner: "alice".to_string(),
                 amount: Uint128::new(100),
-            },
-        );
+            });
         assert_eq!(res, Err(StdError::generic_err("`burn_from` command is disabled").into()));
     }
 }

@@ -32,6 +32,7 @@ pub(crate) fn query_delegation(
 ) -> StdResult<Delegation> {
     Ok(Delegation {
         validator: validator.to_string(),
+
         amount: querier
             .query_delegation(delegator_addr, validator)?
             .map(|fd| fd.amount.amount.u128())
@@ -51,6 +52,23 @@ pub(crate) fn query_delegations(
         .iter()
         .map(|validator| query_delegation(querier, validator, delegator_addr, denom))
         .collect()
+}
+/// Query the amounts of Luna a staker is delegating to each of the validators specified
+pub(crate) fn query_all_delegations(
+    querier: &QuerierWrapper,
+    delegator_addr: &Addr,
+) -> StdResult<Vec<Delegation>> {
+    let res = querier
+        .query_all_delegations(delegator_addr)?
+        .into_iter()
+        .map(|validator| Delegation {
+            validator: validator.validator.clone(),
+            amount: validator.amount.amount.u128(),
+            denom: validator.amount.denom.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    Ok(res)
 }
 
 /// `cosmwasm_std::Coin` does not implement `FromStr`, so we have do it ourselves

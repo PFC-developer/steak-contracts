@@ -1,13 +1,13 @@
-use std::{collections::HashSet, iter::FromIterator, str::FromStr};
+use std::{collections::HashSet, str::FromStr};
 
 use cosmwasm_std::{
-    to_json_binary, Addr, BankMsg, Coin, CosmosMsg, Decimal, DepsMut, DistributionMsg, Env, Event,
-    Order, ReplyOn, Response, StdError, StdResult, SubMsg, Uint128, WasmMsg,
+    Addr, BankMsg, Coin, CosmosMsg, Decimal, DepsMut, DistributionMsg, Env, Event, Order, ReplyOn,
+    Response, StdError, StdResult, SubMsg, Uint128, WasmMsg, to_json_binary,
 };
 use pfc_steak::{
+    DecimalCheckedOps,
     hub::{Batch, CallbackMsg, FeeType, PendingBatch, UnbondRequest},
     hub_tf::{ExecuteMsg, InstantiateMsg, TokenFactoryType},
-    DecimalCheckedOps,
 };
 
 //use crate::token_factory::denom::{MsgBurn, MsgCreateDenom, MsgMint};
@@ -25,7 +25,7 @@ use crate::{
         reconcile_batches,
     },
     osmosis,
-    state::{previous_batches, unbond_requests, State, VALIDATORS, VALIDATORS_ACTIVE},
+    state::{State, VALIDATORS, VALIDATORS_ACTIVE, previous_batches, unbond_requests},
     token_factory,
 };
 
@@ -58,14 +58,11 @@ pub fn instantiate(deps: DepsMut, env: Env, msg: InstantiateMsg) -> StdResult<Re
 
     state.fee_account.save(deps.storage, &deps.api.addr_validate(&msg.fee_account)?)?;
 
-    state.pending_batch.save(
-        deps.storage,
-        &PendingBatch {
-            id: 1,
-            usteak_to_burn: Uint128::zero(),
-            est_unbond_start_time: env.block.time.seconds() + msg.epoch_period,
-        },
-    )?;
+    state.pending_batch.save(deps.storage, &PendingBatch {
+        id: 1,
+        usteak_to_burn: Uint128::zero(),
+        est_unbond_start_time: env.block.time.seconds() + msg.epoch_period,
+    })?;
 
     for v in msg.validators {
         VALIDATORS.insert(deps.storage, &v)?;
@@ -123,9 +120,7 @@ pub fn instantiate(deps: DepsMut, env: Env, msg: InstantiateMsg) -> StdResult<Re
 // Bonding and harvesting logics
 //--------------------------------------------------------------------------------------------------
 
-/// NOTE: In a previous implementation, we split up the deposited Luna over all validators, so that
-/// they all have the same amount of delegation. This is however quite gas-expensive: $1.5 cost in
-/// the case of 15 validators.
+/// bond tokens (XXX) to validators, returning bXXXX
 ///
 /// To save gas for users, now we simply delegate all deposited Luna to the validator with the
 /// smallest amount of delegation. If delegations become severely unbalance as a result of this
@@ -150,25 +145,11 @@ pub fn bond(
         validators.push(v?);
     }
 
-    let mut validators_wl: HashSet<String> = Default::default();
-    for v in VALIDATORS.items(deps.storage, None, None, Order::Ascending) {
-        validators_wl.insert(v?);
-    }
-    for v in validators.iter() {
-        validators_wl.remove(v);
-    }
-    let non_active_validator_list = Vec::from_iter(validators_wl);
-
     // Query the current delegations made to validators, and find the validator with the smallest
     // delegated amount through a linear search
     // The code for linear search is a bit uglier than using `sort_by` but cheaper: O(n) vs O(n *
     // log(n))
-    let delegations_non_active = query_delegations(
-        &deps.querier,
-        &non_active_validator_list,
-        &env.contract.address,
-        &denom,
-    )?;
+    let delegations_all = query_all_delegations(&deps.querier, &env.contract.address)?;
     let delegations = query_delegations(&deps.querier, &validators, &env.contract.address, &denom)?;
 
     let mut validator = &delegations[0].validator;
@@ -194,12 +175,7 @@ pub fn bond(
     if mint_steak {
         // Query the current supply of Steak and compute the amount to mint
         //   let usteak_supply = steak_minted;
-        let usteak_to_mint = compute_mint_amount(
-            steak_minted,
-            amount_to_bond,
-            &delegations,
-            &delegations_non_active,
-        );
+        let usteak_to_mint = compute_mint_amount(steak_minted, amount_to_bond, &delegations_all);
         state.steak_minted.save(deps.storage, &(steak_minted + usteak_to_mint))?;
         // TODO deal with multiple token returns
         state.prev_denom.save(
@@ -588,20 +564,20 @@ pub fn submit_batch(deps: DepsMut, env: Env) -> StdResult<Response> {
     for v in validators.iter() {
         validators_active.remove(v);
     }
-    let active_validator_list = Vec::from_iter(validators_active);
+    //   let active_validator_list = Vec::from_iter(validators_active);
 
     // for unbonding we still need to look at
     // TODO verify denom
     let delegations = query_all_delegations(&deps.querier, &env.contract.address)?;
-    let delegations_active =
-        query_delegations(&deps.querier, &active_validator_list, &env.contract.address, &denom)?;
+    //  let delegations_active =
+    //     query_delegations(&deps.querier, &active_validator_list, &env.contract.address, &denom)?;
     // let usteak_supply = query_cw20_total_supply(&deps.querier, &steak_token)?;
 
     let amount_to_unbond = compute_unbond_amount(
         usteak_supply,
         pending_batch.usteak_to_burn,
         &delegations,
-        &delegations_active,
+        //   &delegations_active,
     );
 
     let new_undelegations = compute_undelegations(amount_to_unbond, &delegations, &denom);
@@ -616,27 +592,20 @@ pub fn submit_batch(deps: DepsMut, env: Env) -> StdResult<Response> {
     //
     // I don't have a solution for this... other than to manually fund contract with the slashed
     // amount.
-    previous_batches().save(
-        deps.storage,
-        pending_batch.id,
-        &Batch {
-            id: pending_batch.id,
-            reconciled: false,
-            total_shares: pending_batch.usteak_to_burn,
-            amount_unclaimed: amount_to_unbond,
-            est_unbond_end_time: current_time + unbond_period,
-        },
-    )?;
+    previous_batches().save(deps.storage, pending_batch.id, &Batch {
+        id: pending_batch.id,
+        reconciled: false,
+        total_shares: pending_batch.usteak_to_burn,
+        amount_unclaimed: amount_to_unbond,
+        est_unbond_end_time: current_time + unbond_period,
+    })?;
 
     let epoch_period = state.epoch_period.load(deps.storage)?;
-    state.pending_batch.save(
-        deps.storage,
-        &PendingBatch {
-            id: pending_batch.id + 1,
-            usteak_to_burn: Uint128::zero(),
-            est_unbond_start_time: current_time + epoch_period,
-        },
-    )?;
+    state.pending_batch.save(deps.storage, &PendingBatch {
+        id: pending_batch.id + 1,
+        usteak_to_burn: Uint128::zero(),
+        est_unbond_start_time: current_time + epoch_period,
+    })?;
     state.prev_denom.save(
         deps.storage,
         &get_denom_balance(&deps.querier, env.contract.address.clone(), denom)?,
@@ -858,16 +827,13 @@ pub fn withdraw_unbonded(
 pub fn rebalance(deps: DepsMut, env: Env, minimum: Uint128) -> StdResult<Response> {
     let state = State::default();
     let denom = state.denom.load(deps.storage)?;
-    let mut validators: Vec<String> = Default::default();
-    for v in VALIDATORS.items(deps.storage, None, None, Order::Ascending) {
-        validators.push(v?)
-    }
+
+    let delegations = query_all_delegations(&deps.querier, &env.contract.address)?;
+
     let mut validators_active: Vec<String> = Default::default();
     for v in VALIDATORS_ACTIVE.items(deps.storage, None, None, Order::Ascending) {
         validators_active.push(v?);
     }
-
-    let delegations = query_delegations(&deps.querier, &validators, &env.contract.address, &denom)?;
 
     let new_redelegations =
         compute_redelegations_for_rebalancing(validators_active, &delegations, minimum);

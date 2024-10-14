@@ -1,5 +1,5 @@
 {
-  "cw20_code_id": 446,
+  "cw20_code_id": 701,
   "owner": "archway1lu92zj8q6cmrptu09rp3343x9969r9qrg72hzj",
   "name": "boneARCH Token",
   "symbol": "boneARCH",
@@ -7,7 +7,9 @@
   "epoch_period": 259200,
   "unbond_period": 1814400,
   "validators": [
-    "archwayvaloper1cz6unq70w0sdm2gwghv8m4uqmhwxz5x4adam88"
+    "archwayvaloper1hgzw3udgagqylcvp9kyqq2w7ws8enucqpw094n",
+    "archwayvaloper140l6y2gp3gxvay6qtn70re7z2s0gn57zekxzpl",
+    "archwayvaloper1p4n7pw4rdfyn3rgc4cndcqedwmcu3dt6kfdwpt"
   ],
   "denom": "aarch",
   "fee_account": "archway1pzjprqczpn0fvn5kvqzs74mggg4539rt2vpmp07ffp3pufp6cc3qqmhdg3",

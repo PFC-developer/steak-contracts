@@ -1,6 +1,6 @@
 [package]
 name = "pfc-steak-hub"
-version = "3.0.16"
+version = "3.0.20"
 authors = ["larry <gm@larry.engineer>", "PFC <pfc-validator@protonmail.com>"]
 edition = "2018"
 license = "GPL-3.0-or-later"
@@ -10,18 +10,18 @@ repository = "https://github.com/st4k3h0us3/steak-contracts"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-backtraces = ["cosmwasm-std/backtraces"]
+# backtraces = ["cosmwasm-std/backtraces"]
 
 [dependencies]
-cosmwasm-std = { version = "1.5.4", features = ["staking"] }
-cw2= "1.0.0"
-cw20 = "1.0.1"
-cw20-base = { version = "1.0.0", features = ["library"] }
+cosmwasm-std = { version = "1.5.8", features = ["staking"] }
+cw2 = "1.1.2"
+cw20 = "1.1.2"
+cw20-base = { version = "1.1.2", features = ["library"] }
 cw-storage-plus = "0.13"
 pfc-steak = { path = "../../packages/steak" }
-serde = { version = "1.0.103", default-features = false, features = ["derive"] }
-pfc-fee-split = "0.2.3"
+serde = { version = "1.0.210", default-features = false, features = ["derive"] }
+pfc-fee-split = "0.2.5"
 #pfc-dust-collector = {path = "../../packages/pfc-dust-collector"}
-funds-distributor-api = {git="https://github.com/terra-money/enterprise-contracts.git" , branch="main"}
+funds-distributor-api = { git = "https://github.com/terra-money/enterprise-contracts.git", branch = "main" }
 #[dev-dependencies]
 #serde = { version = "1.0.103", default-features = false, features = ["derive"] }

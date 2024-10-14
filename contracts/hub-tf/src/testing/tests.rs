@@ -1,9 +1,10 @@
 use std::str::FromStr;
 
 use cosmwasm_std::{
-    testing::{mock_env, mock_info, MockApi, MockStorage, MOCK_CONTRACT_ADDR},
-    to_json_binary, Addr, BankMsg, Coin, CosmosMsg, Decimal, DistributionMsg, Order, OwnedDeps,
-    ReplyOn, StdError, StdResult, SubMsg, Uint128, WasmMsg,
+    Addr, BankMsg, Coin, CosmosMsg, Decimal, DistributionMsg, Order, OwnedDeps, ReplyOn, StdError,
+    StdResult, SubMsg, Uint128, WasmMsg,
+    testing::{MOCK_CONTRACT_ADDR, MockApi, MockStorage, mock_env, mock_info},
+    to_json_binary,
 };
 use pfc_steak::{
     hub::{
@@ -18,13 +19,13 @@ use super::{
     helpers::{mock_dependencies, mock_env_at_timestamp, query_helper},
 };
 use crate::{
-    contract::{execute, instantiate, REPLY_REGISTER_RECEIVED_COINS},
+    contract::{REPLY_REGISTER_RECEIVED_COINS, execute, instantiate},
     helpers::{parse_coin, parse_received_fund},
     math::{
         compute_redelegations_for_rebalancing, compute_redelegations_for_removal,
         compute_undelegations,
     },
-    state::{previous_batches, unbond_requests, State, VALIDATORS},
+    state::{State, VALIDATORS, previous_batches, unbond_requests},
     token_factory::{
         denom,
         denom::{MsgBurn, MsgCreateDenom, MsgMint},
@@ -115,68 +116,56 @@ fn proper_instantiation() {
     let deps = setup_test();
 
     let res: ConfigResponse = query_helper(deps.as_ref(), QueryMsg::Config {});
-    assert_eq!(
-        res,
-        ConfigResponse {
-            owner: "larry".to_string(),
-            new_owner: None,
-            steak_token: "factory/cosmos2contract/boneXYZ".to_string(),
-            epoch_period: 259200,
-            unbond_period: 1814400,
-            denom: "uxyz".to_string(),
-            fee_type: "Wallet".to_string(),
-            fee_account: "the_fee_man".to_string(),
-            fee_rate: Decimal::from_ratio(10_u128, 100_u128),
-            max_fee_rate: Decimal::from_ratio(20_u128, 100_u128),
-            validators: vec!["alice".to_string(), "bob".to_string(), "charlie".to_string(),],
-            paused_validators: vec![],
-            dust_collector: Some("dusty_1".to_string()),
-            token_factory: Some("CosmWasm".to_string())
-        }
-    );
+    assert_eq!(res, ConfigResponse {
+        owner: "larry".to_string(),
+        new_owner: None,
+        steak_token: "factory/cosmos2contract/boneXYZ".to_string(),
+        epoch_period: 259200,
+        unbond_period: 1814400,
+        denom: "uxyz".to_string(),
+        fee_type: "Wallet".to_string(),
+        fee_account: "the_fee_man".to_string(),
+        fee_rate: Decimal::from_ratio(10_u128, 100_u128),
+        max_fee_rate: Decimal::from_ratio(20_u128, 100_u128),
+        validators: vec!["alice".to_string(), "bob".to_string(), "charlie".to_string(),],
+        paused_validators: vec![],
+        dust_collector: Some("dusty_1".to_string()),
+        token_factory: Some("CosmWasm".to_string())
+    });
 
     let res: StateResponse = query_helper(deps.as_ref(), QueryMsg::State {});
-    assert_eq!(
-        res,
-        StateResponse {
-            total_usteak: Uint128::zero(),
-            total_native: Uint128::zero(),
-            exchange_rate: Decimal::one(),
-            unlocked_coins: vec![],
-        },
-    );
+    assert_eq!(res, StateResponse {
+        total_usteak: Uint128::zero(),
+        total_native: Uint128::zero(),
+        exchange_rate: Decimal::one(),
+        unlocked_coins: vec![],
+    },);
 
     let res: PendingBatch = query_helper(deps.as_ref(), QueryMsg::PendingBatch {});
-    assert_eq!(
-        res,
-        PendingBatch {
-            id: 1,
-            usteak_to_burn: Uint128::zero(),
-            est_unbond_start_time: 269200, // 10,000 + 259,200
-        },
-    );
+    assert_eq!(res, PendingBatch {
+        id: 1,
+        usteak_to_burn: Uint128::zero(),
+        est_unbond_start_time: 269200, // 10,000 + 259,200
+    },);
     let deps_fee_split = setup_test_fee_split();
 
     let res_fee_split: ConfigResponse = query_helper(deps_fee_split.as_ref(), QueryMsg::Config {});
-    assert_eq!(
-        res_fee_split,
-        ConfigResponse {
-            owner: "larry".to_string(),
-            new_owner: None,
-            steak_token: "factory/cosmos2contract/sXYZ".to_string(),
-            epoch_period: 259200,
-            unbond_period: 1814400,
-            denom: "uxyz".to_string(),
-            fee_type: "FeeSplit".to_string(),
-            fee_account: "fee_split_contract".to_string(),
-            fee_rate: Decimal::from_ratio(10_u128, 100_u128),
-            max_fee_rate: Decimal::from_ratio(20_u128, 100_u128),
-            validators: vec!["alice".to_string(), "bob".to_string(), "charlie".to_string(),],
-            paused_validators: vec![],
-            dust_collector: Some("dusty_2".to_string()),
-            token_factory: Some("CosmWasm".to_string())
-        }
-    );
+    assert_eq!(res_fee_split, ConfigResponse {
+        owner: "larry".to_string(),
+        new_owner: None,
+        steak_token: "factory/cosmos2contract/sXYZ".to_string(),
+        epoch_period: 259200,
+        unbond_period: 1814400,
+        denom: "uxyz".to_string(),
+        fee_type: "FeeSplit".to_string(),
+        fee_account: "fee_split_contract".to_string(),
+        fee_rate: Decimal::from_ratio(10_u128, 100_u128),
+        max_fee_rate: Decimal::from_ratio(20_u128, 100_u128),
+        validators: vec!["alice".to_string(), "bob".to_string(), "charlie".to_string(),],
+        paused_validators: vec![],
+        dust_collector: Some("dusty_2".to_string()),
+        token_factory: Some("CosmWasm".to_string())
+    });
 }
 
 #[test]
@@ -201,15 +190,12 @@ fn bonding() {
     // 2 - mint token (to ourselves)
     // 3 - send/transfer it
     assert_eq!(res.messages.len(), 3);
-    assert_eq!(
-        res.messages[0],
-        SubMsg {
-            msg: Delegation::new("alice", 1_000_000, "uxyz").to_cosmos_msg(),
-            gas_limit: None,
-            id: REPLY_REGISTER_RECEIVED_COINS,
-            reply_on: ReplyOn::Never,
-        }
-    );
+    assert_eq!(res.messages[0], SubMsg {
+        msg: Delegation::new("alice", 1_000_000, "uxyz").to_cosmos_msg(),
+        gas_limit: None,
+        id: REPLY_REGISTER_RECEIVED_COINS,
+        reply_on: ReplyOn::Never,
+    });
     let mint_msg = <MsgMint as Into<CosmosMsg>>::into(MsgMint {
         sender: "cosmos2contract".to_string(),
         amount: Some(denom::Coin {
@@ -217,31 +203,25 @@ fn bonding() {
             amount: Uint128::new(1_000_000).to_string(),
         }),
     });
-    assert_eq!(
-        res.messages[1],
-        SubMsg {
-            id: 0,
-            msg: mint_msg,
-            gas_limit: None,
-            reply_on: ReplyOn::Never,
-        }
-    );
+    assert_eq!(res.messages[1], SubMsg {
+        id: 0,
+        msg: mint_msg,
+        gas_limit: None,
+        reply_on: ReplyOn::Never,
+    });
 
-    assert_eq!(
-        res.messages[2],
-        SubMsg {
-            id: 0,
-            msg: CosmosMsg::Bank(BankMsg::Send {
-                to_address: "user_1".to_string(),
-                amount: vec![Coin {
-                    denom: "factory/cosmos2contract/boneXYZ".to_string(),
-                    amount: Uint128::new(1_000_000)
-                }],
-            }),
-            gas_limit: None,
-            reply_on: ReplyOn::Never,
-        }
-    );
+    assert_eq!(res.messages[2], SubMsg {
+        id: 0,
+        msg: CosmosMsg::Bank(BankMsg::Send {
+            to_address: "user_1".to_string(),
+            amount: vec![Coin {
+                denom: "factory/cosmos2contract/boneXYZ".to_string(),
+                amount: Uint128::new(1_000_000)
+            }],
+        }),
+        gas_limit: None,
+        reply_on: ReplyOn::Never,
+    });
 
     // Bond when there are existing delegations, and Luna:Steak exchange rate is >1
     // Previously user 1 delegated 1,000,000 uluna. We assume we have accumulated 2.5% yield at
@@ -265,15 +245,12 @@ fn bonding() {
     .unwrap();
 
     assert_eq!(res.messages.len(), 3);
-    assert_eq!(
-        res.messages[0],
-        SubMsg {
-            msg: Delegation::new("charlie", 12345, "uxyz").to_cosmos_msg(),
-            id: REPLY_REGISTER_RECEIVED_COINS,
-            gas_limit: None,
-            reply_on: ReplyOn::Never
-        }
-    );
+    assert_eq!(res.messages[0], SubMsg {
+        msg: Delegation::new("charlie", 12345, "uxyz").to_cosmos_msg(),
+        id: REPLY_REGISTER_RECEIVED_COINS,
+        gas_limit: None,
+        reply_on: ReplyOn::Never
+    });
     let mint_msg = <MsgMint as Into<CosmosMsg>>::into(MsgMint {
         sender: "cosmos2contract".to_string(),
         amount: Some(denom::Coin {
@@ -281,32 +258,26 @@ fn bonding() {
             amount: Uint128::new(12_043).to_string(),
         }),
     });
-    assert_eq!(
-        res.messages[1],
-        SubMsg {
-            id: 0,
-            msg: mint_msg,
-            gas_limit: None,
-            reply_on: ReplyOn::Never,
-        }
-    );
+    assert_eq!(res.messages[1], SubMsg {
+        id: 0,
+        msg: mint_msg,
+        gas_limit: None,
+        reply_on: ReplyOn::Never,
+    });
 
-    assert_eq!(
-        res.messages[2],
-        SubMsg {
-            id: 0,
-            msg: CosmosMsg::Bank(BankMsg::Send {
-                to_address: "user_3".to_string(),
+    assert_eq!(res.messages[2], SubMsg {
+        id: 0,
+        msg: CosmosMsg::Bank(BankMsg::Send {
+            to_address: "user_3".to_string(),
 
-                amount: vec![Coin {
-                    denom: "factory/cosmos2contract/boneXYZ".to_string(),
-                    amount: Uint128::new(12_043)
-                }],
-            }),
-            gas_limit: None,
-            reply_on: ReplyOn::Never,
-        }
-    );
+            amount: vec![Coin {
+                denom: "factory/cosmos2contract/boneXYZ".to_string(),
+                amount: Uint128::new(12_043)
+            }],
+        }),
+        gas_limit: None,
+        reply_on: ReplyOn::Never,
+    });
 
     // Check the state after bonding
     deps.querier.set_staking_delegations(&[
@@ -316,15 +287,12 @@ fn bonding() {
     ]);
 
     let res: StateResponse = query_helper(deps.as_ref(), QueryMsg::State {});
-    assert_eq!(
-        res,
-        StateResponse {
-            total_usteak: Uint128::new(1012043),
-            total_native: Uint128::new(1037345),
-            exchange_rate: Decimal::from_ratio(1037345u128, 1012043u128),
-            unlocked_coins: vec![],
-        }
-    );
+    assert_eq!(res, StateResponse {
+        total_usteak: Uint128::new(1012043),
+        total_native: Uint128::new(1037345),
+        exchange_rate: Decimal::from_ratio(1037345u128, 1012043u128),
+        unlocked_coins: vec![],
+    });
 }
 
 #[test]
@@ -342,52 +310,40 @@ fn harvesting() {
         .unwrap();
 
     assert_eq!(res.messages.len(), 4);
-    assert_eq!(
-        res.messages[0],
-        SubMsg {
-            msg: CosmosMsg::Distribution(DistributionMsg::WithdrawDelegatorReward {
-                validator: "alice".to_string(),
-            }),
-            gas_limit: None,
-            id: REPLY_REGISTER_RECEIVED_COINS,
-            reply_on: ReplyOn::Never,
-        }
-    );
-    assert_eq!(
-        res.messages[1],
-        SubMsg {
-            msg: CosmosMsg::Distribution(DistributionMsg::WithdrawDelegatorReward {
-                validator: "bob".to_string(),
-            }),
-            id: REPLY_REGISTER_RECEIVED_COINS,
-            gas_limit: None,
-            reply_on: ReplyOn::Never
-        }
-    );
-    assert_eq!(
-        res.messages[2],
-        SubMsg {
-            msg: CosmosMsg::Distribution(DistributionMsg::WithdrawDelegatorReward {
-                validator: "charlie".to_string(),
-            }),
-            id: REPLY_REGISTER_RECEIVED_COINS,
-            gas_limit: None,
-            reply_on: ReplyOn::Never
-        }
-    );
-    assert_eq!(
-        res.messages[3],
-        SubMsg {
-            id: 0,
-            msg: CosmosMsg::Wasm(WasmMsg::Execute {
-                contract_addr: MOCK_CONTRACT_ADDR.to_string(),
-                msg: to_json_binary(&ExecuteMsg::Callback(CallbackMsg::Reinvest {})).unwrap(),
-                funds: vec![],
-            }),
-            gas_limit: None,
-            reply_on: ReplyOn::Never,
-        }
-    );
+    assert_eq!(res.messages[0], SubMsg {
+        msg: CosmosMsg::Distribution(DistributionMsg::WithdrawDelegatorReward {
+            validator: "alice".to_string(),
+        }),
+        gas_limit: None,
+        id: REPLY_REGISTER_RECEIVED_COINS,
+        reply_on: ReplyOn::Never,
+    });
+    assert_eq!(res.messages[1], SubMsg {
+        msg: CosmosMsg::Distribution(DistributionMsg::WithdrawDelegatorReward {
+            validator: "bob".to_string(),
+        }),
+        id: REPLY_REGISTER_RECEIVED_COINS,
+        gas_limit: None,
+        reply_on: ReplyOn::Never
+    });
+    assert_eq!(res.messages[2], SubMsg {
+        msg: CosmosMsg::Distribution(DistributionMsg::WithdrawDelegatorReward {
+            validator: "charlie".to_string(),
+        }),
+        id: REPLY_REGISTER_RECEIVED_COINS,
+        gas_limit: None,
+        reply_on: ReplyOn::Never
+    });
+    assert_eq!(res.messages[3], SubMsg {
+        id: 0,
+        msg: CosmosMsg::Wasm(WasmMsg::Execute {
+            contract_addr: MOCK_CONTRACT_ADDR.to_string(),
+            msg: to_json_binary(&ExecuteMsg::Callback(CallbackMsg::Reinvest {})).unwrap(),
+            funds: vec![],
+        }),
+        gas_limit: None,
+        reply_on: ReplyOn::Never,
+    });
 }
 
 #[test]
@@ -406,16 +362,13 @@ fn reinvesting() {
     // After the swaps, `unlocked_coins` should contain only uxyz and unknown denoms
     state
         .unlocked_coins
-        .save(
-            deps.as_mut().storage,
-            &vec![
-                Coin::new(234, "uxyz"),
-                Coin::new(
-                    69420,
-                    "ibc/0471F1C4E7AFD3F07702BEF6DC365268D64570F7C1FDC98EA6098DD6DE59817B",
-                ),
-            ],
-        )
+        .save(deps.as_mut().storage, &vec![
+            Coin::new(234, "uxyz"),
+            Coin::new(
+                69420,
+                "ibc/0471F1C4E7AFD3F07702BEF6DC365268D64570F7C1FDC98EA6098DD6DE59817B",
+            ),
+        ])
         .unwrap();
 
     // Bob has the smallest amount of delegations, so all proceeds go to him
@@ -428,38 +381,29 @@ fn reinvesting() {
     .unwrap();
 
     assert_eq!(res.messages.len(), 2);
-    assert_eq!(
-        res.messages[0],
-        SubMsg {
-            id: 0,
-            msg: Delegation::new("bob", 234 - 23, "uxyz").to_cosmos_msg(),
-            gas_limit: None,
-            reply_on: ReplyOn::Never,
-        }
-    );
+    assert_eq!(res.messages[0], SubMsg {
+        id: 0,
+        msg: Delegation::new("bob", 234 - 23, "uxyz").to_cosmos_msg(),
+        gas_limit: None,
+        reply_on: ReplyOn::Never,
+    });
     let send_msg = BankMsg::Send {
         to_address: "the_fee_man".into(),
         amount: vec![Coin::new(23u128, "uxyz")],
     };
-    assert_eq!(
-        res.messages[1],
-        SubMsg {
-            id: 0,
-            msg: CosmosMsg::Bank(send_msg),
-            gas_limit: None,
-            reply_on: ReplyOn::Never,
-        }
-    );
+    assert_eq!(res.messages[1], SubMsg {
+        id: 0,
+        msg: CosmosMsg::Bank(send_msg),
+        gas_limit: None,
+        reply_on: ReplyOn::Never,
+    });
 
     // Storage should have been updated
     let unlocked_coins = state.unlocked_coins.load(deps.as_ref().storage).unwrap();
-    assert_eq!(
-        unlocked_coins,
-        vec![Coin::new(
-            69420,
-            "ibc/0471F1C4E7AFD3F07702BEF6DC365268D64570F7C1FDC98EA6098DD6DE59817B",
-        )],
-    );
+    assert_eq!(unlocked_coins, vec![Coin::new(
+        69420,
+        "ibc/0471F1C4E7AFD3F07702BEF6DC365268D64570F7C1FDC98EA6098DD6DE59817B",
+    )],);
 }
 
 #[test]
@@ -478,16 +422,13 @@ fn reinvesting_fee_split() {
     // After the swaps, `unlocked_coins` should contain only uxyz and unknown denoms
     state
         .unlocked_coins
-        .save(
-            deps.as_mut().storage,
-            &vec![
-                Coin::new(234, "uxyz"),
-                Coin::new(
-                    69420,
-                    "ibc/0471F1C4E7AFD3F07702BEF6DC365268D64570F7C1FDC98EA6098DD6DE59817B",
-                ),
-            ],
-        )
+        .save(deps.as_mut().storage, &vec![
+            Coin::new(234, "uxyz"),
+            Coin::new(
+                69420,
+                "ibc/0471F1C4E7AFD3F07702BEF6DC365268D64570F7C1FDC98EA6098DD6DE59817B",
+            ),
+        ])
         .unwrap();
 
     // Bob has the smallest amount of delegations, so all proceeds go to him
@@ -500,40 +441,31 @@ fn reinvesting_fee_split() {
     .unwrap();
 
     assert_eq!(res.messages.len(), 2);
-    assert_eq!(
-        res.messages[0],
-        SubMsg {
-            id: 0,
-            msg: Delegation::new("bob", 234 - 23, "uxyz").to_cosmos_msg(),
-            gas_limit: None,
-            reply_on: ReplyOn::Never,
-        }
-    );
+    assert_eq!(res.messages[0], SubMsg {
+        id: 0,
+        msg: Delegation::new("bob", 234 - 23, "uxyz").to_cosmos_msg(),
+        gas_limit: None,
+        reply_on: ReplyOn::Never,
+    });
     let send_msg = pfc_fee_split::fee_split_msg::ExecuteMsg::Deposit {
         flush: false,
     };
 
-    assert_eq!(
-        res.messages[1],
-        SubMsg {
-            id: 0,
-            msg: send_msg
-                .into_cosmos_msg("fee_split_contract", vec![Coin::new(23u128, "uxyz")])
-                .unwrap(),
-            gas_limit: None,
-            reply_on: ReplyOn::Never,
-        }
-    );
+    assert_eq!(res.messages[1], SubMsg {
+        id: 0,
+        msg: send_msg
+            .into_cosmos_msg("fee_split_contract", vec![Coin::new(23u128, "uxyz")])
+            .unwrap(),
+        gas_limit: None,
+        reply_on: ReplyOn::Never,
+    });
 
     // Storage should have been updated
     let unlocked_coins = state.unlocked_coins.load(deps.as_ref().storage).unwrap();
-    assert_eq!(
-        unlocked_coins,
-        vec![Coin::new(
-            69420,
-            "ibc/0471F1C4E7AFD3F07702BEF6DC365268D64570F7C1FDC98EA6098DD6DE59817B",
-        )],
-    );
+    assert_eq!(unlocked_coins, vec![Coin::new(
+        69420,
+        "ibc/0471F1C4E7AFD3F07702BEF6DC365268D64570F7C1FDC98EA6098DD6DE59817B",
+    )],);
 }
 
 #[test]
@@ -545,13 +477,10 @@ fn queuing_unbond() {
     let err = execute(
         deps.as_mut(),
         mock_env(),
-        mock_info(
-            "random_token",
-            &[Coin {
-                denom: "asldkj".into(),
-                amount: Uint128::new(69_420),
-            }],
-        ),
+        mock_info("random_token", &[Coin {
+            denom: "asldkj".into(),
+            amount: Uint128::new(69_420),
+        }]),
         ExecuteMsg::Unbond {
             receiver: None,
         },
@@ -568,13 +497,10 @@ fn queuing_unbond() {
     let res = execute(
         deps.as_mut(),
         mock_env_at_timestamp(12345), // est_unbond_start_time = 269200
-        mock_info(
-            "steak_token",
-            &[Coin {
-                denom: "factory/cosmos2contract/boneXYZ".into(),
-                amount: Uint128::new(23_456),
-            }],
-        ),
+        mock_info("steak_token", &[Coin {
+            denom: "factory/cosmos2contract/boneXYZ".into(),
+            amount: Uint128::new(23_456),
+        }]),
         ExecuteMsg::Unbond {
             receiver: Some("user_1".to_string()),
         },
@@ -588,13 +514,10 @@ fn queuing_unbond() {
     let res = execute(
         deps.as_mut(),
         mock_env_at_timestamp(269201), // est_unbond_start_time = 269200
-        mock_info(
-            "user_3",
-            &[Coin {
-                denom: "factory/cosmos2contract/boneXYZ".into(),
-                amount: Uint128::new(69_420),
-            }],
-        ),
+        mock_info("user_3", &[Coin {
+            denom: "factory/cosmos2contract/boneXYZ".into(),
+            amount: Uint128::new(69_420),
+        }]),
         ExecuteMsg::Unbond {
             receiver: None,
         },
@@ -602,19 +525,16 @@ fn queuing_unbond() {
     .unwrap();
 
     assert_eq!(res.messages.len(), 1);
-    assert_eq!(
-        res.messages[0],
-        SubMsg {
-            id: 0,
-            msg: CosmosMsg::Wasm(WasmMsg::Execute {
-                contract_addr: MOCK_CONTRACT_ADDR.to_string(),
-                msg: to_json_binary(&ExecuteMsg::SubmitBatch {}).unwrap(),
-                funds: vec![],
-            }),
-            gas_limit: None,
-            reply_on: ReplyOn::Never,
-        }
-    );
+    assert_eq!(res.messages[0], SubMsg {
+        id: 0,
+        msg: CosmosMsg::Wasm(WasmMsg::Execute {
+            contract_addr: MOCK_CONTRACT_ADDR.to_string(),
+            msg: to_json_binary(&ExecuteMsg::SubmitBatch {}).unwrap(),
+            funds: vec![],
+        }),
+        gas_limit: None,
+        reply_on: ReplyOn::Never,
+    });
 
     // The users' unbonding requests should have been saved
     let ubr1 = unbond_requests()
@@ -624,33 +544,24 @@ fn queuing_unbond() {
         .load(deps.as_ref().storage, (1u64, Addr::unchecked("user_3").as_ref()))
         .unwrap();
 
-    assert_eq!(
-        ubr1,
-        UnbondRequest {
-            id: 1,
-            user: Addr::unchecked("user_1"),
-            shares: Uint128::new(23456),
-        }
-    );
-    assert_eq!(
-        ubr2,
-        UnbondRequest {
-            id: 1,
-            user: Addr::unchecked("user_3"),
-            shares: Uint128::new(69420),
-        }
-    );
+    assert_eq!(ubr1, UnbondRequest {
+        id: 1,
+        user: Addr::unchecked("user_1"),
+        shares: Uint128::new(23456),
+    });
+    assert_eq!(ubr2, UnbondRequest {
+        id: 1,
+        user: Addr::unchecked("user_3"),
+        shares: Uint128::new(69420),
+    });
 
     // Pending batch should have been updated
     let pending_batch = state.pending_batch.load(deps.as_ref().storage).unwrap();
-    assert_eq!(
-        pending_batch,
-        PendingBatch {
-            id: 1,
-            usteak_to_burn: Uint128::new(92876), // 23,456 + 69,420
-            est_unbond_start_time: 269200,
-        }
-    );
+    assert_eq!(pending_batch, PendingBatch {
+        id: 1,
+        usteak_to_burn: Uint128::new(92876), // 23,456 + 69,420
+        est_unbond_start_time: 269200,
+    });
 }
 
 #[test]
@@ -694,14 +605,11 @@ fn submitting_batch() {
 
     state
         .pending_batch
-        .save(
-            deps.as_mut().storage,
-            &PendingBatch {
-                id: 1,
-                usteak_to_burn: Uint128::new(92876), // 23,456 + 69,420
-                est_unbond_start_time: 269200,
-            },
-        )
+        .save(deps.as_mut().storage, &PendingBatch {
+            id: 1,
+            usteak_to_burn: Uint128::new(92876), // 23,456 + 69,420
+            est_unbond_start_time: 269200,
+        })
         .unwrap();
 
     // Anyone can invoke `submit_batch`. Here we continue from the previous test and assume it is
@@ -724,33 +632,24 @@ fn submitting_batch() {
     .unwrap();
 
     assert_eq!(res.messages.len(), 4);
-    assert_eq!(
-        res.messages[0],
-        SubMsg {
-            msg: Undelegation::new("alice", 31732, "uxyz").to_cosmos_msg(),
-            id: REPLY_REGISTER_RECEIVED_COINS,
-            gas_limit: None,
-            reply_on: ReplyOn::Never
-        }
-    );
-    assert_eq!(
-        res.messages[1],
-        SubMsg {
-            msg: Undelegation::new("bob", 31733, "uxyz").to_cosmos_msg(),
-            id: REPLY_REGISTER_RECEIVED_COINS,
-            gas_limit: None,
-            reply_on: ReplyOn::Never
-        }
-    );
-    assert_eq!(
-        res.messages[2],
-        SubMsg {
-            msg: Undelegation::new("charlie", 31732, "uxyz").to_cosmos_msg(),
-            id: REPLY_REGISTER_RECEIVED_COINS,
-            gas_limit: None,
-            reply_on: ReplyOn::Never
-        }
-    );
+    assert_eq!(res.messages[0], SubMsg {
+        msg: Undelegation::new("alice", 31732, "uxyz").to_cosmos_msg(),
+        id: REPLY_REGISTER_RECEIVED_COINS,
+        gas_limit: None,
+        reply_on: ReplyOn::Never
+    });
+    assert_eq!(res.messages[1], SubMsg {
+        msg: Undelegation::new("bob", 31733, "uxyz").to_cosmos_msg(),
+        id: REPLY_REGISTER_RECEIVED_COINS,
+        gas_limit: None,
+        reply_on: ReplyOn::Never
+    });
+    assert_eq!(res.messages[2], SubMsg {
+        msg: Undelegation::new("charlie", 31732, "uxyz").to_cosmos_msg(),
+        id: REPLY_REGISTER_RECEIVED_COINS,
+        gas_limit: None,
+        reply_on: ReplyOn::Never
+    });
 
     let burn_msg = <MsgBurn as Into<CosmosMsg>>::into(MsgBurn {
         sender: "cosmos2contract".to_string(),
@@ -759,39 +658,30 @@ fn submitting_batch() {
             amount: Uint128::new(92_876).to_string(),
         }),
     });
-    assert_eq!(
-        res.messages[3],
-        SubMsg {
-            id: 0,
-            msg: burn_msg,
-            gas_limit: None,
-            reply_on: ReplyOn::Never,
-        }
-    );
+    assert_eq!(res.messages[3], SubMsg {
+        id: 0,
+        msg: burn_msg,
+        gas_limit: None,
+        reply_on: ReplyOn::Never,
+    });
 
     // A new pending batch should have been created
     let pending_batch = state.pending_batch.load(deps.as_ref().storage).unwrap();
-    assert_eq!(
-        pending_batch,
-        PendingBatch {
-            id: 2,
-            usteak_to_burn: Uint128::zero(),
-            est_unbond_start_time: 528401, // 269,201 + 259,200
-        }
-    );
+    assert_eq!(pending_batch, PendingBatch {
+        id: 2,
+        usteak_to_burn: Uint128::zero(),
+        est_unbond_start_time: 528401, // 269,201 + 259,200
+    });
 
     // Previous batch should have been updated
     let previous_batch = previous_batches().load(deps.as_ref().storage, 1u64).unwrap();
-    assert_eq!(
-        previous_batch,
-        Batch {
-            id: 1,
-            reconciled: false,
-            total_shares: Uint128::new(92876),
-            amount_unclaimed: Uint128::new(95197),
-            est_unbond_end_time: 2083601, // 269,201 + 1,814,400
-        }
-    );
+    assert_eq!(previous_batch, Batch {
+        id: 1,
+        reconciled: false,
+        total_shares: Uint128::new(92876),
+        amount_unclaimed: Uint128::new(95197),
+        est_unbond_end_time: 2083601, // 269,201 + 1,814,400
+    });
 }
 
 #[test]
@@ -836,18 +726,15 @@ fn reconciling() {
 
     state
         .unlocked_coins
-        .save(
-            deps.as_mut().storage,
-            &vec![
-                Coin::new(10000, "uxyz"),
-                Coin::new(234, "ukrw"),
-                Coin::new(345, "uusd"),
-                Coin::new(
-                    69420,
-                    "ibc/0471F1C4E7AFD3F07702BEF6DC365268D64570F7C1FDC98EA6098DD6DE59817B",
-                ),
-            ],
-        )
+        .save(deps.as_mut().storage, &vec![
+            Coin::new(10000, "uxyz"),
+            Coin::new(234, "ukrw"),
+            Coin::new(345, "uusd"),
+            Coin::new(
+                69420,
+                "ibc/0471F1C4E7AFD3F07702BEF6DC365268D64570F7C1FDC98EA6098DD6DE59817B",
+            ),
+        ])
         .unwrap();
 
     deps.querier.set_bank_balances(&[
@@ -876,28 +763,22 @@ fn reconciling() {
     // batch 2: 1385 - 273 = 1112
     // batch 3: 1506 - 273 = 1233
     let batch = previous_batches().load(deps.as_ref().storage, 2u64).unwrap();
-    assert_eq!(
-        batch,
-        Batch {
-            id: 2,
-            reconciled: true,
-            total_shares: Uint128::new(1345),
-            amount_unclaimed: Uint128::new(1112), // 1385 - 273
-            est_unbond_end_time: 20000,
-        }
-    );
+    assert_eq!(batch, Batch {
+        id: 2,
+        reconciled: true,
+        total_shares: Uint128::new(1345),
+        amount_unclaimed: Uint128::new(1112), // 1385 - 273
+        est_unbond_end_time: 20000,
+    });
 
     let batch = previous_batches().load(deps.as_ref().storage, 3u64).unwrap();
-    assert_eq!(
-        batch,
-        Batch {
-            id: 3,
-            reconciled: true,
-            total_shares: Uint128::new(1456),
-            amount_unclaimed: Uint128::new(1233), // 1506 - 273
-            est_unbond_end_time: 30000,
-        }
-    );
+    assert_eq!(batch, Batch {
+        id: 3,
+        reconciled: true,
+        total_shares: Uint128::new(1456),
+        amount_unclaimed: Uint128::new(1233), // 1506 - 273
+        est_unbond_end_time: 30000,
+    });
 
     // Batches 1 and 4 should not have changed
     let batch = previous_batches().load(deps.as_ref().storage, 1u64).unwrap();
@@ -992,14 +873,11 @@ fn withdrawing_unbonded() {
 
     state
         .pending_batch
-        .save(
-            deps.as_mut().storage,
-            &PendingBatch {
-                id: 4,
-                usteak_to_burn: Uint128::new(56789),
-                est_unbond_start_time: 100000,
-            },
-        )
+        .save(deps.as_mut().storage, &PendingBatch {
+            id: 4,
+            usteak_to_burn: Uint128::new(56789),
+            est_unbond_start_time: 100000,
+        })
         .unwrap();
 
     // Attempt to withdraw before any batch has completed unbonding. Should error
@@ -1037,31 +915,25 @@ fn withdrawing_unbonded() {
     .unwrap();
 
     assert_eq!(res.messages.len(), 1);
-    assert_eq!(
-        res.messages[0],
-        SubMsg {
-            id: 0,
-            msg: CosmosMsg::Bank(BankMsg::Send {
-                to_address: "user_1".to_string(),
-                amount: vec![Coin::new(59646, "uxyz")],
-            }),
-            gas_limit: None,
-            reply_on: ReplyOn::Never,
-        }
-    );
+    assert_eq!(res.messages[0], SubMsg {
+        id: 0,
+        msg: CosmosMsg::Bank(BankMsg::Send {
+            to_address: "user_1".to_string(),
+            amount: vec![Coin::new(59646, "uxyz")],
+        }),
+        gas_limit: None,
+        reply_on: ReplyOn::Never,
+    });
 
     // Previous batches should have been updated
     let batch = previous_batches().load(deps.as_ref().storage, 1u64).unwrap();
-    assert_eq!(
-        batch,
-        Batch {
-            id: 1,
-            reconciled: true,
-            total_shares: Uint128::new(69420),
-            amount_unclaimed: Uint128::new(71155),
-            est_unbond_end_time: 10000,
-        }
-    );
+    assert_eq!(batch, Batch {
+        id: 1,
+        reconciled: true,
+        total_shares: Uint128::new(69420),
+        amount_unclaimed: Uint128::new(71155),
+        est_unbond_end_time: 10000,
+    });
 
     let err = previous_batches().load(deps.as_ref().storage, 2u64).unwrap_err();
     match err {
@@ -1111,18 +983,15 @@ fn withdrawing_unbonded() {
     .unwrap();
 
     assert_eq!(res.messages.len(), 1);
-    assert_eq!(
-        res.messages[0],
-        SubMsg {
-            id: 0,
-            msg: CosmosMsg::Bank(BankMsg::Send {
-                to_address: "user_2".to_string(),
-                amount: vec![Coin::new(71155, "uxyz")],
-            }),
-            gas_limit: None,
-            reply_on: ReplyOn::Never,
-        }
-    );
+    assert_eq!(res.messages[0], SubMsg {
+        id: 0,
+        msg: CosmosMsg::Bank(BankMsg::Send {
+            to_address: "user_2".to_string(),
+            amount: vec![Coin::new(71155, "uxyz")],
+        }),
+        gas_limit: None,
+        reply_on: ReplyOn::Never,
+    });
 
     // Batch 1 and user 2's unbonding request should have been purged from storage
     let err = previous_batches().load(deps.as_ref().storage, 1u64).unwrap_err();
@@ -1154,39 +1023,27 @@ fn adding_validator() {
     let mut deps = setup_test();
     //let state = State::default();
 
-    let err = execute(
-        deps.as_mut(),
-        mock_env(),
-        mock_info("jake", &[]),
-        ExecuteMsg::AddValidator {
+    let err =
+        execute(deps.as_mut(), mock_env(), mock_info("jake", &[]), ExecuteMsg::AddValidator {
             validator: "dave".to_string(),
-        },
-    )
-    .unwrap_err();
+        })
+        .unwrap_err();
 
     assert_eq!(err, StdError::generic_err("unauthorized: sender is not owner"));
 
-    let err = execute(
-        deps.as_mut(),
-        mock_env(),
-        mock_info("larry", &[]),
-        ExecuteMsg::AddValidator {
+    let err =
+        execute(deps.as_mut(), mock_env(), mock_info("larry", &[]), ExecuteMsg::AddValidator {
             validator: "alice".to_string(),
-        },
-    )
-    .unwrap_err();
+        })
+        .unwrap_err();
 
     assert_eq!(err, StdError::generic_err("validator is already whitelisted"));
 
-    let res = execute(
-        deps.as_mut(),
-        mock_env(),
-        mock_info("larry", &[]),
-        ExecuteMsg::AddValidator {
+    let res =
+        execute(deps.as_mut(), mock_env(), mock_info("larry", &[]), ExecuteMsg::AddValidator {
             validator: "dave".to_string(),
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
 
     assert_eq!(res.messages.len(), 0);
 
@@ -1208,27 +1065,19 @@ fn removing_validator() {
         Delegation::new("charlie", 341666, "uxyz"),
     ]);
 
-    let err = execute(
-        deps.as_mut(),
-        mock_env(),
-        mock_info("jake", &[]),
-        ExecuteMsg::RemoveValidator {
+    let err =
+        execute(deps.as_mut(), mock_env(), mock_info("jake", &[]), ExecuteMsg::RemoveValidator {
             validator: "charlie".to_string(),
-        },
-    )
-    .unwrap_err();
+        })
+        .unwrap_err();
 
     assert_eq!(err, StdError::generic_err("unauthorized: sender is not owner"));
 
-    let err = execute(
-        deps.as_mut(),
-        mock_env(),
-        mock_info("larry", &[]),
-        ExecuteMsg::RemoveValidator {
+    let err =
+        execute(deps.as_mut(), mock_env(), mock_info("larry", &[]), ExecuteMsg::RemoveValidator {
             validator: "dave".to_string(),
-        },
-    )
-    .unwrap_err();
+        })
+        .unwrap_err();
 
     assert_eq!(err, StdError::generic_err("validator is not already whitelisted"));
 
@@ -1236,35 +1085,25 @@ fn removing_validator() {
     // Remainder: 0
     // Alice:   512500 + 0 - 341667 = 170833
     // Bob:     512500 + 0 - 341667 = 170833
-    let res = execute(
-        deps.as_mut(),
-        mock_env(),
-        mock_info("larry", &[]),
-        ExecuteMsg::RemoveValidator {
+    let res =
+        execute(deps.as_mut(), mock_env(), mock_info("larry", &[]), ExecuteMsg::RemoveValidator {
             validator: "charlie".to_string(),
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
 
     assert_eq!(res.messages.len(), 2);
-    assert_eq!(
-        res.messages[0],
-        SubMsg {
-            msg: Redelegation::new("charlie", "alice", 170833, "uxyz").to_cosmos_msg(),
-            id: REPLY_REGISTER_RECEIVED_COINS,
-            gas_limit: None,
-            reply_on: ReplyOn::Never
-        },
-    );
-    assert_eq!(
-        res.messages[1],
-        SubMsg {
-            msg: Redelegation::new("charlie", "bob", 170833, "uxyz").to_cosmos_msg(),
-            id: REPLY_REGISTER_RECEIVED_COINS,
-            gas_limit: None,
-            reply_on: ReplyOn::Never
-        },
-    );
+    assert_eq!(res.messages[0], SubMsg {
+        msg: Redelegation::new("charlie", "alice", 170833, "uxyz").to_cosmos_msg(),
+        id: REPLY_REGISTER_RECEIVED_COINS,
+        gas_limit: None,
+        reply_on: ReplyOn::Never
+    },);
+    assert_eq!(res.messages[1], SubMsg {
+        msg: Redelegation::new("charlie", "bob", 170833, "uxyz").to_cosmos_msg(),
+        id: REPLY_REGISTER_RECEIVED_COINS,
+        gas_limit: None,
+        reply_on: ReplyOn::Never
+    },);
 
     assert!(VALIDATORS.contains(deps.as_ref().storage, "alice"));
     assert!(VALIDATORS.contains(deps.as_ref().storage, "bob"));
@@ -1276,15 +1115,11 @@ fn transferring_ownership() {
     let mut deps = setup_test();
     let state = State::default();
 
-    let err = execute(
-        deps.as_mut(),
-        mock_env(),
-        mock_info("jake", &[]),
-        ExecuteMsg::TransferOwnership {
+    let err =
+        execute(deps.as_mut(), mock_env(), mock_info("jake", &[]), ExecuteMsg::TransferOwnership {
             new_owner: "jake".to_string(),
-        },
-    )
-    .unwrap_err();
+        })
+        .unwrap_err();
 
     assert_eq!(err, StdError::generic_err("unauthorized: sender is not owner"));
 
@@ -1353,67 +1188,51 @@ fn splitting_fees() {
 
     assert_eq!(err, StdError::generic_err("Invalid Fee type: Wallet or FeeSplit only"));
 
-    execute(
-        deps.as_mut(),
-        mock_env(),
-        mock_info("larry", &[]),
-        ExecuteMsg::TransferFeeAccount {
-            fee_account_type: "Wallet".to_string(),
-            new_fee_account: "charlie".to_string(),
-        },
-    )
+    execute(deps.as_mut(), mock_env(), mock_info("larry", &[]), ExecuteMsg::TransferFeeAccount {
+        fee_account_type: "Wallet".to_string(),
+        new_fee_account: "charlie".to_string(),
+    })
     .unwrap();
     let res: ConfigResponse = query_helper(deps.as_ref(), QueryMsg::Config {});
-    assert_eq!(
-        res,
-        ConfigResponse {
-            owner: "larry".to_string(),
-            new_owner: None,
-            steak_token: "factory/cosmos2contract/boneXYZ".to_string(),
-            epoch_period: 259200,
-            unbond_period: 1814400,
-            denom: "uxyz".to_string(),
-            fee_type: "Wallet".to_string(),
-            fee_account: "charlie".to_string(),
-            fee_rate: Decimal::from_ratio(10_u128, 100_u128),
-            max_fee_rate: Decimal::from_ratio(20_u128, 100_u128),
-            validators: vec!["alice".to_string(), "bob".to_string(), "charlie".to_string(),],
-            paused_validators: vec![],
-            dust_collector: Some("dusty_1".to_string()),
-            token_factory: Some("CosmWasm".to_string())
-        }
-    );
+    assert_eq!(res, ConfigResponse {
+        owner: "larry".to_string(),
+        new_owner: None,
+        steak_token: "factory/cosmos2contract/boneXYZ".to_string(),
+        epoch_period: 259200,
+        unbond_period: 1814400,
+        denom: "uxyz".to_string(),
+        fee_type: "Wallet".to_string(),
+        fee_account: "charlie".to_string(),
+        fee_rate: Decimal::from_ratio(10_u128, 100_u128),
+        max_fee_rate: Decimal::from_ratio(20_u128, 100_u128),
+        validators: vec!["alice".to_string(), "bob".to_string(), "charlie".to_string(),],
+        paused_validators: vec![],
+        dust_collector: Some("dusty_1".to_string()),
+        token_factory: Some("CosmWasm".to_string())
+    });
 
-    execute(
-        deps.as_mut(),
-        mock_env(),
-        mock_info("larry", &[]),
-        ExecuteMsg::TransferFeeAccount {
-            fee_account_type: "FeeSplit".to_string(),
-            new_fee_account: "contract".to_string(),
-        },
-    )
+    execute(deps.as_mut(), mock_env(), mock_info("larry", &[]), ExecuteMsg::TransferFeeAccount {
+        fee_account_type: "FeeSplit".to_string(),
+        new_fee_account: "contract".to_string(),
+    })
     .unwrap();
     let res: ConfigResponse = query_helper(deps.as_ref(), QueryMsg::Config {});
-    assert_eq!(
-        res,
-        ConfigResponse {
-            owner: "larry".to_string(),
-            new_owner: None,
-            steak_token: "factory/cosmos2contract/boneXYZ".to_string(),
-            epoch_period: 259200,
-            unbond_period: 1814400,
-            denom: "uxyz".to_string(),
-            fee_type: "FeeSplit".to_string(),
-            fee_account: "contract".to_string(),
-            fee_rate: Decimal::from_ratio(10_u128, 100_u128),
-            max_fee_rate: Decimal::from_ratio(20_u128, 100_u128),
-            validators: vec!["alice".to_string(), "bob".to_string(), "charlie".to_string(),],
-            paused_validators: vec![],
-            dust_collector: Some("dusty_1".to_string()),
-            token_factory: Some("CosmWasm".to_string())
-        }
-    );
+    assert_eq!(res, ConfigResponse {
+        owner: "larry".to_string(),
+        new_owner: None,
+        steak_token: "factory/cosmos2contract/boneXYZ".to_string(),
+        epoch_period: 259200,
+        unbond_period: 1814400,
+        denom: "uxyz".to_string(),
+        fee_type: "FeeSplit".to_string(),
+        fee_account: "contract".to_string(),
+        fee_rate: Decimal::from_ratio(10_u128, 100_u128),
+        max_fee_rate: Decimal::from_ratio(20_u128, 100_u128),
+        validators: vec!["alice".to_string(), "bob".to_string(), "charlie".to_string(),],
+        paused_validators: vec![],
+        dust_collector: Some("dusty_1".to_string()),
+        token_factory: Some("CosmWasm".to_string())
+    });
 }
 //--------------------------------------------------------------------------------------------------
 // Queries
@@ -1467,31 +1286,22 @@ fn querying_previous_batches() {
     assert_eq!(res, batches[1].clone());
 
     // Query multiple batches
-    let res: Vec<Batch> = query_helper(
-        deps.as_ref(),
-        QueryMsg::PreviousBatches {
-            start_after: None,
-            limit: None,
-        },
-    );
+    let res: Vec<Batch> = query_helper(deps.as_ref(), QueryMsg::PreviousBatches {
+        start_after: None,
+        limit: None,
+    });
     assert_eq!(res, batches.clone());
 
-    let res: Vec<Batch> = query_helper(
-        deps.as_ref(),
-        QueryMsg::PreviousBatches {
-            start_after: Some(1),
-            limit: None,
-        },
-    );
+    let res: Vec<Batch> = query_helper(deps.as_ref(), QueryMsg::PreviousBatches {
+        start_after: Some(1),
+        limit: None,
+    });
     assert_eq!(res, vec![batches[1].clone(), batches[2].clone(), batches[3].clone()]);
 
-    let res: Vec<Batch> = query_helper(
-        deps.as_ref(),
-        QueryMsg::PreviousBatches {
-            start_after: Some(4),
-            limit: None,
-        },
-    );
+    let res: Vec<Batch> = query_helper(deps.as_ref(), QueryMsg::PreviousBatches {
+        start_after: Some(4),
+        limit: None,
+    });
     assert_eq!(res, vec![]);
 
     // Query multiple batches, indexed by whether it has been reconciled
@@ -1560,41 +1370,32 @@ fn querying_unbond_requests() {
             .unwrap();
     }
 
-    let res: Vec<UnbondRequestsByBatchResponseItem> = query_helper(
-        deps.as_ref(),
-        QueryMsg::UnbondRequestsByBatch {
+    let res: Vec<UnbondRequestsByBatchResponseItem> =
+        query_helper(deps.as_ref(), QueryMsg::UnbondRequestsByBatch {
             id: 1,
             start_after: None,
             limit: None,
-        },
-    );
-    assert_eq!(
-        res,
-        vec![
-            unbond_reqs[0].clone().into(),
-            unbond_reqs[1].clone().into(),
-            unbond_reqs[2].clone().into(),
-        ]
-    );
+        });
+    assert_eq!(res, vec![
+        unbond_reqs[0].clone().into(),
+        unbond_reqs[1].clone().into(),
+        unbond_reqs[2].clone().into(),
+    ]);
 
-    let res: Vec<UnbondRequestsByBatchResponseItem> = query_helper(
-        deps.as_ref(),
-        QueryMsg::UnbondRequestsByBatch {
+    let res: Vec<UnbondRequestsByBatchResponseItem> =
+        query_helper(deps.as_ref(), QueryMsg::UnbondRequestsByBatch {
             id: 2,
             start_after: None,
             limit: None,
-        },
-    );
+        });
     assert_eq!(res, vec![unbond_reqs[3].clone().into()]);
 
-    let res: Vec<UnbondRequestsByUserResponseItem> = query_helper(
-        deps.as_ref(),
-        QueryMsg::UnbondRequestsByUser {
+    let res: Vec<UnbondRequestsByUserResponseItem> =
+        query_helper(deps.as_ref(), QueryMsg::UnbondRequestsByUser {
             user: "alice".to_string(),
             start_after: None,
             limit: None,
-        },
-    );
+        });
     assert_eq!(res, vec![unbond_reqs[0].clone().into(), unbond_reqs[3].clone().into(),]);
     /*
         for x in unbond_requests().range(deps.as_ref().storage, None, None, Order::Ascending) {
@@ -1602,14 +1403,12 @@ fn querying_unbond_requests() {
             eprintln!("Key {}/{} = {:?}", rec.0.0, rec.0.1, rec.1)
         }
     */
-    let res: Vec<UnbondRequestsByUserResponseItem> = query_helper(
-        deps.as_ref(),
-        QueryMsg::UnbondRequestsByUser {
+    let res: Vec<UnbondRequestsByUserResponseItem> =
+        query_helper(deps.as_ref(), QueryMsg::UnbondRequestsByUser {
             user: "alice".to_string(),
             start_after: Some(1),
             limit: None,
-        },
-    );
+        });
     assert_eq!(res, vec![unbond_reqs[3].clone().into()]);
 }
 
@@ -1803,10 +1602,11 @@ fn adding_coins() {
     assert_eq!(coins.0, vec![Coin::new(12345, "uatom"), Coin::new(23456, "uxyz")]);
 
     coins.add_many(&Coins::from_str("76543uatom,69420uusd").unwrap()).unwrap();
-    assert_eq!(
-        coins.0,
-        vec![Coin::new(88888, "uatom"), Coin::new(23456, "uxyz"), Coin::new(69420, "uusd"),]
-    );
+    assert_eq!(coins.0, vec![
+        Coin::new(88888, "uatom"),
+        Coin::new(23456, "uxyz"),
+        Coin::new(69420, "uusd"),
+    ]);
 }
 
 #[test]
@@ -1867,18 +1667,15 @@ fn reconciling_underflow() {
     }
     state
         .unlocked_coins
-        .save(
-            deps.as_mut().storage,
-            &vec![
-                Coin::new(10000, "uatom"),
-                Coin::new(234, "ukrw"),
-                Coin::new(345, "uusd"),
-                Coin::new(
-                    69420,
-                    "ibc/0471F1C4E7AFD3F07702BEF6DC365268D64570F7C1FDC98EA6098DD6DE59817B",
-                ),
-            ],
-        )
+        .save(deps.as_mut().storage, &vec![
+            Coin::new(10000, "uatom"),
+            Coin::new(234, "ukrw"),
+            Coin::new(345, "uusd"),
+            Coin::new(
+                69420,
+                "ibc/0471F1C4E7AFD3F07702BEF6DC365268D64570F7C1FDC98EA6098DD6DE59817B",
+            ),
+        ])
         .unwrap();
     deps.querier.set_bank_balances(&[
         Coin::new(12345, "uatom"),
@@ -1934,18 +1731,15 @@ fn reconciling_underflow_second() {
     }
     state
         .unlocked_coins
-        .save(
-            deps.as_mut().storage,
-            &vec![
-                Coin::new(10000, "uatom"),
-                Coin::new(234, "ukrw"),
-                Coin::new(345, "uusd"),
-                Coin::new(
-                    69420,
-                    "ibc/0471F1C4E7AFD3F07702BEF6DC365268D64570F7C1FDC98EA6098DD6DE59817B",
-                ),
-            ],
-        )
+        .save(deps.as_mut().storage, &vec![
+            Coin::new(10000, "uatom"),
+            Coin::new(234, "ukrw"),
+            Coin::new(345, "uusd"),
+            Coin::new(
+                69420,
+                "ibc/0471F1C4E7AFD3F07702BEF6DC365268D64570F7C1FDC98EA6098DD6DE59817B",
+            ),
+        ])
         .unwrap();
     deps.querier.set_bank_balances(&[
         Coin::new(12345 - 1323, "uatom"),
@@ -1983,15 +1777,12 @@ fn dust_return_denom() {
     // 2 - mint token (to ourselves)
     // 3 - send/transfer it
     assert_eq!(res.messages.len(), 3);
-    assert_eq!(
-        res.messages[0],
-        SubMsg {
-            msg: Delegation::new("alice", 1_000_000, "uxyz").to_cosmos_msg(),
-            id: REPLY_REGISTER_RECEIVED_COINS,
-            gas_limit: None,
-            reply_on: ReplyOn::Never
-        }
-    );
+    assert_eq!(res.messages[0], SubMsg {
+        msg: Delegation::new("alice", 1_000_000, "uxyz").to_cosmos_msg(),
+        id: REPLY_REGISTER_RECEIVED_COINS,
+        gas_limit: None,
+        reply_on: ReplyOn::Never
+    });
     let mint_msg = <MsgMint as Into<CosmosMsg>>::into(MsgMint {
         sender: "cosmos2contract".to_string(),
         amount: Some(denom::Coin {
@@ -1999,31 +1790,25 @@ fn dust_return_denom() {
             amount: Uint128::new(1_000_000).to_string(),
         }),
     });
-    assert_eq!(
-        res.messages[1],
-        SubMsg {
-            id: 0,
-            msg: mint_msg,
-            gas_limit: None,
-            reply_on: ReplyOn::Never,
-        }
-    );
+    assert_eq!(res.messages[1], SubMsg {
+        id: 0,
+        msg: mint_msg,
+        gas_limit: None,
+        reply_on: ReplyOn::Never,
+    });
 
-    assert_eq!(
-        res.messages[2],
-        SubMsg {
-            id: 0,
-            msg: CosmosMsg::Bank(BankMsg::Send {
-                to_address: "user_1".to_string(),
-                amount: vec![Coin {
-                    denom: "factory/cosmos2contract/boneXYZ".to_string(),
-                    amount: Uint128::new(1_000_000)
-                }],
-            }),
-            gas_limit: None,
-            reply_on: ReplyOn::Never,
-        }
-    );
+    assert_eq!(res.messages[2], SubMsg {
+        id: 0,
+        msg: CosmosMsg::Bank(BankMsg::Send {
+            to_address: "user_1".to_string(),
+            amount: vec![Coin {
+                denom: "factory/cosmos2contract/boneXYZ".to_string(),
+                amount: Uint128::new(1_000_000)
+            }],
+        }),
+        gas_limit: None,
+        reply_on: ReplyOn::Never,
+    });
 
     // Bond when there are existing delegations, and Luna:Steak exchange rate is >1
     // Previously user 1 delegated 1,000,000 uluna. We assume we have accumulated 2.5% yield at
@@ -2042,17 +1827,14 @@ fn dust_return_denom() {
         ExecuteMsg::ReturnDenom {},
     )
     .unwrap();
-    eprintln!("{:?}", res.messages);
+    //eprintln!("{:?}", res.messages);
     assert_eq!(res.messages.len(), 1);
-    assert_eq!(
-        res.messages[0],
-        SubMsg {
-            msg: Delegation::new("charlie", 12345, "uxyz").to_cosmos_msg(),
-            id: REPLY_REGISTER_RECEIVED_COINS,
-            gas_limit: None,
-            reply_on: ReplyOn::Never
-        }
-    );
+    assert_eq!(res.messages[0], SubMsg {
+        msg: Delegation::new("charlie", 12345, "uxyz").to_cosmos_msg(),
+        id: REPLY_REGISTER_RECEIVED_COINS,
+        gas_limit: None,
+        reply_on: ReplyOn::Never
+    });
 }
 #[test]
 fn test_128() {
@@ -2061,15 +1843,11 @@ fn test_128() {
     let user_addr = deps.api.addr_make("testing");
 
     crate::state::unbond_requests()
-        .save(
-            deps.as_mut().storage,
-            (128u64, user_addr.as_str()),
-            &UnbondRequest {
-                id: 128u64,
-                user: user_addr.clone(),
-                shares: Uint128::new(18084001808),
-            },
-        )
+        .save(deps.as_mut().storage, (128u64, user_addr.as_str()), &UnbondRequest {
+            id: 128u64,
+            user: user_addr.clone(),
+            shares: Uint128::new(18084001808),
+        })
         .unwrap();
 
     let mut_deps = deps.as_mut();
