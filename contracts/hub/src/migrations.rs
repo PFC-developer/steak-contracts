@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     helpers::get_denom_balance,
-    state::{State, BATCH_KEY_V101},
+    state::{BATCH_KEY_V101, State},
     types::BooleanKey,
 };
 
@@ -88,7 +88,7 @@ pub(crate) struct PreviousBatchesIndexesV100<'a> {
     pub reconciled: MultiIndex<'a, BooleanKey, BatchV100, Vec<u8>>,
 }
 
-impl<'a> IndexList<BatchV100> for PreviousBatchesIndexesV100<'a> {
+impl IndexList<BatchV100> for PreviousBatchesIndexesV100<'_> {
     fn get_indexes(&'_ self) -> Box<dyn Iterator<Item = &'_ dyn Index<BatchV100>> + '_> {
         let v: Vec<&dyn Index<BatchV100>> = vec![&self.reconciled];
         Box::new(v.into_iter())

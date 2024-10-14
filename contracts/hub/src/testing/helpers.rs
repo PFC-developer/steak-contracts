@@ -1,8 +1,7 @@
 use cosmwasm_std::{
-    from_json,
-    testing::{mock_env, MockApi, MockStorage, MOCK_CONTRACT_ADDR},
     Addr, BlockInfo, ContractInfo, Deps, Env, OwnedDeps, QuerierResult, SystemError, SystemResult,
-    Timestamp,
+    Timestamp, from_json,
+    testing::{MOCK_CONTRACT_ADDR, MockApi, MockStorage, mock_env},
 };
 use pfc_steak::hub::QueryMsg;
 use serde::de::DeserializeOwned;

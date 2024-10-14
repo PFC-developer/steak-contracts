@@ -1,18 +1,18 @@
 use std::{collections::HashSet, iter::FromIterator, str::FromStr};
 
 use cosmwasm_std::{
-    from_json, to_json_binary, Addr, BankMsg, Binary, Coin, CosmosMsg, Decimal, DepsMut,
-    DistributionMsg, Env, Event, Order, Response, StdError, StdResult, SubMsg, SubMsgResponse,
-    Uint128, WasmMsg,
+    Addr, BankMsg, Binary, Coin, CosmosMsg, Decimal, DepsMut, DistributionMsg, Env, Event, Order,
+    Response, StdError, StdResult, SubMsg, SubMsgResponse, Uint128, WasmMsg, from_json,
+    to_json_binary,
 };
 use cw20::{Cw20ExecuteMsg, MinterResponse};
 use cw20_base::msg::InstantiateMsg as Cw20InstantiateMsg;
 use pfc_steak::{
+    DecimalCheckedOps,
     hub::{
         Batch, CallbackMsg, Cw20HookMsg, ExecuteMsg, FeeType, InstantiateMsg, PendingBatch,
         UnbondRequest,
     },
-    DecimalCheckedOps,
 };
 
 use crate::{
@@ -60,14 +60,11 @@ pub fn instantiate(deps: DepsMut, env: Env, msg: InstantiateMsg) -> StdResult<Re
 
     state.fee_account.save(deps.storage, &deps.api.addr_validate(&msg.fee_account)?)?;
 
-    state.pending_batch.save(
-        deps.storage,
-        &PendingBatch {
-            id: 1,
-            usteak_to_burn: Uint128::zero(),
-            est_unbond_start_time: env.block.time.seconds() + msg.epoch_period,
-        },
-    )?;
+    state.pending_batch.save(deps.storage, &PendingBatch {
+        id: 1,
+        usteak_to_burn: Uint128::zero(),
+        est_unbond_start_time: env.block.time.seconds() + msg.epoch_period,
+    })?;
     state.validators_active.save(deps.storage, &msg.validators)?;
 
     Ok(Response::new().add_submessage(SubMsg::reply_on_success(
@@ -119,9 +116,7 @@ pub fn register_steak_token(deps: DepsMut, response: SubMsgResponse) -> StdResul
 // Bonding and harvesting logics
 //--------------------------------------------------------------------------------------------------
 
-/// NOTE: In a previous implementation, we split up the deposited Luna over all validators, so that
-/// they all have the same amount of delegation. This is however quite gas-expensive: $1.5 cost in
-/// the case of 15 validators.
+/// bond tokens (XXX) to validators, returning bXXXX
 ///
 /// To save gas for users, now we simply delegate all deposited Luna to the validator with the
 /// smallest amount of delegation. If delegations become severely unbalance as a result of this
@@ -546,27 +541,20 @@ pub fn submit_batch(deps: DepsMut, env: Env) -> StdResult<Response> {
     //
     // I don't have a solution for this... other than to manually fund contract with the slashed
     // amount.
-    state.previous_batches.save(
-        deps.storage,
-        pending_batch.id,
-        &Batch {
-            id: pending_batch.id,
-            reconciled: false,
-            total_shares: pending_batch.usteak_to_burn,
-            amount_unclaimed: amount_to_bond,
-            est_unbond_end_time: current_time + unbond_period,
-        },
-    )?;
+    state.previous_batches.save(deps.storage, pending_batch.id, &Batch {
+        id: pending_batch.id,
+        reconciled: false,
+        total_shares: pending_batch.usteak_to_burn,
+        amount_unclaimed: amount_to_bond,
+        est_unbond_end_time: current_time + unbond_period,
+    })?;
 
     let epoch_period = state.epoch_period.load(deps.storage)?;
-    state.pending_batch.save(
-        deps.storage,
-        &PendingBatch {
-            id: pending_batch.id + 1,
-            usteak_to_burn: Uint128::zero(),
-            est_unbond_start_time: current_time + epoch_period,
-        },
-    )?;
+    state.pending_batch.save(deps.storage, &PendingBatch {
+        id: pending_batch.id + 1,
+        usteak_to_burn: Uint128::zero(),
+        est_unbond_start_time: current_time + epoch_period,
+    })?;
     state
         .prev_denom
         .save(deps.storage, &get_denom_balance(&deps.querier, env.contract.address, denom)?)?;

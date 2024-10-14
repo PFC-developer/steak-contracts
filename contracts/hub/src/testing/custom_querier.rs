@@ -1,10 +1,9 @@
 use std::collections::HashMap;
 
 use cosmwasm_std::{
-    from_json,
-    testing::{BankQuerier, StakingQuerier, MOCK_CONTRACT_ADDR},
     Addr, Coin, Empty, FullDelegation, Querier, QuerierResult, QueryRequest, SystemError,
-    WasmQuery,
+    WasmQuery, from_json,
+    testing::{BankQuerier, MOCK_CONTRACT_ADDR, StakingQuerier},
 };
 use cw20::Cw20QueryMsg;
 

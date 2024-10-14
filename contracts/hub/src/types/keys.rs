@@ -27,7 +27,7 @@ impl From<bool> for BooleanKey {
     }
 }
 
-impl<'a> PrimaryKey<'a> for BooleanKey {
+impl PrimaryKey<'_> for BooleanKey {
     type Prefix = ();
     type SubPrefix = ();
     type Suffix = ();
@@ -38,7 +38,7 @@ impl<'a> PrimaryKey<'a> for BooleanKey {
     }
 }
 
-impl<'a> Prefixer<'a> for BooleanKey {
+impl Prefixer<'_> for BooleanKey {
     fn prefix(&self) -> Vec<Key> {
         self.wrapped.prefix()
     }

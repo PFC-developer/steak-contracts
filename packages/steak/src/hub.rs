@@ -1,7 +1,7 @@
 use std::{fmt::Display, str::FromStr};
 
 use cosmwasm_std::{
-    to_json_binary, Addr, Binary, Coin, CosmosMsg, Decimal, Empty, StdResult, Uint128, WasmMsg,
+    Addr, Binary, Coin, CosmosMsg, Decimal, Empty, StdResult, Uint128, WasmMsg, to_json_binary,
 };
 use cw20::Cw20ReceiveMsg;
 use cw20_base::msg::InstantiateMarketingInfo as Cw20InstantiateMarketingInfo;

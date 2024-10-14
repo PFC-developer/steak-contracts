@@ -1,13 +1,13 @@
 use std::{collections::HashSet, iter::FromIterator, str::FromStr};
 
 use cosmwasm_std::{
-    to_json_binary, Addr, BankMsg, Coin, CosmosMsg, Decimal, DepsMut, DistributionMsg, Env, Event,
-    Order, ReplyOn, Response, StdError, StdResult, SubMsg, Uint128, WasmMsg,
+    Addr, BankMsg, Coin, CosmosMsg, Decimal, DepsMut, DistributionMsg, Env, Event, Order, ReplyOn,
+    Response, StdError, StdResult, SubMsg, Uint128, WasmMsg, to_json_binary,
 };
 use pfc_steak::{
+    DecimalCheckedOps,
     hub::{Batch, CallbackMsg, FeeType, PendingBatch, UnbondRequest},
     hub_tf::{ExecuteMsg, InstantiateMsg, TokenFactoryType},
-    DecimalCheckedOps,
 };
 
 //use crate::token_factory::denom::{MsgBurn, MsgCreateDenom, MsgMint};
@@ -25,7 +25,7 @@ use crate::{
         reconcile_batches,
     },
     osmosis,
-    state::{previous_batches, unbond_requests, State, VALIDATORS, VALIDATORS_ACTIVE},
+    state::{State, VALIDATORS, VALIDATORS_ACTIVE, previous_batches, unbond_requests},
     token_factory,
 };
 
@@ -58,14 +58,11 @@ pub fn instantiate(deps: DepsMut, env: Env, msg: InstantiateMsg) -> StdResult<Re
 
     state.fee_account.save(deps.storage, &deps.api.addr_validate(&msg.fee_account)?)?;
 
-    state.pending_batch.save(
-        deps.storage,
-        &PendingBatch {
-            id: 1,
-            usteak_to_burn: Uint128::zero(),
-            est_unbond_start_time: env.block.time.seconds() + msg.epoch_period,
-        },
-    )?;
+    state.pending_batch.save(deps.storage, &PendingBatch {
+        id: 1,
+        usteak_to_burn: Uint128::zero(),
+        est_unbond_start_time: env.block.time.seconds() + msg.epoch_period,
+    })?;
 
     for v in msg.validators {
         VALIDATORS.insert(deps.storage, &v)?;
@@ -123,9 +120,7 @@ pub fn instantiate(deps: DepsMut, env: Env, msg: InstantiateMsg) -> StdResult<Re
 // Bonding and harvesting logics
 //--------------------------------------------------------------------------------------------------
 
-/// NOTE: In a previous implementation, we split up the deposited Luna over all validators, so that
-/// they all have the same amount of delegation. This is however quite gas-expensive: $1.5 cost in
-/// the case of 15 validators.
+/// bond tokens (XXX) to validators, returning bXXXX
 ///
 /// To save gas for users, now we simply delegate all deposited Luna to the validator with the
 /// smallest amount of delegation. If delegations become severely unbalance as a result of this
@@ -616,27 +611,20 @@ pub fn submit_batch(deps: DepsMut, env: Env) -> StdResult<Response> {
     //
     // I don't have a solution for this... other than to manually fund contract with the slashed
     // amount.
-    previous_batches().save(
-        deps.storage,
-        pending_batch.id,
-        &Batch {
-            id: pending_batch.id,
-            reconciled: false,
-            total_shares: pending_batch.usteak_to_burn,
-            amount_unclaimed: amount_to_unbond,
-            est_unbond_end_time: current_time + unbond_period,
-        },
-    )?;
+    previous_batches().save(deps.storage, pending_batch.id, &Batch {
+        id: pending_batch.id,
+        reconciled: false,
+        total_shares: pending_batch.usteak_to_burn,
+        amount_unclaimed: amount_to_unbond,
+        est_unbond_end_time: current_time + unbond_period,
+    })?;
 
     let epoch_period = state.epoch_period.load(deps.storage)?;
-    state.pending_batch.save(
-        deps.storage,
-        &PendingBatch {
-            id: pending_batch.id + 1,
-            usteak_to_burn: Uint128::zero(),
-            est_unbond_start_time: current_time + epoch_period,
-        },
-    )?;
+    state.pending_batch.save(deps.storage, &PendingBatch {
+        id: pending_batch.id + 1,
+        usteak_to_burn: Uint128::zero(),
+        est_unbond_start_time: current_time + epoch_period,
+    })?;
     state.prev_denom.save(
         deps.storage,
         &get_denom_balance(&deps.querier, env.contract.address.clone(), denom)?,

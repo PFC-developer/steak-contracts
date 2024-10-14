@@ -42,9 +42,8 @@ pub(crate) struct State<'a> {
     pub epoch_period: Item<'a, u64>,
     /// The staking module's unbonding time, in seconds
     pub unbond_period: Item<'a, u64>,
-    /// Validators who will receive the delegations
+    // Validators who will receive the delegations
     //  pub validators: Item<'a, Vec<String>>,
-
     /// Coins that can be reinvested
     pub unlocked_coins: Item<'a, Vec<Coin>>,
     /// The current batch of un-bonding requests queued to be executed
@@ -96,7 +95,7 @@ impl Default for State<'static> {
     }
 }
 
-impl<'a> State<'a> {
+impl State<'_> {
     pub fn assert_owner(&self, storage: &dyn Storage, sender: &Addr) -> StdResult<()> {
         let owner = self.owner.load(storage)?;
         if *sender == owner {
@@ -116,16 +115,13 @@ pub fn previous_batches_reconciled_idx(_pk: &[u8], d: &Batch) -> String {
 }
 
 pub fn previous_batches<'a>() -> IndexedMap<'a, u64, Batch, PreviousBatchesIndexes<'a>> {
-    IndexedMap::new(
-        BATCH_KEY_V101,
-        PreviousBatchesIndexes {
-            reconciled: MultiIndex::new(
-                previous_batches_reconciled_idx,
-                BATCH_KEY_V101,
-                BATCH_KEY_OWNER_V101,
-            ),
-        },
-    )
+    IndexedMap::new(BATCH_KEY_V101, PreviousBatchesIndexes {
+        reconciled: MultiIndex::new(
+            previous_batches_reconciled_idx,
+            BATCH_KEY_V101,
+            BATCH_KEY_OWNER_V101,
+        ),
+    })
 }
 
 pub fn unbond_requests_user_idx(_pk: &[u8], d: &UnbondRequest) -> String {
@@ -134,12 +130,9 @@ pub fn unbond_requests_user_idx(_pk: &[u8], d: &UnbondRequest) -> String {
 
 pub fn unbond_requests<'a>()
 -> IndexedMap<'a, (u64, &'a str), UnbondRequest, UnbondRequestsIndexes<'a>> {
-    IndexedMap::new(
-        UNBOND_KEY_V101,
-        UnbondRequestsIndexes {
-            user: MultiIndex::new(unbond_requests_user_idx, UNBOND_KEY_V101, UNBOND_KEY_USER_V101),
-        },
-    )
+    IndexedMap::new(UNBOND_KEY_V101, UnbondRequestsIndexes {
+        user: MultiIndex::new(unbond_requests_user_idx, UNBOND_KEY_V101, UNBOND_KEY_USER_V101),
+    })
 }
 
 pub struct PreviousBatchesIndexes<'a> {
@@ -147,7 +140,7 @@ pub struct PreviousBatchesIndexes<'a> {
     pub reconciled: MultiIndex<'a, String, Batch, u64>,
 }
 
-impl<'a> IndexList<Batch> for PreviousBatchesIndexes<'a> {
+impl IndexList<Batch> for PreviousBatchesIndexes<'_> {
     fn get_indexes(&'_ self) -> Box<dyn Iterator<Item = &'_ dyn Index<Batch>> + '_> {
         let v: Vec<&dyn Index<Batch>> = vec![&self.reconciled];
         Box::new(v.into_iter())
@@ -159,7 +152,7 @@ pub struct UnbondRequestsIndexes<'a> {
     pub user: MultiIndex<'a, String, UnbondRequest, (u64, Addr)>,
 }
 
-impl<'a> IndexList<UnbondRequest> for UnbondRequestsIndexes<'a> {
+impl IndexList<UnbondRequest> for UnbondRequestsIndexes<'_> {
     fn get_indexes(&'_ self) -> Box<dyn Iterator<Item = &'_ dyn Index<UnbondRequest>> + '_> {
         let v: Vec<&dyn Index<UnbondRequest>> = vec![&self.user];
         Box::new(v.into_iter())

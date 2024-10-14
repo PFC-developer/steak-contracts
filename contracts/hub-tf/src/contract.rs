@@ -1,10 +1,10 @@
 use std::convert::TryInto;
 
 use cosmwasm_std::{
-    entry_point, to_json_binary, Binary, Deps, DepsMut, Env, MessageInfo, Reply, Response,
-    StdError, StdResult,
+    Binary, Deps, DepsMut, Env, MessageInfo, Reply, Response, StdError, StdResult, entry_point,
+    to_json_binary,
 };
-use cw2::{get_contract_version, set_contract_version, ContractVersion};
+use cw2::{ContractVersion, get_contract_version, set_contract_version};
 use pfc_steak::{
     hub::{CallbackMsg, MigrateMsg, QueryMsg},
     hub_tf::{ExecuteMsg, InstantiateMsg, TokenFactoryType},

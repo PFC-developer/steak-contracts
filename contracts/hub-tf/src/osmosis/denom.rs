@@ -28,6 +28,8 @@ pub struct Coin {
     pub amount: ::prost::alloc::string::String,
 }
 
+/// Create a Denom
+///
 /// MsgCreateDenom defines the message structure for the CreateDenom gRPC service
 /// method. It allows an account to create a new denom. It requires a sender
 /// address and a sub denomination. The (sender_address, sub_denomination) tuple
