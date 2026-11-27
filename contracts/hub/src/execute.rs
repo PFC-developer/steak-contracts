@@ -297,6 +297,46 @@ pub fn harvest(deps: DepsMut, env: Env) -> StdResult<Response> {
         .add_attribute("action", "steakhub/harvest"))
 }
 
+/// Complete reward processing after inactive-validator redelegations. The caller captured
+/// `prev_denom` before those redelegations; preserve that baseline, withdraw rewards from every
+/// remaining delegation, then reinvest the complete balance delta. Withdrawing first also prevents
+/// the final delegation from surfacing an active validator's older rewards after reinvestment.
+pub fn harvest_after_redelegation(deps: DepsMut, env: Env) -> StdResult<Response> {
+    let withdraw_submsgs = deps
+        .querier
+        .query_all_delegations(&env.contract.address)?
+        .into_iter()
+        .map(|d| {
+            SubMsg::reply_on_success(
+                CosmosMsg::Distribution(DistributionMsg::WithdrawDelegatorReward {
+                    validator: d.validator,
+                }),
+                REPLY_REGISTER_RECEIVED_COINS,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let callback_msg = CallbackMsg::ReinvestIfNeeded {}.into_cosmos_msg(&env.contract.address)?;
+
+    Ok(Response::new()
+        .add_submessages(withdraw_submsgs)
+        .add_message(callback_msg)
+        .add_attribute("action", "steakhub/harvest_after_redelegation"))
+}
+
+pub fn reinvest_if_needed(deps: DepsMut, env: Env) -> StdResult<Response> {
+    let state = State::default();
+    let denom = state.denom.load(deps.storage)?;
+    let prev_coin = state.prev_denom.load(deps.storage)?;
+    let current_coin = get_denom_balance(&deps.querier, env.contract.address.clone(), denom)?;
+
+    if current_coin <= prev_coin {
+        return Ok(Response::new().add_attribute("action", "steakhub/reinvest_not_needed"));
+    }
+
+    reinvest(deps, env)
+}
+
 /// NOTE:
 /// 1. When delegation Native denom here, we don't need to use a `SubMsg` to handle the received
 ///    coins, because we have already withdrawn all claimable staking rewards previously in the same
@@ -857,9 +897,12 @@ pub fn redelegate_inactive(
         .sum();
     let planned_total: u128 = new_redelegations.iter().map(|rd| rd.amount).sum();
 
-    state
-        .prev_denom
-        .save(deps.storage, &get_denom_balance(&deps.querier, env.contract.address, denom)?)?;
+    if !new_redelegations.is_empty() {
+        state.prev_denom.save(
+            deps.storage,
+            &get_denom_balance(&deps.querier, env.contract.address.clone(), denom)?,
+        )?;
+    }
 
     let mut submsgs = Vec::with_capacity(new_redelegations.len());
     let mut events = Vec::with_capacity(new_redelegations.len() + 1);
@@ -889,10 +932,17 @@ pub fn redelegate_inactive(
             ),
     );
 
-    Ok(Response::new()
+    let mut response = Response::new()
         .add_submessages(submsgs)
         .add_events(events)
-        .add_attribute("action", "steakhub/redelegate_inactive"))
+        .add_attribute("action", "steakhub/redelegate_inactive");
+    if !new_redelegations.is_empty() {
+        response = response.add_message(
+            CallbackMsg::HarvestAfterRedelegation {}.into_cosmos_msg(&env.contract.address)?,
+        );
+    }
+
+    Ok(response)
 }
 
 fn redelegation_skipped(id: u64, reason: String) -> Response {

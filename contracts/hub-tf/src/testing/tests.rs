@@ -75,6 +75,14 @@ fn setup_test() -> OwnedDeps<MockStorage, MockApi, CustomQuerier> {
     deps
 }
 
+fn callback_submsg(callback: CallbackMsg) -> SubMsg {
+    SubMsg::new(CosmosMsg::Wasm(WasmMsg::Execute {
+        contract_addr: MOCK_CONTRACT_ADDR.to_string(),
+        msg: to_json_binary(&ExecuteMsg::Callback(callback)).unwrap(),
+        funds: vec![],
+    }))
+}
+
 #[test]
 fn migration_repairs_active_validator_registry() {
     let mut deps = setup_test();
@@ -403,6 +411,89 @@ fn harvesting() {
         gas_limit: None,
         reply_on: ReplyOn::Never,
     });
+}
+
+#[test]
+fn harvesting_and_reinvesting_after_inactive_redelegation() {
+    let mut deps = setup_test();
+    let state = State::default();
+
+    deps.querier.set_staking_delegations(&[
+        Delegation::new("alice", 100, "uxyz"),
+        Delegation::new("bob", 200, "uxyz"),
+        Delegation::new("charlie", 300, "uxyz"),
+    ]);
+    state.prev_denom.save(deps.as_mut().storage, &Uint128::new(100)).unwrap();
+
+    let err = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info("worker", &[]),
+        ExecuteMsg::Callback(CallbackMsg::HarvestAfterRedelegation {}),
+    )
+    .unwrap_err();
+    assert_eq!(err, StdError::generic_err("callbacks can only be invoked by the contract itself"));
+
+    let res = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info(MOCK_CONTRACT_ADDR, &[]),
+        ExecuteMsg::Callback(CallbackMsg::HarvestAfterRedelegation {}),
+    )
+    .unwrap();
+
+    assert_eq!(res.messages, vec![
+        SubMsg {
+            id: REPLY_REGISTER_RECEIVED_COINS,
+            msg: CosmosMsg::Distribution(DistributionMsg::WithdrawDelegatorReward {
+                validator: "alice".to_string(),
+            }),
+            gas_limit: None,
+            reply_on: ReplyOn::Never,
+        },
+        SubMsg {
+            id: REPLY_REGISTER_RECEIVED_COINS,
+            msg: CosmosMsg::Distribution(DistributionMsg::WithdrawDelegatorReward {
+                validator: "bob".to_string(),
+            }),
+            gas_limit: None,
+            reply_on: ReplyOn::Never,
+        },
+        SubMsg {
+            id: REPLY_REGISTER_RECEIVED_COINS,
+            msg: CosmosMsg::Distribution(DistributionMsg::WithdrawDelegatorReward {
+                validator: "charlie".to_string(),
+            }),
+            gas_limit: None,
+            reply_on: ReplyOn::Never,
+        },
+        callback_submsg(CallbackMsg::ReinvestIfNeeded {}),
+    ]);
+    assert_eq!(state.prev_denom.load(deps.as_ref().storage).unwrap(), Uint128::new(100));
+
+    deps.querier.set_bank_balances(&[Coin::new(150, "uxyz")]);
+    let res = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info(MOCK_CONTRACT_ADDR, &[]),
+        ExecuteMsg::Callback(CallbackMsg::ReinvestIfNeeded {}),
+    )
+    .unwrap();
+    assert_eq!(res.messages[0], SubMsg::new(Delegation::new("alice", 45, "uxyz").to_cosmos_msg()));
+
+    state.prev_denom.save(deps.as_mut().storage, &Uint128::new(150)).unwrap();
+    let res = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info(MOCK_CONTRACT_ADDR, &[]),
+        ExecuteMsg::Callback(CallbackMsg::ReinvestIfNeeded {}),
+    )
+    .unwrap();
+    assert!(res.messages.is_empty());
+    assert_eq!(res.attributes, vec![cosmwasm_std::Attribute::new(
+        "action",
+        "steakhub/reinvest_not_needed"
+    )]);
 }
 
 #[test]
@@ -2032,6 +2123,7 @@ fn redelegating_inactive_validators() {
             gas_limit: None,
             reply_on: ReplyOn::Error,
         },
+        callback_submsg(CallbackMsg::HarvestAfterRedelegation {}),
     ]);
     let summary = res.events.iter().find(|e| e.ty == "steakhub/redelegated_inactive").unwrap();
     let attr = |key: &str| {
@@ -2070,9 +2162,12 @@ fn redelegating_inactive_validators() {
             gas_limit: None,
             reply_on: ReplyOn::Error,
         },
+        callback_submsg(CallbackMsg::HarvestAfterRedelegation {}),
     ]);
 
     // Nothing left on inactive validators: re-running is a harmless no-op.
+    let state = State::default();
+    state.prev_denom.save(deps.as_mut().storage, &Uint128::new(123)).unwrap();
     deps.querier.set_staking_delegations(&[
         Delegation::new("alice", 325, "uxyz"),
         Delegation::new("bob", 325, "uxyz"),
@@ -2087,6 +2182,7 @@ fn redelegating_inactive_validators() {
     )
     .unwrap();
     assert!(res.messages.is_empty());
+    assert_eq!(state.prev_denom.load(deps.as_ref().storage).unwrap(), Uint128::new(123));
 }
 
 #[test]

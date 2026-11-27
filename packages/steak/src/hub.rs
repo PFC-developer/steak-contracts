@@ -178,6 +178,11 @@ pub enum ReceiveMsg {
 pub enum CallbackMsg {
     /// Following the swaps, stake the Luna acquired to the whitelisted validators
     Reinvest {},
+    /// Following inactive-validator redelegations, withdraw the remaining validator rewards
+    /// without replacing the balance baseline captured before those redelegations.
+    HarvestAfterRedelegation {},
+    /// Reinvest rewards if the preceding operations produced any; otherwise succeed as a no-op.
+    ReinvestIfNeeded {},
 }
 
 impl CallbackMsg {

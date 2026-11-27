@@ -158,6 +158,8 @@ fn callback(
 
     match callback_msg {
         CallbackMsg::Reinvest {} => execute::reinvest(deps, env),
+        CallbackMsg::HarvestAfterRedelegation {} => execute::harvest_after_redelegation(deps, env),
+        CallbackMsg::ReinvestIfNeeded {} => execute::reinvest_if_needed(deps, env),
     }
 }
 
