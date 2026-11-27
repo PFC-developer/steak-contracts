@@ -9,9 +9,9 @@ use cosmwasm_std::{
 use cw20::{Cw20ExecuteMsg, MinterResponse};
 use cw20_base::msg::InstantiateMsg as Cw20InstantiateMsg;
 use pfc_steak::hub::{
-    Batch, CallbackMsg, ConfigResponse, ExecuteMsg, InstantiateMsg, PendingBatch, QueryMsg,
-    ReceiveMsg, StateResponse, UnbondRequest, UnbondRequestsByBatchResponseItem,
-    UnbondRequestsByUserResponseItem,
+    Batch, CallbackMsg, ConfigResponse, ExecuteMsg, IdleFundsResponse, InstantiateMsg,
+    PendingBatch, QueryMsg, ReceiveMsg, StateResponse, UnbondRequest,
+    UnbondRequestsByBatchResponseItem, UnbondRequestsByUserResponseItem,
 };
 
 use super::{
@@ -559,7 +559,6 @@ fn harvesting_and_reinvesting_after_inactive_redelegation() {
         Delegation::new("bob", 200, "uxyz"),
         Delegation::new("charlie", 300, "uxyz"),
     ]);
-    state.prev_denom.save(deps.as_mut().storage, &Uint128::new(100)).unwrap();
 
     let err = execute(
         deps.as_mut(),
@@ -599,9 +598,10 @@ fn harvesting_and_reinvesting_after_inactive_redelegation() {
         ),
         callback_submsg(CallbackMsg::ReinvestIfNeeded {}),
     ]);
-    assert_eq!(state.prev_denom.load(deps.as_ref().storage).unwrap(), Uint128::new(100));
 
     deps.querier.set_bank_balances(&[Coin::new(150, "uxyz")]);
+    // The redelegations' and the harvest's withdrawals were registered as 50 uxyz of rewards.
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![Coin::new(50, "uxyz")]).unwrap();
     let res = execute(
         deps.as_mut(),
         mock_env(),
@@ -611,7 +611,7 @@ fn harvesting_and_reinvesting_after_inactive_redelegation() {
     .unwrap();
     assert_eq!(res.messages[0], SubMsg::new(Delegation::new("alice", 45, "uxyz").to_cosmos_msg()));
 
-    state.prev_denom.save(deps.as_mut().storage, &Uint128::new(150)).unwrap();
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![]).unwrap();
     let res = execute(
         deps.as_mut(),
         mock_env(),
@@ -2503,4 +2503,159 @@ fn reconcile_does_not_count_funds_owed_to_reconciled_batches() {
         state.previous_batches.load(deps.as_ref().storage, 1u64).unwrap().amount_unclaimed,
         Uint128::new(500)
     );
+}
+
+#[test]
+fn reinvest_restakes_recorded_side_effect_rewards() {
+    let mut deps = setup_test();
+    let state = State::default();
+    deps.querier.set_staking_delegations(&[
+        Delegation::new("alice", 333334, "uxyz"),
+        Delegation::new("bob", 333333, "uxyz"),
+        Delegation::new("charlie", 333333, "uxyz"),
+    ]);
+    // 300 uxyz of rewards were withdrawn automatically by earlier bonds / unbonds / redelegations
+    // and recorded; the old balance-delta baseline would have seen no new rewards at all.
+    deps.querier.set_bank_balances(&[Coin::new(300, "uxyz")]);
+    state.prev_denom.save(deps.as_mut().storage, &Uint128::new(300)).unwrap();
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![Coin::new(300, "uxyz")]).unwrap();
+
+    let res = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info(MOCK_CONTRACT_ADDR, &[]),
+        ExecuteMsg::Callback(CallbackMsg::Reinvest {}),
+    )
+    .unwrap();
+    assert_eq!(res.messages[0], SubMsg::new(Delegation::new("bob", 270, "uxyz").to_cosmos_msg()));
+    assert_eq!(
+        res.messages[1],
+        SubMsg::new(CosmosMsg::Bank(BankMsg::Send {
+            to_address: "the_fee_man".into(),
+            amount: vec![Coin::new(30, "uxyz")],
+        }))
+    );
+    assert!(state.unlocked_coins.load(deps.as_ref().storage).unwrap().is_empty());
+}
+
+#[test]
+fn reinvest_never_bonds_funds_owed_to_batches() {
+    let mut deps = setup_test();
+    let state = State::default();
+    deps.querier.set_staking_delegations(&[
+        Delegation::new("alice", 333334, "uxyz"),
+        Delegation::new("bob", 333333, "uxyz"),
+        Delegation::new("charlie", 333333, "uxyz"),
+    ]);
+    // A matured batch is owed 400 of the 500 balance, so only 100 of the 300 recorded can be
+    // bonded.
+    let batch = Batch {
+        id: 1,
+        reconciled: false,
+        total_shares: Uint128::new(400),
+        amount_unclaimed: Uint128::new(400),
+        est_unbond_end_time: 100,
+    };
+    state.previous_batches.save(deps.as_mut().storage, batch.id, &batch).unwrap();
+    deps.querier.set_bank_balances(&[Coin::new(500, "uxyz")]);
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![Coin::new(300, "uxyz")]).unwrap();
+
+    let res = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info(MOCK_CONTRACT_ADDR, &[]),
+        ExecuteMsg::Callback(CallbackMsg::Reinvest {}),
+    )
+    .unwrap();
+    assert_eq!(res.messages[0], SubMsg::new(Delegation::new("bob", 90, "uxyz").to_cosmos_msg()));
+    // The rest stays recorded for a later reinvest.
+    assert_eq!(state.unlocked_coins.load(deps.as_ref().storage).unwrap(), vec![Coin::new(
+        200, "uxyz"
+    )]);
+}
+
+#[test]
+fn querying_and_reinvesting_idle_funds() {
+    let mut deps = setup_test();
+    let state = State::default();
+    deps.querier.set_staking_delegations(&[
+        Delegation::new("alice", 333334, "uxyz"),
+        Delegation::new("bob", 333333, "uxyz"),
+        Delegation::new("charlie", 333333, "uxyz"),
+    ]);
+    // Balance 1000: 100 recorded rewards, 300 owed to a batch still unbonding (its funds are not
+    // here yet, but they are reserved anyway), so 600 is idle.
+    let batch = Batch {
+        id: 1,
+        reconciled: false,
+        total_shares: Uint128::new(300),
+        amount_unclaimed: Uint128::new(300),
+        est_unbond_end_time: u64::MAX,
+    };
+    state.previous_batches.save(deps.as_mut().storage, batch.id, &batch).unwrap();
+    deps.querier.set_bank_balances(&[Coin::new(1000, "uxyz")]);
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![Coin::new(100, "uxyz")]).unwrap();
+
+    let idle: IdleFundsResponse = query_helper(deps.as_ref(), QueryMsg::IdleFunds {});
+    assert_eq!(idle, IdleFundsResponse {
+        denom: "uxyz".to_string(),
+        balance: Uint128::new(1000),
+        unlocked: Uint128::new(100),
+        owed_to_batches: Uint128::new(300),
+        idle: Uint128::new(600),
+    });
+
+    let err =
+        execute(deps.as_mut(), mock_env(), mock_info("jake", &[]), ExecuteMsg::ReinvestIdle {
+            amount: None,
+        })
+        .unwrap_err();
+    assert_eq!(err, StdError::generic_err("unauthorized: sender is not owner"));
+
+    let err =
+        execute(deps.as_mut(), mock_env(), mock_info("larry", &[]), ExecuteMsg::ReinvestIdle {
+            amount: Some(Uint128::new(601)),
+        })
+        .unwrap_err();
+    assert_eq!(err, StdError::generic_err("amount exceeds idle funds: 601 > 600"));
+
+    let res =
+        execute(deps.as_mut(), mock_env(), mock_info("larry", &[]), ExecuteMsg::ReinvestIdle {
+            amount: None,
+        })
+        .unwrap();
+    assert_eq!(res.messages, vec![SubMsg::reply_on_success(
+        Delegation::new("bob", 600, "uxyz").to_cosmos_msg(),
+        REPLY_REGISTER_RECEIVED_COINS,
+    )]);
+}
+
+#[test]
+fn bonding_prices_in_rewards_not_yet_restaked() {
+    let mut deps = setup_test();
+    let state = State::default();
+    deps.querier.set_staking_delegations(&[
+        Delegation::new("alice", 400, "uxyz"),
+        Delegation::new("bob", 300, "uxyz"),
+        Delegation::new("charlie", 300, "uxyz"),
+    ]);
+    deps.querier.set_cw20_total_supply("steak_token", 1000);
+    // 100 of recorded rewards belong to existing holders: 90 after the 10% fee. Backing is
+    // 1000 + 90 = 1090 per 1000 shares, so a 1090 deposit buys 1000 shares, not 1090.
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![Coin::new(100, "uxyz")]).unwrap();
+    deps.querier.set_bank_balances(&[Coin::new(100 + 1090, "uxyz")]);
+
+    let res = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info("user_1", &[Coin::new(1090, "uxyz")]),
+        ExecuteMsg::Bond {
+            receiver: None,
+            exec_msg: None,
+        },
+    )
+    .unwrap();
+    let bonded = res.events.iter().find(|e| e.ty == "steakhub/bonded").unwrap();
+    let minted = bonded.attributes.iter().find(|a| a.key == "usteak_minted").unwrap();
+    assert_eq!(minted.value, "1000");
 }

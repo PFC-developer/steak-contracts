@@ -12,12 +12,19 @@ use crate::types::{Delegation, Redelegation, Undelegation};
 /// Compute the amount of Steak token to mint for a specific Luna stake amount. If current total
 /// staked amount is zero, we use 1 usteak = 1 native; otherwise, we calculate base on the current
 /// native per ustake ratio.
+///
+/// `pending_rewards` is the holders' share (after fee) of rewards earned but not yet restaked.
+/// It belongs to existing holders, so it is part of the backing a new bonder buys into; leaving
+/// it out would hand the bonder a cut of rewards earned before they arrived.
 pub(crate) fn compute_mint_amount(
     usteak_supply: Uint128,
     native_to_bond: Uint128,
     all_delegations: &[Delegation],
+    pending_rewards: Uint128,
 ) -> StdResult<Uint128> {
-    let native_bonded = total_delegated(all_delegations)?;
+    let native_bonded = total_delegated(all_delegations)?
+        .checked_add(pending_rewards.u128())
+        .ok_or_else(|| StdError::generic_err("delegation total overflow"))?;
     if native_bonded == 0 {
         if usteak_supply.is_zero() {
             Ok(native_to_bond)

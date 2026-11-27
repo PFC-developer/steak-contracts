@@ -116,3 +116,8 @@ pub fn get_denom_balance(
     }))?;
     Ok(balance.amount.amount)
 }
+
+/// Unwrap a `Reply` object to extract the response
+pub(crate) fn unwrap_reply(reply: cosmwasm_std::Reply) -> StdResult<cosmwasm_std::SubMsgResponse> {
+    reply.result.into_result().map_err(StdError::generic_err)
+}

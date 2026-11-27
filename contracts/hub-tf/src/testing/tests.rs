@@ -8,8 +8,9 @@ use cosmwasm_std::{
 };
 use pfc_steak::{
     hub::{
-        Batch, CallbackMsg, ConfigResponse, PendingBatch, QueryMsg, StateResponse, UnbondRequest,
-        UnbondRequestsByBatchResponseItem, UnbondRequestsByUserResponseItem,
+        Batch, CallbackMsg, ConfigResponse, IdleFundsResponse, PendingBatch, QueryMsg,
+        StateResponse, UnbondRequest, UnbondRequestsByBatchResponseItem,
+        UnbondRequestsByUserResponseItem,
     },
     hub_tf::{ExecuteMsg, InstantiateMsg},
 };
@@ -244,7 +245,7 @@ fn bonding() {
         msg: Delegation::new("alice", 1_000_000, "uxyz").to_cosmos_msg(),
         gas_limit: None,
         id: REPLY_REGISTER_RECEIVED_COINS,
-        reply_on: ReplyOn::Never,
+        reply_on: ReplyOn::Success,
     });
     let mint_msg = <MsgMint as Into<CosmosMsg>>::into(MsgMint {
         sender: "cosmos2contract".to_string(),
@@ -299,7 +300,7 @@ fn bonding() {
         msg: Delegation::new("charlie", 12345, "uxyz").to_cosmos_msg(),
         id: REPLY_REGISTER_RECEIVED_COINS,
         gas_limit: None,
-        reply_on: ReplyOn::Never
+        reply_on: ReplyOn::Success
     });
     let mint_msg = <MsgMint as Into<CosmosMsg>>::into(MsgMint {
         sender: "cosmos2contract".to_string(),
@@ -384,7 +385,7 @@ fn harvesting() {
         }),
         gas_limit: None,
         id: REPLY_REGISTER_RECEIVED_COINS,
-        reply_on: ReplyOn::Never,
+        reply_on: ReplyOn::Success,
     });
     assert_eq!(res.messages[1], SubMsg {
         msg: CosmosMsg::Distribution(DistributionMsg::WithdrawDelegatorReward {
@@ -392,7 +393,7 @@ fn harvesting() {
         }),
         id: REPLY_REGISTER_RECEIVED_COINS,
         gas_limit: None,
-        reply_on: ReplyOn::Never
+        reply_on: ReplyOn::Success
     });
     assert_eq!(res.messages[2], SubMsg {
         msg: CosmosMsg::Distribution(DistributionMsg::WithdrawDelegatorReward {
@@ -400,7 +401,7 @@ fn harvesting() {
         }),
         id: REPLY_REGISTER_RECEIVED_COINS,
         gas_limit: None,
-        reply_on: ReplyOn::Never
+        reply_on: ReplyOn::Success
     });
     assert_eq!(res.messages[3], SubMsg {
         id: 0,
@@ -424,7 +425,6 @@ fn harvesting_and_reinvesting_after_inactive_redelegation() {
         Delegation::new("bob", 200, "uxyz"),
         Delegation::new("charlie", 300, "uxyz"),
     ]);
-    state.prev_denom.save(deps.as_mut().storage, &Uint128::new(100)).unwrap();
 
     let err = execute(
         deps.as_mut(),
@@ -450,7 +450,7 @@ fn harvesting_and_reinvesting_after_inactive_redelegation() {
                 validator: "alice".to_string(),
             }),
             gas_limit: None,
-            reply_on: ReplyOn::Never,
+            reply_on: ReplyOn::Success,
         },
         SubMsg {
             id: REPLY_REGISTER_RECEIVED_COINS,
@@ -458,7 +458,7 @@ fn harvesting_and_reinvesting_after_inactive_redelegation() {
                 validator: "bob".to_string(),
             }),
             gas_limit: None,
-            reply_on: ReplyOn::Never,
+            reply_on: ReplyOn::Success,
         },
         SubMsg {
             id: REPLY_REGISTER_RECEIVED_COINS,
@@ -466,13 +466,14 @@ fn harvesting_and_reinvesting_after_inactive_redelegation() {
                 validator: "charlie".to_string(),
             }),
             gas_limit: None,
-            reply_on: ReplyOn::Never,
+            reply_on: ReplyOn::Success,
         },
         callback_submsg(CallbackMsg::ReinvestIfNeeded {}),
     ]);
-    assert_eq!(state.prev_denom.load(deps.as_ref().storage).unwrap(), Uint128::new(100));
 
     deps.querier.set_bank_balances(&[Coin::new(150, "uxyz")]);
+    // The redelegations' and the harvest's withdrawals were registered as 50 uxyz of rewards.
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![Coin::new(50, "uxyz")]).unwrap();
     let res = execute(
         deps.as_mut(),
         mock_env(),
@@ -482,7 +483,7 @@ fn harvesting_and_reinvesting_after_inactive_redelegation() {
     .unwrap();
     assert_eq!(res.messages[0], SubMsg::new(Delegation::new("alice", 45, "uxyz").to_cosmos_msg()));
 
-    state.prev_denom.save(deps.as_mut().storage, &Uint128::new(150)).unwrap();
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![]).unwrap();
     let res = execute(
         deps.as_mut(),
         mock_env(),
@@ -791,19 +792,19 @@ fn submitting_batch() {
         msg: Undelegation::new("alice", 31732, "uxyz").to_cosmos_msg(),
         id: REPLY_REGISTER_RECEIVED_COINS,
         gas_limit: None,
-        reply_on: ReplyOn::Never
+        reply_on: ReplyOn::Success
     });
     assert_eq!(res.messages[1], SubMsg {
         msg: Undelegation::new("bob", 31733, "uxyz").to_cosmos_msg(),
         id: REPLY_REGISTER_RECEIVED_COINS,
         gas_limit: None,
-        reply_on: ReplyOn::Never
+        reply_on: ReplyOn::Success
     });
     assert_eq!(res.messages[2], SubMsg {
         msg: Undelegation::new("charlie", 31732, "uxyz").to_cosmos_msg(),
         id: REPLY_REGISTER_RECEIVED_COINS,
         gas_limit: None,
-        reply_on: ReplyOn::Never
+        reply_on: ReplyOn::Success
     });
 
     let burn_msg = <MsgBurn as Into<CosmosMsg>>::into(MsgBurn {
@@ -1266,13 +1267,13 @@ fn removing_validator() {
         msg: Redelegation::new("charlie", "alice", 170833, "uxyz").to_cosmos_msg(),
         id: REPLY_REGISTER_RECEIVED_COINS,
         gas_limit: None,
-        reply_on: ReplyOn::Never
+        reply_on: ReplyOn::Success
     },);
     assert_eq!(res.messages[1], SubMsg {
         msg: Redelegation::new("charlie", "bob", 170833, "uxyz").to_cosmos_msg(),
         id: REPLY_REGISTER_RECEIVED_COINS,
         gas_limit: None,
-        reply_on: ReplyOn::Never
+        reply_on: ReplyOn::Success
     },);
 
     assert!(VALIDATORS.contains(deps.as_ref().storage, "alice"));
@@ -1961,7 +1962,7 @@ fn dust_return_denom() {
         msg: Delegation::new("alice", 1_000_000, "uxyz").to_cosmos_msg(),
         id: REPLY_REGISTER_RECEIVED_COINS,
         gas_limit: None,
-        reply_on: ReplyOn::Never
+        reply_on: ReplyOn::Success
     });
     let mint_msg = <MsgMint as Into<CosmosMsg>>::into(MsgMint {
         sender: "cosmos2contract".to_string(),
@@ -2013,7 +2014,7 @@ fn dust_return_denom() {
         msg: Delegation::new("charlie", 12345, "uxyz").to_cosmos_msg(),
         id: REPLY_REGISTER_RECEIVED_COINS,
         gas_limit: None,
-        reply_on: ReplyOn::Never
+        reply_on: ReplyOn::Success
     });
 }
 #[test]
@@ -2120,13 +2121,13 @@ fn redelegating_inactive_validators() {
             id: REPLY_REDELEGATE_INACTIVE_BASE,
             msg: Redelegation::new("charlie", "alice", 200, "uxyz").to_cosmos_msg(),
             gas_limit: None,
-            reply_on: ReplyOn::Error,
+            reply_on: ReplyOn::Always,
         },
         SubMsg {
             id: REPLY_REDELEGATE_INACTIVE_BASE + 1,
             msg: Redelegation::new("dave", "alice", 25, "uxyz").to_cosmos_msg(),
             gas_limit: None,
-            reply_on: ReplyOn::Error,
+            reply_on: ReplyOn::Always,
         },
         SubMsg {
             id: REPLY_HARVEST_AFTER_REDELEGATION,
@@ -2164,13 +2165,13 @@ fn redelegating_inactive_validators() {
             id: REPLY_REDELEGATE_INACTIVE_BASE,
             msg: Redelegation::new("dave", "alice", 25, "uxyz").to_cosmos_msg(),
             gas_limit: None,
-            reply_on: ReplyOn::Error,
+            reply_on: ReplyOn::Always,
         },
         SubMsg {
             id: REPLY_REDELEGATE_INACTIVE_BASE + 1,
             msg: Redelegation::new("dave", "bob", 25, "uxyz").to_cosmos_msg(),
             gas_limit: None,
-            reply_on: ReplyOn::Error,
+            reply_on: ReplyOn::Always,
         },
         SubMsg {
             id: REPLY_HARVEST_AFTER_REDELEGATION,
@@ -2306,7 +2307,7 @@ fn redelegating_inactive_respects_exclude_and_bonded_set() {
             id: REPLY_REDELEGATE_INACTIVE_BASE,
             msg: Redelegation::new("dave", "alice", 50, "uxyz").to_cosmos_msg(),
             gas_limit: None,
-            reply_on: ReplyOn::Error,
+            reply_on: ReplyOn::Always,
         },
         SubMsg {
             id: REPLY_HARVEST_AFTER_REDELEGATION,
@@ -2419,4 +2420,185 @@ fn reconcile_does_not_count_funds_owed_to_reconciled_batches() {
         previous_batches().load(deps.as_ref().storage, 1u64).unwrap().amount_unclaimed,
         Uint128::new(500)
     );
+}
+
+#[test]
+fn reinvest_restakes_recorded_side_effect_rewards() {
+    let mut deps = setup_test();
+    let state = State::default();
+    deps.querier.set_staking_delegations(&[
+        Delegation::new("alice", 333334, "uxyz"),
+        Delegation::new("bob", 333333, "uxyz"),
+        Delegation::new("charlie", 333333, "uxyz"),
+    ]);
+    // 300 uxyz of rewards were withdrawn automatically by earlier bonds / unbonds / redelegations
+    // and recorded; the old balance-delta baseline would have seen no new rewards at all.
+    deps.querier.set_bank_balances(&[Coin::new(300, "uxyz")]);
+    state.prev_denom.save(deps.as_mut().storage, &Uint128::new(300)).unwrap();
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![Coin::new(300, "uxyz")]).unwrap();
+
+    let res = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info(MOCK_CONTRACT_ADDR, &[]),
+        ExecuteMsg::Callback(CallbackMsg::Reinvest {}),
+    )
+    .unwrap();
+    assert_eq!(res.messages[0], SubMsg::new(Delegation::new("bob", 270, "uxyz").to_cosmos_msg()));
+    assert_eq!(
+        res.messages[1],
+        SubMsg::new(CosmosMsg::Bank(BankMsg::Send {
+            to_address: "the_fee_man".into(),
+            amount: vec![Coin::new(30, "uxyz")],
+        }))
+    );
+    assert!(state.unlocked_coins.load(deps.as_ref().storage).unwrap().is_empty());
+}
+
+#[test]
+fn reinvest_never_bonds_funds_owed_to_batches() {
+    let mut deps = setup_test();
+    let state = State::default();
+    deps.querier.set_staking_delegations(&[
+        Delegation::new("alice", 333334, "uxyz"),
+        Delegation::new("bob", 333333, "uxyz"),
+        Delegation::new("charlie", 333333, "uxyz"),
+    ]);
+    // A matured batch is owed 400 of the 500 balance, so only 100 of the 300 recorded can be
+    // bonded.
+    let batch = Batch {
+        id: 1,
+        reconciled: false,
+        total_shares: Uint128::new(400),
+        amount_unclaimed: Uint128::new(400),
+        est_unbond_end_time: 100,
+    };
+    previous_batches().save(deps.as_mut().storage, batch.id, &batch).unwrap();
+    deps.querier.set_bank_balances(&[Coin::new(500, "uxyz")]);
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![Coin::new(300, "uxyz")]).unwrap();
+
+    let res = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info(MOCK_CONTRACT_ADDR, &[]),
+        ExecuteMsg::Callback(CallbackMsg::Reinvest {}),
+    )
+    .unwrap();
+    assert_eq!(res.messages[0], SubMsg::new(Delegation::new("bob", 90, "uxyz").to_cosmos_msg()));
+    // The rest stays recorded for a later reinvest.
+    assert_eq!(state.unlocked_coins.load(deps.as_ref().storage).unwrap(), vec![Coin::new(
+        200, "uxyz"
+    )]);
+}
+
+#[test]
+fn querying_and_reinvesting_idle_funds() {
+    let mut deps = setup_test();
+    let state = State::default();
+    deps.querier.set_staking_delegations(&[
+        Delegation::new("alice", 333334, "uxyz"),
+        Delegation::new("bob", 333333, "uxyz"),
+        Delegation::new("charlie", 333333, "uxyz"),
+    ]);
+    // Balance 1000: 100 recorded rewards, 300 owed to a batch still unbonding (its funds are not
+    // here yet, but they are reserved anyway), so 600 is idle.
+    let batch = Batch {
+        id: 1,
+        reconciled: false,
+        total_shares: Uint128::new(300),
+        amount_unclaimed: Uint128::new(300),
+        est_unbond_end_time: u64::MAX,
+    };
+    previous_batches().save(deps.as_mut().storage, batch.id, &batch).unwrap();
+    deps.querier.set_bank_balances(&[Coin::new(1000, "uxyz")]);
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![Coin::new(100, "uxyz")]).unwrap();
+
+    let idle: IdleFundsResponse = query_helper(deps.as_ref(), QueryMsg::IdleFunds {});
+    assert_eq!(idle, IdleFundsResponse {
+        denom: "uxyz".to_string(),
+        balance: Uint128::new(1000),
+        unlocked: Uint128::new(100),
+        owed_to_batches: Uint128::new(300),
+        idle: Uint128::new(600),
+    });
+
+    let err =
+        execute(deps.as_mut(), mock_env(), mock_info("jake", &[]), ExecuteMsg::ReinvestIdle {
+            amount: None,
+        })
+        .unwrap_err();
+    assert_eq!(err, StdError::generic_err("unauthorized: sender is not owner"));
+
+    let err =
+        execute(deps.as_mut(), mock_env(), mock_info("larry", &[]), ExecuteMsg::ReinvestIdle {
+            amount: Some(Uint128::new(601)),
+        })
+        .unwrap_err();
+    assert_eq!(err, StdError::generic_err("amount exceeds idle funds: 601 > 600"));
+
+    let res =
+        execute(deps.as_mut(), mock_env(), mock_info("larry", &[]), ExecuteMsg::ReinvestIdle {
+            amount: None,
+        })
+        .unwrap();
+    assert_eq!(res.messages, vec![SubMsg::reply_on_success(
+        Delegation::new("bob", 600, "uxyz").to_cosmos_msg(),
+        REPLY_REGISTER_RECEIVED_COINS,
+    )]);
+}
+
+#[test]
+fn bonding_prices_in_rewards_not_yet_restaked() {
+    let mut deps = setup_test();
+    let state = State::default();
+    deps.querier.set_staking_delegations(&[
+        Delegation::new("alice", 400, "uxyz"),
+        Delegation::new("bob", 300, "uxyz"),
+        Delegation::new("charlie", 300, "uxyz"),
+    ]);
+    state.steak_minted.save(deps.as_mut().storage, &Uint128::new(1000)).unwrap();
+    // 100 of recorded rewards belong to existing holders: 90 after the 10% fee. Backing is
+    // 1000 + 90 = 1090 per 1000 shares, so a 1090 deposit buys 1000 shares, not 1090.
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![Coin::new(100, "uxyz")]).unwrap();
+    deps.querier.set_bank_balances(&[Coin::new(100 + 1090, "uxyz")]);
+
+    let res = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info("user_1", &[Coin::new(1090, "uxyz")]),
+        ExecuteMsg::Bond {
+            receiver: None,
+            exec_msg: None,
+        },
+    )
+    .unwrap();
+    let bonded = res.events.iter().find(|e| e.ty == "steakhub/bonded").unwrap();
+    let minted = bonded.attributes.iter().find(|a| a.key == "usteak_minted").unwrap();
+    assert_eq!(minted.value, "1000");
+}
+
+#[test]
+fn staking_replies_register_withdrawn_rewards() {
+    let mut deps = setup_test();
+    let state = State::default();
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![]).unwrap();
+
+    reply(deps.as_mut(), mock_env(), cosmwasm_std::Reply {
+        id: REPLY_REGISTER_RECEIVED_COINS,
+        result: cosmwasm_std::SubMsgResult::Ok(cosmwasm_std::SubMsgResponse {
+            events: vec![
+                cosmwasm_std::Event::new("coin_received")
+                    .add_attribute("receiver", MOCK_CONTRACT_ADDR)
+                    .add_attribute("amount", "123uxyz"),
+                cosmwasm_std::Event::new("coin_received")
+                    .add_attribute("receiver", "someone_else")
+                    .add_attribute("amount", "999uxyz"),
+            ],
+            data: None,
+        }),
+    })
+    .unwrap();
+    assert_eq!(state.unlocked_coins.load(deps.as_ref().storage).unwrap(), vec![Coin::new(
+        123, "uxyz"
+    )]);
 }

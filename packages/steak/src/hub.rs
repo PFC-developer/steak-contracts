@@ -131,6 +131,12 @@ pub enum ExecuteMsg {
     /// redelegations mature. A source that is blocked is planned again on every run; pass it in
     /// `exclude` (which skips a validator as both source and destination) so it does not use up
     /// `limit`. `limit` caps the number of redelegations sent in one call (default 25, max 50).
+    /// Owner only. Delegate native that sits in the contract unaccounted for (see
+    /// `QueryMsg::IdleFunds`) so it earns for current holders. `amount` defaults to all of it and
+    /// may not exceed it. No fee is taken.
+    ReinvestIdle {
+        amount: Option<Uint128>,
+    },
     RedelegateInactive {
         limit: Option<u32>,
         exclude: Option<Vec<String>>,
@@ -208,6 +214,9 @@ impl CallbackMsg {
 pub enum QueryMsg {
     /// The contract's configurations. Response: `ConfigResponse`
     Config {},
+    /// Native held by the contract that nothing accounts for (not delegated, not recorded as
+    /// rewards to reinvest, not owed to an unbonding batch). Response: `IdleFundsResponse`
+    IdleFunds {},
     /// The contract's current state. Response: `StateResponse`
     State {},
     /// The current batch on unbonding requests pending submission. Response: `PendingBatch`
@@ -266,6 +275,19 @@ pub struct ConfigResponse {
     pub paused_validators: Vec<String>,
     pub dust_collector: Option<String>,
     pub token_factory: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, JsonSchema)]
+pub struct IdleFundsResponse {
+    pub denom: String,
+    /// The contract's native balance
+    pub balance: Uint128,
+    /// Rewards recorded and waiting for the next reinvest
+    pub unlocked: Uint128,
+    /// Owed to every unbonding batch that still has claims, whether or not its funds arrived yet
+    pub owed_to_batches: Uint128,
+    /// `balance - unlocked - owed_to_batches`, floored at zero
+    pub idle: Uint128,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, JsonSchema)]

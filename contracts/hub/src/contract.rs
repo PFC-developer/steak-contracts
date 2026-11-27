@@ -102,6 +102,9 @@ pub fn execute(deps: DepsMut, env: Env, info: MessageInfo, msg: ExecuteMsg) -> S
             validator_from,
             validator_to,
         } => execute::redelegate(deps, env, info.sender, validator_from, validator_to),
+        ExecuteMsg::ReinvestIdle {
+            amount,
+        } => execute::reinvest_idle(deps, env, info.sender, amount),
         ExecuteMsg::RedelegateInactive {
             limit,
             exclude,
@@ -233,6 +236,7 @@ pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
     match msg {
         QueryMsg::Config {} => to_json_binary(&queries::config(deps)?),
         QueryMsg::State {} => to_json_binary(&queries::state(deps, env)?),
+        QueryMsg::IdleFunds {} => to_json_binary(&execute::idle_native(deps, &env)?),
         QueryMsg::PendingBatch {} => to_json_binary(&queries::pending_batch(deps)?),
         QueryMsg::PreviousBatch(id) => to_json_binary(&queries::previous_batch(deps, id)?),
         QueryMsg::PreviousBatches {

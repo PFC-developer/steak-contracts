@@ -11,11 +11,11 @@ use pfc_steak::{
 };
 
 use crate::{
-    execute, queries,
+    execute,
+    helpers::unwrap_reply,
+    queries,
     state::{State, VALIDATORS, VALIDATORS_ACTIVE},
 };
-
-//use crate::helpers::{ unwrap_reply};
 
 /// Contract name that is used for migration.
 pub const CONTRACT_NAME: &str = "steak-hub-tf";
@@ -98,6 +98,9 @@ pub fn execute(deps: DepsMut, env: Env, info: MessageInfo, msg: ExecuteMsg) -> S
             validator_from,
             validator_to,
         } => execute::redelegate(deps, env, info.sender, validator_from, validator_to),
+        ExecuteMsg::ReinvestIdle {
+            amount,
+        } => execute::reinvest_idle(deps, env, info.sender, amount),
         ExecuteMsg::RedelegateInactive {
             limit,
             exclude,
@@ -182,12 +185,16 @@ fn is_redelegate_inactive_reply(id: u64) -> bool {
 }
 
 #[entry_point]
-pub fn reply(_deps: DepsMut, _env: Env, reply: Reply) -> StdResult<Response> {
+pub fn reply(deps: DepsMut, env: Env, reply: Reply) -> StdResult<Response> {
     match reply.id {
-        REPLY_REGISTER_RECEIVED_COINS => Ok(Response::default()),
+        REPLY_REGISTER_RECEIVED_COINS => {
+            execute::register_received_coins(deps, env, unwrap_reply(reply)?.events)
+        },
         REPLY_SUBMIT_BATCH => Ok(execute::submit_batch_deferred(reply)),
         REPLY_HARVEST_AFTER_REDELEGATION => Ok(execute::harvest_after_redelegation_deferred(reply)),
-        id if is_redelegate_inactive_reply(id) => Ok(execute::redelegate_inactive_reply(reply)),
+        id if is_redelegate_inactive_reply(id) => {
+            execute::redelegate_inactive_reply(deps, env, reply)
+        },
         _ => Err(StdError::generic_err(format!(
             "invalid reply id: {}  {:?}",
             reply.id, reply.result
@@ -200,6 +207,7 @@ pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
     match msg {
         QueryMsg::Config {} => to_json_binary(&queries::config(deps)?),
         QueryMsg::State {} => to_json_binary(&queries::state(deps, env)?),
+        QueryMsg::IdleFunds {} => to_json_binary(&execute::idle_native(deps, &env)?),
         QueryMsg::PendingBatch {} => to_json_binary(&queries::pending_batch(deps)?),
         QueryMsg::PreviousBatch(id) => to_json_binary(&queries::previous_batch(deps, id)?),
         QueryMsg::PreviousBatches {
