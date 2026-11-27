@@ -25,9 +25,6 @@ pub const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const REPLY_INSTANTIATE_TOKEN: u64 = 1;
 pub const REPLY_REGISTER_RECEIVED_COINS: u64 = 2;
 pub const REPLY_SUBMIT_BATCH: u64 = 3;
-/// The reward harvest that follows `RedelegateInactive`; a failure there is reported rather than
-/// reverting the redelegations that went through.
-pub const REPLY_HARVEST_AFTER_REDELEGATION: u64 = 4;
 /// How long after a batch's estimated unbonding end `Reconcile` waits before treating missing
 /// funds as slashed. The staking module pays out matured unbondings at the end of a block, after
 /// that block's transactions, so without a margin a `Reconcile` in the first block past the
@@ -225,12 +222,11 @@ pub fn reply(deps: DepsMut, env: Env, reply: Reply) -> StdResult<Response> {
             execute::register_received_coins(deps, env, unwrap_reply(reply)?.events)
         },
         REPLY_SUBMIT_BATCH => Ok(execute::submit_batch_deferred(reply)),
-        REPLY_HARVEST_AFTER_REDELEGATION => Ok(execute::harvest_after_redelegation_deferred(reply)),
         id if is_redelegate_inactive_reply(id) => {
             execute::redelegate_inactive_reply(deps, env, reply)
         },
         id => Err(StdError::generic_err(format!(
-            "invalid reply id: {}; must be 1-4 or a redelegate-inactive id",
+            "invalid reply id: {}; must be 1-3 or a redelegate-inactive id",
             id
         ))),
     }
