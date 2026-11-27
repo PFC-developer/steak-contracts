@@ -3002,3 +3002,46 @@ fn withdrawing_a_batch_observed_earlier_asks_for_reconcile() {
         )
     );
 }
+
+#[test]
+fn a_deficit_larger_than_the_batches_is_written_off_the_recorded_rewards() {
+    let mut deps = setup_test();
+    let state = State::default();
+    // Batch 1 expects 100 and 200 of rewards are recorded, but only 50 is held: 250 missing, of
+    // which the batch can absorb only its 100.
+    let batch = Batch {
+        id: 1,
+        reconciled: false,
+        total_shares: Uint128::new(100),
+        amount_unclaimed: Uint128::new(100),
+        est_unbond_end_time: 20000,
+    };
+    previous_batches().save(deps.as_mut().storage, batch.id, &batch).unwrap();
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![Coin::new(200, "uxyz")]).unwrap();
+    deps.querier.set_bank_balances(&[Coin::new(50, "uxyz")]);
+    observe_and_reconcile(&mut deps, 30000);
+    assert_eq!(
+        previous_batches().load(deps.as_ref().storage, 1u64).unwrap().amount_unclaimed,
+        Uint128::zero()
+    );
+    // The other 150 is gone from the recorded rewards, not carried over.
+    assert_eq!(state.unlocked_coins.load(deps.as_ref().storage).unwrap(), vec![Coin::new(
+        50, "uxyz"
+    )]);
+
+    // Batch 2, expecting 300, is paid in full: it must not be charged for the earlier gap.
+    let batch = Batch {
+        id: 2,
+        reconciled: false,
+        total_shares: Uint128::new(300),
+        amount_unclaimed: Uint128::new(300),
+        est_unbond_end_time: 40000,
+    };
+    previous_batches().save(deps.as_mut().storage, batch.id, &batch).unwrap();
+    deps.querier.set_bank_balances(&[Coin::new(50 + 300, "uxyz")]);
+    observe_and_reconcile(&mut deps, 50000);
+    assert_eq!(
+        previous_batches().load(deps.as_ref().storage, 2u64).unwrap().amount_unclaimed,
+        Uint128::new(300)
+    );
+}

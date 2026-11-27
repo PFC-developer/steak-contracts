@@ -738,7 +738,7 @@ pub fn reconcile(mut deps: DepsMut, env: Env) -> StdResult<Response> {
     let denom = state.denom.load(deps.storage)?;
     let unlocked_coins = state.unlocked_coins.load(deps.storage)?;
 
-    let native_expected_unlocked = Coins(unlocked_coins).find(&denom).amount;
+    let native_expected_unlocked = Coins(unlocked_coins.clone()).find(&denom).amount;
 
     let native_expected = native_expected_received + native_expected_unlocked;
     // Funds owed to batches that were already reconciled but not yet fully withdrawn sit in the
@@ -759,6 +759,21 @@ pub fn reconcile(mut deps: DepsMut, env: Env) -> StdResult<Response> {
     if !native_to_deduct.is_zero() {
         reconcile_batches(&mut batches, native_to_deduct);
     }
+    // Whatever the batches cannot absorb is missing from the recorded rewards; write it off there,
+    // or the next `Reconcile` would charge it to newer batches that lost nothing.
+    let unlocked_written_off = native_expected
+        .saturating_sub(native_actual)
+        .saturating_sub(native_to_deduct)
+        .min(native_expected_unlocked);
+    if !unlocked_written_off.is_zero() {
+        let mut unlocked_coins = unlocked_coins;
+        unlocked_coins.retain(|coin| coin.denom != denom);
+        let left = native_expected_unlocked - unlocked_written_off;
+        if !left.is_zero() {
+            unlocked_coins.push(Coin::new(left.u128(), &denom));
+        }
+        state.unlocked_coins.save(deps.storage, &unlocked_coins)?;
+    }
 
     for batch in batches.iter_mut() {
         batch.reconciled = true;
@@ -773,7 +788,8 @@ pub fn reconcile(mut deps: DepsMut, env: Env) -> StdResult<Response> {
 
     let event = Event::new("steakhub/reconciled")
         .add_attribute("ids", ids)
-        .add_attribute("native_deducted", native_to_deduct.to_string());
+        .add_attribute("native_deducted", native_to_deduct.to_string())
+        .add_attribute("unlocked_written_off", unlocked_written_off.to_string());
 
     Ok(Response::new()
         .add_event(event)
