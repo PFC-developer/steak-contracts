@@ -1,6 +1,9 @@
 # changelog
 
 ## 3.0.22
+* `SubmitBatch` defers (with a retry time) while 7 earlier batches are still unbonding, instead of failing the whole batch on the staking module's per-validator unbonding-entry limit
+* bonding with zero derivative supply mints 1:1 even if dust is still delegated; a bond too small to mint any token is refused instead of being swallowed
+* new owner-only `BurnStraySteak {}`: burns derivative tokens the hub holds beyond those queued for unbonding (sent to it directly, otherwise unredeemable)
 * bond, reinvest, `ReinvestIdle` and `RemoveValidator` only send stake to active validators the chain currently has bonded (falling back to the whole active set if none is bonded), instead of the smallest delegation, which was often a slashed, jailed validator; `RemoveValidator` no longer redelegates onto paused validators
 * `Rebalance` is owner only (anyone could lock validators against redelegation for an unbonding period), drains every validator outside the bonded active set in full, tops up active validators that hold nothing, and sends each move as an isolated submessage (max 50 per call)
 * rewards withdrawn automatically by bond / unbond / redelegate / rebalance / remove-validator are now recorded (hub-tf replies to every staking message, like the CW20 hub) and reinvested at the next harvest; `Reinvest` bonds the recorded rewards instead of a balance delta that skipped them, and never bonds funds owed to matured batches
