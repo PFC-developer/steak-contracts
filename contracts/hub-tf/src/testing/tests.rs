@@ -80,10 +80,11 @@ fn migration_repairs_active_validator_registry() {
     let response = migrate(deps.as_mut(), mock_env(), Default::default()).unwrap();
 
     assert!(VALIDATORS.contains(deps.as_ref().storage, "charlie"));
-    assert!(response
-        .attributes
-        .iter()
-        .any(|attribute| attribute.key == "validator_registry_repairs" && attribute.value == "1"));
+    assert!(
+        response.attributes.iter().any(
+            |attribute| attribute.key == "validator_registry_repairs" && attribute.value == "1"
+        )
+    );
 }
 
 fn setup_test_fee_split() -> OwnedDeps<MockStorage, MockApi, CustomQuerier> {
@@ -1161,15 +1162,11 @@ fn removing_validator() {
     assert_eq!(VALIDATORS.count(deps.as_ref().storage).unwrap(), 2);
     assert!(!VALIDATORS_ACTIVE.contains(deps.as_ref().storage, "charlie"));
 
-    let err = execute(
-        deps.as_mut(),
-        mock_env(),
-        mock_info("larry", &[]),
-        ExecuteMsg::UnPauseValidator {
+    let err =
+        execute(deps.as_mut(), mock_env(), mock_info("larry", &[]), ExecuteMsg::UnPauseValidator {
             validator: "charlie".to_string(),
-        },
-    )
-    .unwrap_err();
+        })
+        .unwrap_err();
     assert_eq!(err, StdError::generic_err("validator is not in the delegation set"));
 }
 

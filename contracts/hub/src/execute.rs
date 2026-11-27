@@ -512,9 +512,7 @@ pub fn submit_batch(deps: DepsMut, env: Env) -> StdResult<Response> {
     let delegations = query_all_delegations(&deps.querier, &env.contract.address)?;
     let usteak_supply = query_cw20_total_supply(&deps.querier, &steak_token)?;
     if usteak_supply.is_zero() || pending_batch.usteak_to_burn > usteak_supply {
-        return Err(StdError::generic_err(
-            "unbond batch exceeds the derivative token supply",
-        ));
+        return Err(StdError::generic_err("unbond batch exceeds the derivative token supply"));
     }
     if delegations.is_empty() || delegations.iter().all(|d| d.amount == 0) {
         return Err(StdError::generic_err("cannot unbond without delegated backing"));

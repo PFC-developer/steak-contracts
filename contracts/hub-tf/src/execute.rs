@@ -184,8 +184,7 @@ pub fn bond(
     if mint_steak {
         // Query the current supply of Steak and compute the amount to mint
         //   let usteak_supply = steak_minted;
-        let usteak_to_mint =
-            compute_mint_amount(steak_minted, amount_to_bond, &delegations_all)?;
+        let usteak_to_mint = compute_mint_amount(steak_minted, amount_to_bond, &delegations_all)?;
         state.steak_minted.save(deps.storage, &(steak_minted + usteak_to_mint))?;
         // TODO deal with multiple token returns
         state.prev_denom.save(
@@ -569,9 +568,7 @@ pub fn submit_batch(deps: DepsMut, env: Env) -> StdResult<Response> {
         return Err(StdError::generic_err("cannot submit an empty unbond batch"));
     }
     if usteak_supply.is_zero() || pending_batch.usteak_to_burn > usteak_supply {
-        return Err(StdError::generic_err(
-            "unbond batch exceeds the derivative token supply",
-        ));
+        return Err(StdError::generic_err("unbond batch exceeds the derivative token supply"));
     }
 
     let delegations = query_all_delegations(&deps.querier, &env.contract.address)?;

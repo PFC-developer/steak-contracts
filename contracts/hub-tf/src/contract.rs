@@ -1,8 +1,8 @@
 use std::convert::TryInto;
 
 use cosmwasm_std::{
-    Binary, Deps, DepsMut, Env, MessageInfo, Order, Reply, Response, StdError, StdResult, entry_point,
-    to_json_binary,
+    Binary, Deps, DepsMut, Env, MessageInfo, Order, Reply, Response, StdError, StdResult,
+    entry_point, to_json_binary,
 };
 use cw2::{ContractVersion, get_contract_version, set_contract_version};
 use pfc_steak::{

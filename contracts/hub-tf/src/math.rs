@@ -43,9 +43,7 @@ pub(crate) fn compute_unbond_amount(
     all_delegations: &[Delegation],
 ) -> StdResult<Uint128> {
     if usteak_supply.is_zero() || usteak_to_burn > usteak_supply {
-        return Err(StdError::generic_err(
-            "unbond amount exceeds the derivative token supply",
-        ));
+        return Err(StdError::generic_err("unbond amount exceeds the derivative token supply"));
     }
 
     Uint128::new(total_delegated(all_delegations)?)
