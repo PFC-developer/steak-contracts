@@ -716,8 +716,23 @@ pub fn submit_batch(deps: DepsMut, env: Env) -> StdResult<Response> {
             pending_batch.est_unbond_start_time
         )));
     }
+    // Nothing queued: roll the epoch forward instead of failing, so a keeper calling this every
+    // epoch keeps working and the first request after a quiet period still waits a full epoch
+    // for others to join its batch.
     if pending_batch.usteak_to_burn.is_zero() {
-        return Err(StdError::generic_err("cannot submit an empty unbond batch"));
+        let epoch_period = state.epoch_period.load(deps.storage)?;
+        let next_start = current_time + epoch_period;
+        state.pending_batch.save(deps.storage, &PendingBatch {
+            est_unbond_start_time: next_start,
+            ..pending_batch
+        })?;
+        return Ok(Response::new()
+            .add_event(
+                Event::new("steakhub/empty_batch_skipped")
+                    .add_attribute("id", pending_batch.id.to_string())
+                    .add_attribute("est_unbond_start_time", next_start.to_string()),
+            )
+            .add_attribute("action", "steakhub/submit_batch"));
     }
     // The staking module refuses an undelegation once `MAX_UNBONDING_ENTRIES` are pending for the
     // same validator, which would fail the whole batch. Defer while that many earlier batches are
