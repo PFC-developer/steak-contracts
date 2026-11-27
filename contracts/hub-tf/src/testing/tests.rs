@@ -2821,7 +2821,7 @@ fn withdrawing_from_a_batch_awaiting_reconcile_records_it() {
 }
 
 #[test]
-fn withdrawals_saturate_a_short_reserve_and_keep_dust_claims() {
+fn withdrawals_fail_closed_on_a_short_reserve_and_keep_dust_claims() {
     let mut deps = setup_test();
     let batch = Batch {
         id: 1,
@@ -2865,8 +2865,9 @@ fn withdrawals_saturate_a_short_reserve_and_keep_dust_claims() {
         unbond_requests().may_load(deps.as_ref().storage, (1, dust.as_str())).unwrap().is_some()
     );
 
-    // The whale's 99 exceeds the 50 reserve: paid, the reserve saturates, and it is reported.
-    let res = execute(
+    // The whale's 99 exceeds the 50 reserve. Paying it would take funds from another accounting
+    // bucket, so the withdrawal fails before changing either the claim or its batch.
+    let err = execute(
         deps.as_mut(),
         mock_env_at_timestamp(20000),
         mock_info(whale.as_str(), &[]),
@@ -2874,9 +2875,17 @@ fn withdrawals_saturate_a_short_reserve_and_keep_dust_claims() {
             receiver: None,
         },
     )
-    .unwrap();
-    assert_eq!(res.messages.len(), 1);
-    let withdrawn = res.events.iter().find(|e| e.ty == "steakhub/unbonded_withdrawn").unwrap();
-    assert!(withdrawn.attributes.iter().any(|a| a.key == "reserve_shortfall" && a.value == "49"));
-    assert_eq!(NATIVE_RESERVED.load(deps.as_ref().storage).unwrap(), Uint128::zero());
+    .unwrap_err();
+    assert_eq!(
+        err,
+        StdError::generic_err("native reserve is smaller than the reconciled withdrawal")
+    );
+    assert_eq!(NATIVE_RESERVED.load(deps.as_ref().storage).unwrap(), Uint128::new(50));
+    assert!(
+        unbond_requests().may_load(deps.as_ref().storage, (1, whale.as_str())).unwrap().is_some()
+    );
+    assert_eq!(
+        previous_batches().load(deps.as_ref().storage, 1).unwrap().amount_unclaimed,
+        Uint128::new(100)
+    );
 }

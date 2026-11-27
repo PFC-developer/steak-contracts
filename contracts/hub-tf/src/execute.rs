@@ -1119,6 +1119,7 @@ pub fn withdraw_unbonded(
     let mut ids: Vec<String> = vec![];
     let mut zero_refund_ids: Vec<String> = vec![];
     let mut awaiting: Vec<u64> = vec![];
+    let mut withdrawals: Vec<(u64, Option<Batch>)> = vec![];
     for request in &requests {
         if let Ok(mut batch) = previous_batches().load(deps.storage, request.id) {
             if batch.est_unbond_end_time >= current_time {
@@ -1148,26 +1149,24 @@ pub fn withdraw_unbonded(
 
             if batch.total_shares.is_zero() {
                 released += batch.amount_unclaimed;
-                previous_batches().remove(deps.storage, request.id)?;
+                withdrawals.push((request.id, None));
             } else {
-                previous_batches().save(deps.storage, batch.id, &batch)?;
+                withdrawals.push((request.id, Some(batch)));
             }
-
-            unbond_requests().remove(deps.storage, (request.id, user.as_ref()))?;
-        }
-    }
-
-    // Record matured batches that are still waiting for `Reconcile`, so that a withdrawal bundled
-    // after `Reconcile` still moves them towards settlement even though it pays nothing yet.
-    for id in &awaiting {
-        if RECONCILE_OBSERVED_HEIGHTS.may_load(deps.storage, *id)?.is_none() {
-            RECONCILE_OBSERVED_HEIGHTS.save(deps.storage, *id, &env.block.height)?;
         }
     }
 
     if ids.is_empty() {
         if awaiting.is_empty() {
             return Err(StdError::generic_err("withdrawable amount is zero"));
+        }
+        // Record matured batches that are still waiting for `Reconcile`, so that a withdrawal
+        // bundled after `Reconcile` still moves them towards settlement even though it pays
+        // nothing yet.
+        for id in &awaiting {
+            if RECONCILE_OBSERVED_HEIGHTS.may_load(deps.storage, *id)?.is_none() {
+                RECONCILE_OBSERVED_HEIGHTS.save(deps.storage, *id, &env.block.height)?;
+            }
         }
         let awaiting = awaiting.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
         return Ok(Response::new()
@@ -1180,11 +1179,28 @@ pub fn withdraw_unbonded(
     }
 
     // Only reconciled batches pay out, so everything refunded (plus dust left on a batch that was
-    // removed) was part of the reserve. Should the reserve ever fall short of that, saturate and
-    // say so rather than lock the claimers out.
+    // removed) must be part of the reserve. Paying more would draw from funds belonging to
+    // unreconciled batches or recorded rewards, so fail closed if the accounting invariant does
+    // not hold. No withdrawal state has been changed yet.
     let released_total = total_native_to_refund.checked_add(released)?;
-    let reserve_shortfall = released_total.saturating_sub(reserved);
-    NATIVE_RESERVED.save(deps.storage, &reserved.saturating_sub(released_total))?;
+    let remaining_reserved = reserved.checked_sub(released_total).map_err(|_| {
+        StdError::generic_err("native reserve is smaller than the reconciled withdrawal")
+    })?;
+
+    for (id, batch) in withdrawals {
+        if let Some(batch) = batch {
+            previous_batches().save(deps.storage, id, &batch)?;
+        } else {
+            previous_batches().remove(deps.storage, id)?;
+        }
+        unbond_requests().remove(deps.storage, (id, user.as_ref()))?;
+    }
+    for id in &awaiting {
+        if RECONCILE_OBSERVED_HEIGHTS.may_load(deps.storage, *id)?.is_none() {
+            RECONCILE_OBSERVED_HEIGHTS.save(deps.storage, *id, &env.block.height)?;
+        }
+    }
+    NATIVE_RESERVED.save(deps.storage, &remaining_reserved)?;
 
     let mut event = Event::new("steakhub/unbonded_withdrawn")
         .add_attribute("time", env.block.time.seconds().to_string())
@@ -1196,10 +1212,6 @@ pub fn withdraw_unbonded(
     if !zero_refund_ids.is_empty() {
         event = event.add_attribute("zero_refund_ids", zero_refund_ids.join(","));
     }
-    if !reserve_shortfall.is_zero() {
-        event = event.add_attribute("reserve_shortfall", reserve_shortfall);
-    }
-
     let mut response =
         Response::new().add_event(event).add_attribute("action", "steakhub/withdraw_unbonded");
     if !total_native_to_refund.is_zero() {
