@@ -1,6 +1,6 @@
-use std::{cmp, cmp::Ordering};
+use std::{cmp, cmp::Ordering, convert::TryFrom};
 
-use cosmwasm_std::{StdError, StdResult, Uint128};
+use cosmwasm_std::{StdError, StdResult, Uint128, Uint256};
 use pfc_steak::hub::Batch;
 
 use crate::types::{Delegation, Redelegation, Undelegation};
@@ -282,50 +282,33 @@ pub(crate) fn compute_redelegations_for_rebalancing(
 // Batch logics
 //--------------------------------------------------------------------------------------------------
 
-/// If the received native amount after the unbonding period is less than expected, e.g. due to
-/// rounding error or the validator(s) being slashed, then deduct the difference in amount evenly
-/// from each unreconciled batch.
-///
-/// The idea of "reconciling" is based on Stader's implementation:
-/// https://github.com/stader-labs/stader-liquid-token/blob/v0.2.1/contracts/staking/src/contract.rs#L968-L1048
-pub(crate) fn reconcile_batches(batches: &mut [Batch], native_to_deduct: Uint128) {
-    let mut remaining = native_to_deduct;
-    let mut active = batches
-        .iter()
-        .enumerate()
-        .filter_map(|(index, batch)| (!batch.amount_unclaimed.is_zero()).then_some(index))
-        .collect::<Vec<_>>();
-
-    // Repeatedly distribute the remaining shortfall across only the batches that still have
-    // value. This water-fill guarantees that the exact capped deduction is applied even when
-    // small batches hit zero in an earlier pass.
-    while !remaining.is_zero() && !active.is_empty() {
-        let batch_count = active.len() as u128;
-        let native_per_batch = remaining.u128() / batch_count;
-        let mut remainder = remaining.u128() % batch_count;
-        let mut deducted = Uint128::zero();
-        let mut next_active = Vec::with_capacity(active.len());
-
-        for index in active {
-            let extra = u128::from(remainder > 0);
-            remainder = remainder.saturating_sub(extra);
-            let target = Uint128::new(native_per_batch + extra);
-            let amount = batches[index].amount_unclaimed.min(target);
-            batches[index].amount_unclaimed -= amount;
-            deducted += amount;
-            if !batches[index].amount_unclaimed.is_zero() {
-                next_active.push(index);
-            }
-        }
-
-        if deducted.is_zero() {
-            break;
-        }
-        remaining -= deducted;
-        active = next_active;
+/// The part of `deduct` that a batch holding `amount` out of `total` bears pro rata, rounded up so
+/// the parts add up to at least `deduct`. Never more than `amount` when `deduct <= total`.
+pub(crate) fn pro_rata_share(deduct: Uint128, amount: Uint128, total: Uint128) -> Uint128 {
+    if total.is_zero() {
+        return Uint128::zero();
     }
+    let numerator = deduct.full_mul(amount);
+    let denominator = Uint256::from(total);
+    let mut share = numerator / denominator;
+    if share * denominator < numerator {
+        share += Uint256::one();
+    }
+    Uint128::try_from(share).unwrap_or(Uint128::MAX).min(amount)
+}
 
-    for batch in batches {
+/// Write `native_to_deduct` (capped at what the batches hold) down across `batches` in proportion
+/// to what each holds, and mark them reconciled. The batches share one balance, so a missing
+/// amount cannot be attributed to any one of them. Rounding goes to the earlier batches; exactly
+/// the capped amount is applied.
+pub(crate) fn reconcile_batches(batches: &mut [Batch], native_to_deduct: Uint128) {
+    let total: Uint128 = batches.iter().map(|b| b.amount_unclaimed).sum();
+    let deduct = native_to_deduct.min(total);
+    let mut remaining = deduct;
+    for batch in batches.iter_mut() {
+        let share = pro_rata_share(deduct, batch.amount_unclaimed, total).min(remaining);
+        batch.amount_unclaimed -= share;
+        remaining -= share;
         batch.reconciled = true;
     }
 }

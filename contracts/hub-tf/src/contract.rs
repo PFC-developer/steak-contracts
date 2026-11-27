@@ -263,14 +263,18 @@ pub fn migrate(mut deps: DepsMut, env: Env, _msg: MigrateMsg) -> StdResult<Respo
 
     let reserve_initialization =
         execute::prepare_native_reserved_initialization(deps.branch(), &env)?;
-    let (native_reserved, legacy_written_down) = match reserve_initialization {
-        Some((reserved, written_down)) => (reserved.to_string(), written_down.to_string()),
-        None => ("pending".to_string(), "pending".to_string()),
+    let (native_reserved, legacy_written_down) = match &reserve_initialization {
+        execute::ReserveInitStep::Done {
+            reserved,
+            written_down,
+        } => (reserved.to_string(), written_down.to_string()),
+        _ => ("pending".to_string(), "pending".to_string()),
     };
 
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
 
     Ok(Response::new()
+        .add_event(execute::reserve_initialization_event(&reserve_initialization))
         .add_attribute("previous_contract_name", &contract_version.contract)
         .add_attribute("previous_contract_version", &contract_version.version)
         .add_attribute("new_contract_name", CONTRACT_NAME)
