@@ -566,7 +566,9 @@ fn harvesting_and_reinvesting_after_inactive_redelegation() {
         deps.as_mut(),
         mock_env(),
         mock_info("worker", &[]),
-        ExecuteMsg::Callback(CallbackMsg::HarvestAfterRedelegation {}),
+        ExecuteMsg::Callback(CallbackMsg::HarvestAfterRedelegation {
+            exclude: vec![],
+        }),
     )
     .unwrap_err();
     assert_eq!(err, StdError::generic_err("callbacks can only be invoked by the contract itself"));
@@ -575,7 +577,9 @@ fn harvesting_and_reinvesting_after_inactive_redelegation() {
         deps.as_mut(),
         mock_env(),
         mock_info(MOCK_CONTRACT_ADDR, &[]),
-        ExecuteMsg::Callback(CallbackMsg::HarvestAfterRedelegation {}),
+        ExecuteMsg::Callback(CallbackMsg::HarvestAfterRedelegation {
+            exclude: vec![],
+        }),
     )
     .unwrap();
 
@@ -598,7 +602,9 @@ fn harvesting_and_reinvesting_after_inactive_redelegation() {
             }),
             REPLY_REGISTER_RECEIVED_COINS,
         ),
-        callback_submsg(CallbackMsg::ReinvestIfNeeded {}),
+        callback_submsg(CallbackMsg::ReinvestIfNeeded {
+            exclude: vec![],
+        }),
     ]);
     assert_eq!(state.prev_denom.load(deps.as_ref().storage).unwrap(), Uint128::new(100));
 
@@ -608,7 +614,9 @@ fn harvesting_and_reinvesting_after_inactive_redelegation() {
         deps.as_mut(),
         mock_env(),
         mock_info(MOCK_CONTRACT_ADDR, &[]),
-        ExecuteMsg::Callback(CallbackMsg::ReinvestIfNeeded {}),
+        ExecuteMsg::Callback(CallbackMsg::ReinvestIfNeeded {
+            exclude: vec![],
+        }),
     )
     .unwrap_err();
     assert_eq!(err, StdError::generic_err("cannot reinvest without a bonded active validator"));
@@ -619,7 +627,9 @@ fn harvesting_and_reinvesting_after_inactive_redelegation() {
         deps.as_mut(),
         mock_env(),
         mock_info(MOCK_CONTRACT_ADDR, &[]),
-        ExecuteMsg::Callback(CallbackMsg::ReinvestIfNeeded {}),
+        ExecuteMsg::Callback(CallbackMsg::ReinvestIfNeeded {
+            exclude: vec![],
+        }),
     )
     .unwrap();
     assert_eq!(res.messages[0], SubMsg::new(Delegation::new("bob", 45, "uxyz").to_cosmos_msg()));
@@ -629,7 +639,9 @@ fn harvesting_and_reinvesting_after_inactive_redelegation() {
         deps.as_mut(),
         mock_env(),
         mock_info(MOCK_CONTRACT_ADDR, &[]),
-        ExecuteMsg::Callback(CallbackMsg::ReinvestIfNeeded {}),
+        ExecuteMsg::Callback(CallbackMsg::ReinvestIfNeeded {
+            exclude: vec![],
+        }),
     )
     .unwrap();
     assert!(res.messages.is_empty());
@@ -2187,7 +2199,9 @@ fn redelegating_inactive_validators() {
             gas_limit: None,
             reply_on: ReplyOn::Always,
         },
-        callback_submsg(CallbackMsg::HarvestAfterRedelegation {}),
+        callback_submsg(CallbackMsg::HarvestAfterRedelegation {
+            exclude: vec![],
+        }),
     ]);
     let summary = res.events.iter().find(|e| e.ty == "steakhub/redelegated_inactive").unwrap();
     let attr = |key: &str| {
@@ -2227,7 +2241,9 @@ fn redelegating_inactive_validators() {
             gas_limit: None,
             reply_on: ReplyOn::Always,
         },
-        callback_submsg(CallbackMsg::HarvestAfterRedelegation {}),
+        callback_submsg(CallbackMsg::HarvestAfterRedelegation {
+            exclude: vec![],
+        }),
     ]);
 
     // Nothing left on inactive validators: re-running is a harmless no-op.
@@ -2369,7 +2385,9 @@ fn redelegating_inactive_respects_exclude_and_bonded_set() {
             gas_limit: None,
             reply_on: ReplyOn::Always,
         },
-        callback_submsg(CallbackMsg::HarvestAfterRedelegation {}),
+        callback_submsg(CallbackMsg::HarvestAfterRedelegation {
+            exclude: vec!["charlie".to_string()],
+        }),
     ]);
     let summary = res.events.iter().find(|e| e.ty == "steakhub/redelegated_inactive").unwrap();
     let attr = |key: &str| {
@@ -2404,4 +2422,54 @@ fn successful_inactive_redelegation_registers_withdrawn_rewards() {
 
     let unlocked = state.unlocked_coins.load(deps.as_ref().storage).unwrap();
     assert_eq!(unlocked, vec![Coin::new(123, "uxyz")]);
+}
+
+#[test]
+fn reinvest_after_redelegation_skips_excluded_validators() {
+    let mut deps = setup_test();
+    let state = State::default();
+    deps.querier.set_staking_delegations(&[
+        Delegation::new("alice", 100, "uxyz"),
+        Delegation::new("bob", 200, "uxyz"),
+        Delegation::new("charlie", 300, "uxyz"),
+    ]);
+    deps.querier.set_bonded_validators(&["alice", "bob", "charlie"]);
+    state.prev_denom.save(deps.as_mut().storage, &Uint128::new(100)).unwrap();
+    deps.querier.set_bank_balances(&[Coin::new(150, "uxyz")]);
+
+    // The harvest passes the exclude list on to the reinvest.
+    let res = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info(MOCK_CONTRACT_ADDR, &[]),
+        ExecuteMsg::Callback(CallbackMsg::HarvestAfterRedelegation {
+            exclude: vec!["alice".to_string()],
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        res.messages.last().unwrap(),
+        &callback_submsg(CallbackMsg::ReinvestIfNeeded {
+            exclude: vec!["alice".to_string()],
+        })
+    );
+
+    // alice has the smallest delegation but was excluded (e.g. she refuses new stake): the 45
+    // after fee goes to bob instead.
+    let res = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info(MOCK_CONTRACT_ADDR, &[]),
+        ExecuteMsg::Callback(CallbackMsg::ReinvestIfNeeded {
+            exclude: vec!["alice".to_string()],
+        }),
+    )
+    .unwrap();
+    assert_eq!(res.messages[0], SubMsg::new(Delegation::new("bob", 45, "uxyz").to_cosmos_msg()));
+
+    // Older callback messages without the field still parse.
+    let legacy: CallbackMsg = cosmwasm_std::from_json(br#"{"reinvest_if_needed":{}}"#).unwrap();
+    assert_eq!(legacy, CallbackMsg::ReinvestIfNeeded {
+        exclude: vec![],
+    });
 }

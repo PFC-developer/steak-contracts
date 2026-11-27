@@ -1,6 +1,7 @@
 # changelog
 
 ## 3.0.22
+* the reward reinvest that follows `RedelegateInactive` honours its `exclude` list, so an excluded validator that refuses new stake can no longer revert every re-run (`CallbackMsg::HarvestAfterRedelegation` / `ReinvestIfNeeded` gain a defaulted `exclude` field)
 * add owner-only `RedelegateInactive { limit, exclude }` to both hubs: moves stake off validators outside the active set (paused, or removed without redelegation) onto the active validators the chain currently has bonded. Each redelegation is an isolated submessage, so ones the staking module refuses (transitive redelegation, max entries) are skipped and reported, and the call can be re-run once they mature; `exclude` keeps known-blocked validators from using up `limit` (default 25, max 50). Rewards withdrawn by the redelegations are harvested and reinvested atomically through the new `CallbackMsg::HarvestAfterRedelegation` / `ReinvestIfNeeded`; a reward-finalization failure reverts the transaction so no reward balance can be stranded, and reinvestment targets only active validators currently bonded on chain
 * `pfc-steak` 3.0.21: new `ExecuteMsg::RedelegateInactive` and `CallbackMsg` variants
 
