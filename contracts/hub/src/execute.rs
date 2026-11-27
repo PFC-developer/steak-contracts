@@ -17,9 +17,8 @@ use pfc_steak::{
 
 use crate::{
     contract::{
-        REDELEGATE_INACTIVE_DEFAULT_LIMIT, REDELEGATE_INACTIVE_MAX_LIMIT,
-        REPLY_HARVEST_AFTER_REDELEGATION, REPLY_INSTANTIATE_TOKEN, REPLY_REDELEGATE_INACTIVE_BASE,
-        REPLY_REGISTER_RECEIVED_COINS, REPLY_SUBMIT_BATCH,
+        REDELEGATE_INACTIVE_DEFAULT_LIMIT, REDELEGATE_INACTIVE_MAX_LIMIT, REPLY_INSTANTIATE_TOKEN,
+        REPLY_REDELEGATE_INACTIVE_BASE, REPLY_REGISTER_RECEIVED_COINS, REPLY_SUBMIT_BATCH,
     },
     helpers::{
         get_denom_balance, parse_received_fund, query_all_delegations, query_cw20_total_supply,
@@ -349,9 +348,13 @@ pub fn reinvest(deps: DepsMut, env: Env) -> StdResult<Response> {
     let denom = state.denom.load(deps.storage)?;
     let fee = state.fee_rate.load(deps.storage)?;
 
-    let validators = state.validators_active.load(deps.storage)?;
+    let validators_active = state.validators_active.load(deps.storage)?;
+    let bonded: Vec<String> =
+        deps.querier.query_all_validators()?.into_iter().map(|v| v.address).collect();
+    let validators: Vec<String> =
+        validators_active.into_iter().filter(|v| bonded.contains(v)).collect();
     if validators.is_empty() {
-        return Err(StdError::generic_err("cannot reinvest without an active validator"));
+        return Err(StdError::generic_err("cannot reinvest without a bonded active validator"));
     }
     let prev_coin = state.prev_denom.load(deps.storage)?;
     let current_coin =
@@ -972,26 +975,16 @@ pub fn redelegate_inactive(
         .add_events(events)
         .add_attribute("action", "steakhub/redelegate_inactive");
     if !new_redelegations.is_empty() {
-        // Isolated like the redelegations: if harvesting or reinvesting fails (for example the fee
-        // split contract refuses the deposit), report it instead of reverting the moves that
-        // succeeded. The rewards stay in the contract's balance until the next harvest.
-        response = response.add_submessage(SubMsg::reply_on_error(
+        // Reward finalization is atomic with the successful redelegations. If withdrawing,
+        // reinvesting or paying fees fails, rolling the whole transaction back preserves the
+        // pre-redelegation balance baseline instead of committing rewards that no later harvest
+        // can distinguish from the contract's existing balance.
+        response = response.add_message(
             CallbackMsg::HarvestAfterRedelegation {}.into_cosmos_msg(&env.contract.address)?,
-            REPLY_HARVEST_AFTER_REDELEGATION,
-        ));
+        );
     }
 
     Ok(response)
-}
-
-/// Reply for the harvest that follows `RedelegateInactive`; only sent on failure.
-pub fn harvest_after_redelegation_deferred(reply: Reply) -> Response {
-    let reason = match reply.result {
-        SubMsgResult::Err(err) => err,
-        SubMsgResult::Ok(_) => String::new(),
-    };
-    Response::new()
-        .add_event(Event::new("steakhub/reinvest_deferred").add_attribute("reason", reason))
 }
 
 fn redelegation_skipped(id: u64, reason: String) -> Response {
