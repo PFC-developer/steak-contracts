@@ -287,6 +287,9 @@ pub(crate) fn compute_redelegations_for_rebalancing(
 /// https://github.com/stader-labs/stader-liquid-token/blob/v0.2.1/contracts/staking/src/contract.rs#L968-L1048
 pub(crate) fn reconcile_batches(batches: &mut [Batch], native_to_deduct: Uint128) {
     let batch_count = batches.len() as u128;
+    if batch_count == 0 {
+        return;
+    }
     let native_per_batch = native_to_deduct.u128() / batch_count;
     let remainder = native_to_deduct.u128() % batch_count;
     //let mut remaining_underflow = Uint128::zero();
@@ -307,6 +310,9 @@ pub(crate) fn reconcile_batches(batches: &mut [Batch], native_to_deduct: Uint128
     }
     if !underflows.is_empty() {
         let batch_count: u128 = batch_count - (underflows.len() as u128);
+        if batch_count == 0 {
+            return;
+        }
         let to_deduct: Uint128 = underflows.iter().map(|v| v.1).sum();
         let native_per_batch = to_deduct.u128() / batch_count;
         let remainder = to_deduct.u128() % batch_count;

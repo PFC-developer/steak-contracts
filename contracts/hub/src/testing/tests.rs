@@ -20,8 +20,9 @@ use super::{
 };
 use crate::{
     contract::{
-        REDELEGATE_INACTIVE_MAX_LIMIT, REPLY_INSTANTIATE_TOKEN, REPLY_REDELEGATE_INACTIVE_BASE,
-        REPLY_REGISTER_RECEIVED_COINS, REPLY_SUBMIT_BATCH, execute, instantiate, migrate, reply,
+        RECONCILE_GRACE_SECONDS, REDELEGATE_INACTIVE_MAX_LIMIT, REPLY_INSTANTIATE_TOKEN,
+        REPLY_REDELEGATE_INACTIVE_BASE, REPLY_REGISTER_RECEIVED_COINS, REPLY_SUBMIT_BATCH, execute,
+        instantiate, migrate, reply,
     },
     helpers::{parse_coin, parse_received_fund},
     math::{
@@ -1087,7 +1088,7 @@ fn reconciling() {
         .unwrap();
 
     deps.querier.set_bank_balances(&[
-        Coin::new(12345, "uxyz"),
+        Coin::new(12345 + 95197, "uxyz"), // includes batch 1, reconciled but unclaimed
         Coin::new(234, "ukrw"),
         Coin::new(345, "uusd"),
         Coin::new(69420, "ibc/0471F1C4E7AFD3F07702BEF6DC365268D64570F7C1FDC98EA6098DD6DE59817B"),
@@ -2291,4 +2292,88 @@ fn computing_redelegations_for_inactive() {
         Redelegation::new("dave", "erin", 100, "uxyz"),
     ]);
     assert!(compute_redelegations_for_inactive(&[], &delegations, 10, "uxyz").is_empty());
+}
+
+#[test]
+fn reconcile_waits_out_the_grace_period() {
+    let mut deps = setup_test();
+    let state = State::default();
+    // Batch 1 is due at 20000 but its funds are paid out at the end of the block, so they are not
+    // in the balance yet when a Reconcile lands in the first block after.
+    let batch = Batch {
+        id: 1,
+        reconciled: false,
+        total_shares: Uint128::new(1000),
+        amount_unclaimed: Uint128::new(1000),
+        est_unbond_end_time: 20000,
+    };
+    state.previous_batches.save(deps.as_mut().storage, batch.id, &batch).unwrap();
+    deps.querier.set_bank_balances(&[]);
+
+    execute(
+        deps.as_mut(),
+        mock_env_at_timestamp(20000 + RECONCILE_GRACE_SECONDS),
+        mock_info("anyone", &[]),
+        ExecuteMsg::Reconcile {},
+    )
+    .unwrap();
+    assert_eq!(
+        state.previous_batches.load(deps.as_ref().storage, 1u64).unwrap(),
+        batch,
+        "a reconcile inside the grace period must not write down"
+    );
+
+    // Past the grace period, funds that are still missing are treated as slashed.
+    execute(
+        deps.as_mut(),
+        mock_env_at_timestamp(20000 + RECONCILE_GRACE_SECONDS + 1),
+        mock_info("anyone", &[]),
+        ExecuteMsg::Reconcile {},
+    )
+    .unwrap();
+    let reconciled = state.previous_batches.load(deps.as_ref().storage, 1u64).unwrap();
+    assert!(reconciled.reconciled);
+    assert_eq!(reconciled.amount_unclaimed, Uint128::zero());
+}
+
+#[test]
+fn reconcile_does_not_count_funds_owed_to_reconciled_batches() {
+    let mut deps = setup_test();
+    let state = State::default();
+    // Batch 1 is reconciled and still owed 500. Batch 2 expected 1000 but only 800 arrived.
+    let batch1 = Batch {
+        id: 1,
+        reconciled: true,
+        total_shares: Uint128::new(500),
+        amount_unclaimed: Uint128::new(500),
+        est_unbond_end_time: 10000,
+    };
+    let batch2 = Batch {
+        id: 2,
+        reconciled: false,
+        total_shares: Uint128::new(1000),
+        amount_unclaimed: Uint128::new(1000),
+        est_unbond_end_time: 20000,
+    };
+    state.previous_batches.save(deps.as_mut().storage, batch1.id, &batch1).unwrap();
+    state.previous_batches.save(deps.as_mut().storage, batch2.id, &batch2).unwrap();
+    deps.querier.set_bank_balances(&[Coin::new(500 + 800, "uxyz")]);
+
+    execute(
+        deps.as_mut(),
+        mock_env_at_timestamp(30000),
+        mock_info("anyone", &[]),
+        ExecuteMsg::Reconcile {},
+    )
+    .unwrap();
+
+    // Without the reserve, batch 1's 500 would cover the 200 shortfall and batch 2 would keep 1000.
+    assert_eq!(
+        state.previous_batches.load(deps.as_ref().storage, 2u64).unwrap().amount_unclaimed,
+        Uint128::new(800)
+    );
+    assert_eq!(
+        state.previous_batches.load(deps.as_ref().storage, 1u64).unwrap().amount_unclaimed,
+        Uint128::new(500)
+    );
 }

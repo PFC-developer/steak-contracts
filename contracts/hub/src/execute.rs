@@ -17,8 +17,9 @@ use pfc_steak::{
 
 use crate::{
     contract::{
-        REDELEGATE_INACTIVE_DEFAULT_LIMIT, REDELEGATE_INACTIVE_MAX_LIMIT, REPLY_INSTANTIATE_TOKEN,
-        REPLY_REDELEGATE_INACTIVE_BASE, REPLY_REGISTER_RECEIVED_COINS, REPLY_SUBMIT_BATCH,
+        RECONCILE_GRACE_SECONDS, REDELEGATE_INACTIVE_DEFAULT_LIMIT, REDELEGATE_INACTIVE_MAX_LIMIT,
+        REPLY_INSTANTIATE_TOKEN, REPLY_REDELEGATE_INACTIVE_BASE, REPLY_REGISTER_RECEIVED_COINS,
+        REPLY_SUBMIT_BATCH,
     },
     helpers::{
         get_denom_balance, parse_received_fund, query_all_delegations, query_cw20_total_supply,
@@ -663,8 +664,13 @@ pub fn reconcile(deps: DepsMut, env: Env) -> StdResult<Response> {
 
     let mut batches = all_batches
         .into_iter()
-        .filter(|b| current_time > b.est_unbond_end_time)
+        .filter(|b| current_time > b.est_unbond_end_time.saturating_add(RECONCILE_GRACE_SECONDS))
         .collect::<Vec<_>>();
+    if batches.is_empty() {
+        return Ok(Response::new()
+            .add_event(Event::new("steakhub/reconciled").add_attribute("ids", ""))
+            .add_attribute("action", "steakhub/reconcile"));
+    }
 
     let native_expected_received: Uint128 = batches.iter().map(|b| b.amount_unclaimed).sum();
     let denom = state.denom.load(deps.storage)?;
@@ -673,12 +679,31 @@ pub fn reconcile(deps: DepsMut, env: Env) -> StdResult<Response> {
     let native_expected_unlocked = Coins(unlocked_coins).find(&denom).amount;
 
     let native_expected = native_expected_received + native_expected_unlocked;
-    let native_actual = deps.querier.query_balance(&env.contract.address, &denom)?.amount;
+    // Funds owed to batches that were already reconciled but not yet fully withdrawn sit in the
+    // same balance. They are not available to cover the batches being reconciled now; counting
+    // them would hide a shortfall until the last claimers of the older batches fail to withdraw.
+    let native_reserved: Uint128 = state
+        .previous_batches
+        .idx
+        .reconciled
+        .prefix(true.into())
+        .range(deps.storage, None, None, Order::Ascending)
+        .map(|item| item.map(|(_, b)| b.amount_unclaimed))
+        .sum::<StdResult<Uint128>>()?;
+    let native_actual = deps
+        .querier
+        .query_balance(&env.contract.address, &denom)?
+        .amount
+        .saturating_sub(native_reserved);
 
-    let native_to_deduct =
-        native_expected.checked_sub(native_actual).unwrap_or_else(|_| Uint128::zero());
+    // A batch cannot lose more than it holds; capping also keeps `reconcile_batches` from having
+    // to spread a deficit larger than every batch combined.
+    let native_to_deduct = native_expected
+        .checked_sub(native_actual)
+        .unwrap_or_else(|_| Uint128::zero())
+        .min(native_expected_received);
     if !native_to_deduct.is_zero() {
-        reconcile_batches(&mut batches, native_expected - native_actual);
+        reconcile_batches(&mut batches, native_to_deduct);
     }
 
     for batch in batches.iter_mut() {
