@@ -20,9 +20,9 @@ use super::{
 };
 use crate::{
     contract::{
-        RECONCILE_GRACE_SECONDS, REDELEGATE_INACTIVE_MAX_LIMIT, REPLY_HARVEST_AFTER_REDELEGATION,
-        REPLY_INSTANTIATE_TOKEN, REPLY_REDELEGATE_INACTIVE_BASE, REPLY_REGISTER_RECEIVED_COINS,
-        REPLY_SUBMIT_BATCH, execute, instantiate, migrate, reply,
+        RECONCILE_GRACE_SECONDS, REDELEGATE_INACTIVE_MAX_LIMIT, REPLY_INSTANTIATE_TOKEN,
+        REPLY_REDELEGATE_INACTIVE_BASE, REPLY_REGISTER_RECEIVED_COINS, REPLY_SUBMIT_BATCH, execute,
+        instantiate, migrate, reply,
     },
     helpers::{parse_coin, parse_received_fund},
     math::{
@@ -108,6 +108,7 @@ fn setup_test() -> OwnedDeps<MockStorage, MockApi, CustomQuerier> {
     assert_eq!(res.messages.len(), 0);
 
     deps.querier.set_cw20_total_supply("steak_token", 0);
+    deps.querier.set_bonded_validators(&["alice", "bob", "charlie"]);
     deps
 }
 
@@ -234,6 +235,7 @@ fn setup_test_fee_split() -> OwnedDeps<MockStorage, MockApi, CustomQuerier> {
     assert_eq!(res.messages.len(), 0);
 
     deps.querier.set_cw20_total_supply("steak_token", 0);
+    deps.querier.set_bonded_validators(&["alice", "bob", "charlie"]);
     deps
 }
 
@@ -603,6 +605,18 @@ fn harvesting_and_reinvesting_after_inactive_redelegation() {
     deps.querier.set_bank_balances(&[Coin::new(150, "uxyz")]);
     // The redelegations' and the harvest's withdrawals were registered as 50 uxyz of rewards.
     state.unlocked_coins.save(deps.as_mut().storage, &vec![Coin::new(50, "uxyz")]).unwrap();
+    deps.querier.set_bonded_validators(&[]);
+    let err = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info(MOCK_CONTRACT_ADDR, &[]),
+        ExecuteMsg::Callback(CallbackMsg::ReinvestIfNeeded {}),
+    )
+    .unwrap_err();
+    assert_eq!(err, StdError::generic_err("cannot reinvest without a bonded active validator"));
+
+    // alice has the smallest delegation but is no longer bonded, so reinvest with bob instead.
+    deps.querier.set_bonded_validators(&["bob", "charlie"]);
     let res = execute(
         deps.as_mut(),
         mock_env(),
@@ -610,7 +624,7 @@ fn harvesting_and_reinvesting_after_inactive_redelegation() {
         ExecuteMsg::Callback(CallbackMsg::ReinvestIfNeeded {}),
     )
     .unwrap();
-    assert_eq!(res.messages[0], SubMsg::new(Delegation::new("alice", 45, "uxyz").to_cosmos_msg()));
+    assert_eq!(res.messages[0], SubMsg::new(Delegation::new("bob", 45, "uxyz").to_cosmos_msg()));
 
     state.unlocked_coins.save(deps.as_mut().storage, &vec![]).unwrap();
     let res = execute(
@@ -2217,11 +2231,7 @@ fn redelegating_inactive_validators() {
             gas_limit: None,
             reply_on: ReplyOn::Always,
         },
-        SubMsg {
-            id: REPLY_HARVEST_AFTER_REDELEGATION,
-            reply_on: ReplyOn::Error,
-            ..callback_submsg(CallbackMsg::HarvestAfterRedelegation {})
-        },
+        callback_submsg(CallbackMsg::HarvestAfterRedelegation {}),
     ]);
     let summary = res.events.iter().find(|e| e.ty == "steakhub/redelegated_inactive").unwrap();
     let attr = |key: &str| {
@@ -2261,11 +2271,7 @@ fn redelegating_inactive_validators() {
             gas_limit: None,
             reply_on: ReplyOn::Always,
         },
-        SubMsg {
-            id: REPLY_HARVEST_AFTER_REDELEGATION,
-            reply_on: ReplyOn::Error,
-            ..callback_submsg(CallbackMsg::HarvestAfterRedelegation {})
-        },
+        callback_submsg(CallbackMsg::HarvestAfterRedelegation {}),
     ]);
 
     // Nothing left on inactive validators: re-running is a harmless no-op.
@@ -2407,11 +2413,7 @@ fn redelegating_inactive_respects_exclude_and_bonded_set() {
             gas_limit: None,
             reply_on: ReplyOn::Always,
         },
-        SubMsg {
-            id: REPLY_HARVEST_AFTER_REDELEGATION,
-            reply_on: ReplyOn::Error,
-            ..callback_submsg(CallbackMsg::HarvestAfterRedelegation {})
-        },
+        callback_submsg(CallbackMsg::HarvestAfterRedelegation {}),
     ]);
     let summary = res.events.iter().find(|e| e.ty == "steakhub/redelegated_inactive").unwrap();
     let attr = |key: &str| {
@@ -2420,22 +2422,6 @@ fn redelegating_inactive_respects_exclude_and_bonded_set() {
     assert_eq!(attr("inactive_before"), "250");
     assert_eq!(attr("inactive_excluded"), "200");
     assert_eq!(attr("inactive_unplanned"), "200");
-}
-
-#[test]
-fn failed_harvest_after_redelegation_is_reported() {
-    let mut deps = setup_test();
-
-    let res = reply(deps.as_mut(), mock_env(), Reply {
-        id: REPLY_HARVEST_AFTER_REDELEGATION,
-        result: cosmwasm_std::SubMsgResult::Err("codespace: wasm, code: 5".to_string()),
-    })
-    .unwrap();
-    assert!(res.messages.is_empty());
-    assert_eq!(res.events, vec![
-        Event::new("steakhub/reinvest_deferred")
-            .add_attribute("reason", "codespace: wasm, code: 5")
-    ]);
 }
 
 #[test]
