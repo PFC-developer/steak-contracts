@@ -286,11 +286,25 @@ pub fn migrate(deps: DepsMut, env: Env, _msg: MigrateMsg) -> StdResult<Response>
     state.fee_rate.save(deps.storage,&Decimal::from_ratio(10u32,100u32))?;
 
      */
+    let state = State::default();
+    let mut validator_registry_repairs = 0u64;
+    if let Some(active_validators) = state.validators_active.may_load(deps.storage)? {
+        let mut validators = state.validators.may_load(deps.storage)?.unwrap_or_default();
+        for validator in active_validators {
+            if !validators.contains(&validator) {
+                validators.push(validator);
+                validator_registry_repairs += 1;
+            }
+        }
+        state.validators.save(deps.storage, &validators)?;
+    }
+
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
 
     Ok(Response::new()
         .add_attribute("previous_contract_name", &contract_version.contract)
         .add_attribute("previous_contract_version", &contract_version.version)
         .add_attribute("new_contract_name", CONTRACT_NAME)
-        .add_attribute("new_contract_version", CONTRACT_VERSION))
+        .add_attribute("new_contract_version", CONTRACT_VERSION)
+        .add_attribute("validator_registry_repairs", validator_registry_repairs.to_string()))
 }

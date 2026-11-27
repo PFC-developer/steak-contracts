@@ -1,4 +1,4 @@
-use std::{collections::HashSet, str::FromStr};
+use std::str::FromStr;
 
 use cosmwasm_std::{
     Addr, BankMsg, Coin, CosmosMsg, Decimal, DepsMut, DistributionMsg, Env, Event, Order, ReplyOn,
@@ -144,6 +144,9 @@ pub fn bond(
     for v in VALIDATORS_ACTIVE.items(deps.storage, None, None, Order::Ascending) {
         validators.push(v?);
     }
+    if validators.is_empty() {
+        return Err(StdError::generic_err("cannot bond without an active validator"));
+    }
 
     // Query the current delegations made to validators, and find the validator with the smallest
     // delegated amount through a linear search
@@ -151,6 +154,12 @@ pub fn bond(
     // log(n))
     let delegations_all = query_all_delegations(&deps.querier, &env.contract.address)?;
     let delegations = query_delegations(&deps.querier, &validators, &env.contract.address, &denom)?;
+
+    if !steak_minted.is_zero() && delegations_all.iter().all(|d| d.amount == 0) {
+        return Err(StdError::generic_err(
+            "cannot bond while derivative supply exists without delegated backing",
+        ));
+    }
 
     let mut validator = &delegations[0].validator;
     let mut amount = delegations[0].amount;
@@ -175,7 +184,8 @@ pub fn bond(
     if mint_steak {
         // Query the current supply of Steak and compute the amount to mint
         //   let usteak_supply = steak_minted;
-        let usteak_to_mint = compute_mint_amount(steak_minted, amount_to_bond, &delegations_all);
+        let usteak_to_mint =
+            compute_mint_amount(steak_minted, amount_to_bond, &delegations_all)?;
         state.steak_minted.save(deps.storage, &(steak_minted + usteak_to_mint))?;
         // TODO deal with multiple token returns
         state.prev_denom.save(
@@ -341,6 +351,9 @@ pub fn reinvest(deps: DepsMut, env: Env) -> StdResult<Response> {
     let mut validators: Vec<String> = Default::default();
     for v in VALIDATORS_ACTIVE.items(deps.storage, None, None, Order::Ascending) {
         validators.push(v?);
+    }
+    if validators.is_empty() {
+        return Err(StdError::generic_err("cannot reinvest without an active validator"));
     }
     let prev_coin = state.prev_denom.load(deps.storage)?;
     let current_coin =
@@ -542,11 +555,6 @@ pub fn submit_batch(deps: DepsMut, env: Env) -> StdResult<Response> {
     let steak_denom = state.steak_denom.load(deps.storage)?;
     let token_factory_type = state.token_factory_type.load(deps.storage)?;
     let usteak_supply = state.steak_minted.load(deps.storage)?;
-    let mut validators: Vec<String> = Default::default();
-    for v in VALIDATORS.items(deps.storage, None, None, Order::Ascending) {
-        validators.push(v?);
-    }
-
     let unbond_period = state.unbond_period.load(deps.storage)?;
     let pending_batch = state.pending_batch.load(deps.storage)?;
 
@@ -557,28 +565,22 @@ pub fn submit_batch(deps: DepsMut, env: Env) -> StdResult<Response> {
             pending_batch.est_unbond_start_time
         )));
     }
-    let mut validators_active: HashSet<String> = Default::default();
-    for v in VALIDATORS_ACTIVE.items(deps.storage, None, None, Order::Ascending) {
-        validators_active.insert(v?);
+    if pending_batch.usteak_to_burn.is_zero() {
+        return Err(StdError::generic_err("cannot submit an empty unbond batch"));
     }
-    for v in validators.iter() {
-        validators_active.remove(v);
+    if usteak_supply.is_zero() || pending_batch.usteak_to_burn > usteak_supply {
+        return Err(StdError::generic_err(
+            "unbond batch exceeds the derivative token supply",
+        ));
     }
-    //   let active_validator_list = Vec::from_iter(validators_active);
 
-    // for unbonding we still need to look at
-    // TODO verify denom
     let delegations = query_all_delegations(&deps.querier, &env.contract.address)?;
-    //  let delegations_active =
-    //     query_delegations(&deps.querier, &active_validator_list, &env.contract.address, &denom)?;
-    // let usteak_supply = query_cw20_total_supply(&deps.querier, &steak_token)?;
+    if delegations.is_empty() || delegations.iter().all(|d| d.amount == 0) {
+        return Err(StdError::generic_err("cannot unbond without delegated backing"));
+    }
 
-    let amount_to_unbond = compute_unbond_amount(
-        usteak_supply,
-        pending_batch.usteak_to_burn,
-        &delegations,
-        //   &delegations_active,
-    );
+    let amount_to_unbond =
+        compute_unbond_amount(usteak_supply, pending_batch.usteak_to_burn, &delegations)?;
 
     let new_undelegations = compute_undelegations(amount_to_unbond, &delegations, &denom);
 
@@ -834,6 +836,9 @@ pub fn rebalance(deps: DepsMut, env: Env, minimum: Uint128) -> StdResult<Respons
     for v in VALIDATORS_ACTIVE.items(deps.storage, None, None, Order::Ascending) {
         validators_active.push(v?);
     }
+    if validators_active.is_empty() {
+        return Err(StdError::generic_err("cannot rebalance without an active validator"));
+    }
 
     let new_redelegations =
         compute_redelegations_for_rebalancing(validators_active, &delegations, minimum);
@@ -891,8 +896,11 @@ pub fn remove_validator(
     if !VALIDATORS.contains(deps.storage, &validator) {
         return Err(StdError::generic_err("validator is not already whitelisted"));
     }
+    if VALIDATORS.count(deps.storage)? <= 1 {
+        return Err(StdError::generic_err("cannot remove the last validator with redelegation"));
+    }
     VALIDATORS.remove(deps.storage, &validator)?;
-    VALIDATORS_ACTIVE.insert(deps.storage, &validator)?;
+    VALIDATORS_ACTIVE.remove(deps.storage, &validator)?;
     let mut validators: Vec<String> = Default::default();
     for v in VALIDATORS.items(deps.storage, None, None, Order::Ascending) {
         validators.push(v?);
@@ -940,6 +948,7 @@ pub fn remove_validator_ex(
         return Err(StdError::generic_err("validator is not already whitelisted"));
     }
     VALIDATORS.remove(deps.storage, &validator)?;
+    VALIDATORS_ACTIVE.remove(deps.storage, &validator)?;
 
     let event = Event::new("steak/validator_removed_ex").add_attribute("validator", validator);
 
@@ -975,6 +984,9 @@ pub fn unpause_validator(
     let state = State::default();
 
     state.assert_owner(deps.storage, &sender)?;
+    if !VALIDATORS.contains(deps.storage, &validator) {
+        return Err(StdError::generic_err("validator is not in the delegation set"));
+    }
     VALIDATORS_ACTIVE.insert(deps.storage, &validator)?;
 
     let event = Event::new("steak/unpause_validator").add_attribute("validator", validator);

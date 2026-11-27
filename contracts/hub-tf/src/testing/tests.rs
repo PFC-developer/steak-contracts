@@ -19,13 +19,13 @@ use super::{
     helpers::{mock_dependencies, mock_env_at_timestamp, query_helper},
 };
 use crate::{
-    contract::{REPLY_REGISTER_RECEIVED_COINS, execute, instantiate},
+    contract::{REPLY_REGISTER_RECEIVED_COINS, execute, instantiate, migrate},
     helpers::{parse_coin, parse_received_fund},
     math::{
         compute_redelegations_for_rebalancing, compute_redelegations_for_removal,
         compute_undelegations,
     },
-    state::{State, VALIDATORS, previous_batches, unbond_requests},
+    state::{State, VALIDATORS, VALIDATORS_ACTIVE, previous_batches, unbond_requests},
     token_factory::{
         denom,
         denom::{MsgBurn, MsgCreateDenom, MsgMint},
@@ -70,6 +70,20 @@ fn setup_test() -> OwnedDeps<MockStorage, MockApi, CustomQuerier> {
     assert_eq!(res.messages[0], SubMsg::new(c));
 
     deps
+}
+
+#[test]
+fn migration_repairs_active_validator_registry() {
+    let mut deps = setup_test();
+    VALIDATORS.remove(deps.as_mut().storage, "charlie").unwrap();
+
+    let response = migrate(deps.as_mut(), mock_env(), Default::default()).unwrap();
+
+    assert!(VALIDATORS.contains(deps.as_ref().storage, "charlie"));
+    assert!(response
+        .attributes
+        .iter()
+        .any(|attribute| attribute.key == "validator_registry_repairs" && attribute.value == "1"));
 }
 
 fn setup_test_fee_split() -> OwnedDeps<MockStorage, MockApi, CustomQuerier> {
@@ -293,6 +307,24 @@ fn bonding() {
         exchange_rate: Decimal::from_ratio(1037345u128, 1012043u128),
         unlocked_coins: vec![],
     });
+}
+
+#[test]
+fn state_uses_every_onchain_delegation() {
+    let mut deps = setup_test();
+    let state = State::default();
+
+    state.steak_minted.save(deps.as_mut().storage, &Uint128::new(100)).unwrap();
+    VALIDATORS.remove(deps.as_mut().storage, "charlie").unwrap();
+    VALIDATORS_ACTIVE.remove(deps.as_mut().storage, "charlie").unwrap();
+    deps.querier.set_staking_delegations(&[
+        Delegation::new("alice", 40, "uxyz"),
+        Delegation::new("charlie", 60, "uxyz"),
+    ]);
+
+    let response: StateResponse = query_helper(deps.as_ref(), QueryMsg::State {});
+    assert_eq!(response.total_native, Uint128::new(100));
+    assert_eq!(response.exchange_rate, Decimal::one());
 }
 
 #[test]
@@ -569,6 +601,10 @@ fn submitting_batch() {
     let mut deps = setup_test();
     let state = State::default();
 
+    // Reproduce the split registry state from the drain incident: Charlie is active but absent
+    // from the primary validator registry. His delegation must still be counted exactly once.
+    VALIDATORS.remove(deps.as_mut().storage, "charlie").unwrap();
+
     // uluna bonded: 1,037,345
     // usteak supply: 1,012,043
     // uluna per ustake: 1.025
@@ -682,6 +718,21 @@ fn submitting_batch() {
         amount_unclaimed: Uint128::new(95197),
         est_unbond_end_time: 2083601, // 269,201 + 1,814,400
     });
+}
+
+#[test]
+fn submitting_empty_batch_is_rejected() {
+    let mut deps = setup_test();
+
+    let err = execute(
+        deps.as_mut(),
+        mock_env_at_timestamp(269_201),
+        mock_info("worker", &[]),
+        ExecuteMsg::SubmitBatch {},
+    )
+    .unwrap_err();
+
+    assert_eq!(err, StdError::generic_err("cannot submit an empty unbond batch"));
 }
 
 #[test]
@@ -1108,6 +1159,18 @@ fn removing_validator() {
     assert!(VALIDATORS.contains(deps.as_ref().storage, "alice"));
     assert!(VALIDATORS.contains(deps.as_ref().storage, "bob"));
     assert_eq!(VALIDATORS.count(deps.as_ref().storage).unwrap(), 2);
+    assert!(!VALIDATORS_ACTIVE.contains(deps.as_ref().storage, "charlie"));
+
+    let err = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info("larry", &[]),
+        ExecuteMsg::UnPauseValidator {
+            validator: "charlie".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(err, StdError::generic_err("validator is not in the delegation set"));
 }
 
 #[test]
@@ -1418,7 +1481,7 @@ fn querying_unbond_requests() {
 
 #[test]
 fn computing_undelegations() {
-    let current_delegations = vec![
+    let current_delegations = [
         Delegation::new("alice", 400, "uxyz"),
         Delegation::new("bob", 300, "uxyz"),
         Delegation::new("charlie", 200, "uxyz"),
@@ -1440,7 +1503,7 @@ fn computing_undelegations() {
 
 #[test]
 fn computing_redelegations_for_removal() {
-    let current_delegations = vec![
+    let current_delegations = [
         Delegation::new("alice", 13000, "uxyz"),
         Delegation::new("bob", 12000, "uxyz"),
         Delegation::new("charlie", 11000, "uxyz"),
@@ -1577,6 +1640,8 @@ fn parsing_coin() {
 
     let err = parse_coin("ngmi").unwrap_err();
     assert_eq!(err, StdError::generic_err("Parsing u128: cannot parse integer from empty string"));
+
+    assert!(parse_coin("12💥uatom").is_err());
 }
 
 #[test]

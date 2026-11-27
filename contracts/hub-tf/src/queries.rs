@@ -1,7 +1,4 @@
-use std::{
-    collections::{BTreeSet, HashSet},
-    iter::FromIterator,
-};
+use std::{collections::BTreeSet, iter::FromIterator};
 
 use cosmwasm_std::{Decimal, Deps, Env, Order, StdResult, Uint128};
 use cw_storage_plus::Bound;
@@ -11,7 +8,7 @@ use pfc_steak::hub::{
 };
 
 use crate::{
-    helpers::query_delegations,
+    helpers::query_all_delegations,
     state,
     state::{State, VALIDATORS, VALIDATORS_ACTIVE},
 };
@@ -56,20 +53,8 @@ pub fn config(deps: Deps) -> StdResult<ConfigResponse> {
 
 pub fn state(deps: Deps, env: Env) -> StdResult<StateResponse> {
     let state = State::default();
-    let denom = state.denom.load(deps.storage)?;
     let total_usteak = state.steak_minted.load(deps.storage)?; // query_cw20_total_supply(&deps.querier, &steak_token)?;
-    let mut validators: HashSet<String> = Default::default();
-    for res in VALIDATORS.items(deps.storage, None, None, Order::Ascending) {
-        validators.insert(res?);
-    }
-    let mut validators_active: HashSet<String> = Default::default();
-    for res in VALIDATORS_ACTIVE.items(deps.storage, None, None, Order::Ascending) {
-        validators_active.insert(res?);
-    }
-    validators.extend(validators_active);
-    let validator_vec: Vec<String> = Vec::from_iter(validators);
-    let delegations =
-        query_delegations(&deps.querier, &validator_vec, &env.contract.address, &denom)?;
+    let delegations = query_all_delegations(&deps.querier, &env.contract.address)?;
     let total_native: u128 = delegations.iter().map(|d| d.amount).sum();
 
     let exchange_rate = if total_usteak.is_zero() {

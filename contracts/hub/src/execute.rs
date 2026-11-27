@@ -1,4 +1,4 @@
-use std::{collections::HashSet, iter::FromIterator, str::FromStr};
+use std::str::FromStr;
 
 use cosmwasm_std::{
     Addr, BankMsg, Binary, Coin, CosmosMsg, Decimal, DepsMut, DistributionMsg, Env, Event, Order,
@@ -134,6 +134,9 @@ pub fn bond(
     let amount_to_bond = parse_received_fund(&funds, &denom)?;
     let steak_token = state.steak_token.load(deps.storage)?;
     let validators = state.validators_active.load(deps.storage)?;
+    if validators.is_empty() {
+        return Err(StdError::generic_err("cannot bond without an active validator"));
+    }
 
     // Query the current delegations made to validators, and find the validator with the smallest
     // delegated amount through a linear search
@@ -158,7 +161,12 @@ pub fn bond(
 
     // Query the current supply of Steak and compute the amount to mint
     let usteak_supply = query_cw20_total_supply(&deps.querier, &steak_token)?;
-    let usteak_to_mint = compute_mint_amount(usteak_supply, amount_to_bond, &all_delegations);
+    if !usteak_supply.is_zero() && all_delegations.iter().all(|d| d.amount == 0) {
+        return Err(StdError::generic_err(
+            "cannot bond while derivative supply exists without delegated backing",
+        ));
+    }
+    let usteak_to_mint = compute_mint_amount(usteak_supply, amount_to_bond, &all_delegations)?;
     state.prev_denom.save(
         deps.storage,
         &get_denom_balance(&deps.querier, env.contract.address.clone(), denom.clone())?,
@@ -298,6 +306,9 @@ pub fn reinvest(deps: DepsMut, env: Env) -> StdResult<Response> {
     let fee = state.fee_rate.load(deps.storage)?;
 
     let validators = state.validators_active.load(deps.storage)?;
+    if validators.is_empty() {
+        return Err(StdError::generic_err("cannot reinvest without an active validator"));
+    }
     let prev_coin = state.prev_denom.load(deps.storage)?;
     let current_coin =
         get_denom_balance(&deps.querier, env.contract.address.clone(), denom.clone())?;
@@ -484,8 +495,6 @@ pub fn submit_batch(deps: DepsMut, env: Env) -> StdResult<Response> {
     let state = State::default();
     let denom = state.denom.load(deps.storage)?;
     let steak_token = state.steak_token.load(deps.storage)?;
-    let validators = state.validators.load(deps.storage)?;
-
     let unbond_period = state.unbond_period.load(deps.storage)?;
     let pending_batch = state.pending_batch.load(deps.storage)?;
 
@@ -496,21 +505,23 @@ pub fn submit_batch(deps: DepsMut, env: Env) -> StdResult<Response> {
             pending_batch.est_unbond_start_time
         )));
     }
-    let mut validators_active: HashSet<String> =
-        HashSet::from_iter(state.validators_active.load(deps.storage)?);
-    for v in validators.iter() {
-        validators_active.remove(v);
+    if pending_batch.usteak_to_burn.is_zero() {
+        return Err(StdError::generic_err("cannot submit an empty unbond batch"));
     }
-    //    let active_validator_list = Vec::from_iter(validators_active);
 
-    // for unbonding we still need to look at
     let delegations = query_all_delegations(&deps.querier, &env.contract.address)?;
-    //  let delegations_active =
-    //     query_delegations(&deps.querier, &active_validator_list, &env.contract.address, &denom)?;
     let usteak_supply = query_cw20_total_supply(&deps.querier, &steak_token)?;
+    if usteak_supply.is_zero() || pending_batch.usteak_to_burn > usteak_supply {
+        return Err(StdError::generic_err(
+            "unbond batch exceeds the derivative token supply",
+        ));
+    }
+    if delegations.is_empty() || delegations.iter().all(|d| d.amount == 0) {
+        return Err(StdError::generic_err("cannot unbond without delegated backing"));
+    }
 
     let amount_to_bond =
-        compute_unbond_amount(usteak_supply, pending_batch.usteak_to_burn, &delegations);
+        compute_unbond_amount(usteak_supply, pending_batch.usteak_to_burn, &delegations)?;
     let new_undelegations = compute_undelegations(amount_to_bond, &delegations, &denom);
 
     // NOTE: Regarding the `amount_unclaimed` value
@@ -727,6 +738,9 @@ pub fn rebalance(deps: DepsMut, env: Env, minimum: Uint128) -> StdResult<Respons
     let denom = state.denom.load(deps.storage)?;
     //let validators = state.validators.load(deps.storage)?;
     let validators_active = state.validators_active.load(deps.storage)?;
+    if validators_active.is_empty() {
+        return Err(StdError::generic_err("cannot rebalance without an active validator"));
+    }
 
     let delegations = query_all_delegations(&deps.querier, &env.contract.address)?;
 
@@ -790,13 +804,16 @@ pub fn remove_validator(
         if !validators.contains(&validator) {
             return Err(StdError::generic_err("validator is not already whitelisted"));
         }
+        if validators.len() <= 1 {
+            return Err(StdError::generic_err(
+                "cannot remove the last validator with redelegation",
+            ));
+        }
         validators.retain(|v| *v != validator);
         Ok(validators)
     })?;
     let mut validators_active = state.validators_active.load(deps.storage)?;
-    if !validators_active.contains(&validator) {
-        validators_active.push(validator.clone());
-    }
+    validators_active.retain(|v| *v != validator);
     state.validators_active.save(deps.storage, &validators_active)?;
 
     let delegations = query_delegations(&deps.querier, &validators, &env.contract.address, &denom)?;
@@ -839,6 +856,10 @@ pub fn remove_validator_ex(
         validators.retain(|v| *v != validator);
         Ok(validators)
     })?;
+    state.validators_active.update(deps.storage, |mut validators| -> StdResult<_> {
+        validators.retain(|v| *v != validator);
+        Ok(validators)
+    })?;
 
     let event = Event::new("steak/validator_removed_ex").add_attribute("validator", validator);
 
@@ -877,6 +898,9 @@ pub fn unpause_validator(
     let state = State::default();
 
     state.assert_owner(deps.storage, &sender)?;
+    if !state.validators.load(deps.storage)?.contains(&validator) {
+        return Err(StdError::generic_err("validator is not in the delegation set"));
+    }
     let mut validators_active = state.validators_active.load(deps.storage)?;
     if !validators_active.contains(&validator) {
         validators_active.push(validator.clone());

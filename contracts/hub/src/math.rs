@@ -1,6 +1,6 @@
 use std::{cmp, cmp::Ordering, collections::HashMap};
 
-use cosmwasm_std::Uint128;
+use cosmwasm_std::{StdError, StdResult, Uint128};
 use pfc_steak::hub::Batch;
 
 use crate::types::{Delegation, Redelegation, Undelegation};
@@ -16,15 +16,20 @@ pub(crate) fn compute_mint_amount(
     usteak_supply: Uint128,
     native_to_bond: Uint128,
     all_delegations: &[Delegation],
-    // inactive_delegations: &[Delegation],
-) -> Uint128 {
-    let native_bonded: u128 = all_delegations.iter().map(|d| d.amount).sum();
-    // let native_bonded_inactive: u128 = inactive_delegations.iter().map(|d| d.amount).sum();
-    // let native_bonded = native_bonded_c + native_bonded_inactive;
+) -> StdResult<Uint128> {
+    let native_bonded = total_delegated(all_delegations)?;
     if native_bonded == 0 {
-        native_to_bond
+        if usteak_supply.is_zero() {
+            Ok(native_to_bond)
+        } else {
+            Err(StdError::generic_err(
+                "cannot mint while derivative supply exists without delegated backing",
+            ))
+        }
     } else {
-        usteak_supply.multiply_ratio(native_to_bond, native_bonded)
+        usteak_supply
+            .checked_multiply_ratio(native_to_bond, native_bonded)
+            .map_err(|err| StdError::generic_err(format!("failed to compute mint amount: {err}")))
     }
 }
 
@@ -36,12 +41,24 @@ pub(crate) fn compute_unbond_amount(
     usteak_supply: Uint128,
     usteak_to_burn: Uint128,
     all_delegations: &[Delegation],
-    // active_delegations: &[Delegation],
-) -> Uint128 {
-    let native_bonded: u128 = all_delegations.iter().map(|d| d.amount).sum();
-    // let native_bonded_a: u128 = active_delegations.iter().map(|d| d.amount).sum();
-    //  let native_bonded = native_bonded_c + native_bonded_a;
-    Uint128::new(native_bonded).multiply_ratio(usteak_to_burn, usteak_supply)
+) -> StdResult<Uint128> {
+    if usteak_supply.is_zero() || usteak_to_burn > usteak_supply {
+        return Err(StdError::generic_err(
+            "unbond amount exceeds the derivative token supply",
+        ));
+    }
+
+    Uint128::new(total_delegated(all_delegations)?)
+        .checked_multiply_ratio(usteak_to_burn, usteak_supply)
+        .map_err(|err| StdError::generic_err(format!("failed to compute unbond amount: {err}")))
+}
+
+fn total_delegated(delegations: &[Delegation]) -> StdResult<u128> {
+    delegations.iter().try_fold(0u128, |total, delegation| {
+        total
+            .checked_add(delegation.amount)
+            .ok_or_else(|| StdError::generic_err("delegation total overflow"))
+    })
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -72,11 +89,7 @@ pub(crate) fn compute_undelegations(
         let remainder_for_validator: u128 = u128::from((i + 1) as u128 <= remainder);
         let native_for_validator = native_per_validator + remainder_for_validator;
 
-        let mut native_to_undelegate = if d.amount < native_for_validator {
-            0
-        } else {
-            d.amount - native_for_validator
-        };
+        let mut native_to_undelegate = d.amount.saturating_sub(native_for_validator);
 
         native_to_undelegate = cmp::min(native_to_undelegate, native_available);
         native_available -= native_to_undelegate;
@@ -117,11 +130,7 @@ pub(crate) fn compute_redelegations_for_removal(
         let remainder_for_validator: u128 = u128::from((i + 1) as u128 <= remainder);
         let native_for_validator = native_per_validator + remainder_for_validator;
 
-        let mut native_to_redelegate = if d.amount > native_for_validator {
-            0
-        } else {
-            native_for_validator - d.amount
-        };
+        let mut native_to_redelegate = native_for_validator.saturating_sub(d.amount);
 
         native_to_redelegate = cmp::min(native_to_redelegate, native_available);
         native_available -= native_to_redelegate;

@@ -1,7 +1,7 @@
 use std::convert::TryInto;
 
 use cosmwasm_std::{
-    Binary, Deps, DepsMut, Env, MessageInfo, Reply, Response, StdError, StdResult, entry_point,
+    Binary, Deps, DepsMut, Env, MessageInfo, Order, Reply, Response, StdError, StdResult, entry_point,
     to_json_binary,
 };
 use cw2::{ContractVersion, get_contract_version, set_contract_version};
@@ -10,7 +10,10 @@ use pfc_steak::{
     hub_tf::{ExecuteMsg, InstantiateMsg, TokenFactoryType},
 };
 
-use crate::{execute, queries, state::State};
+use crate::{
+    execute, queries,
+    state::{State, VALIDATORS, VALIDATORS_ACTIVE},
+};
 
 //use crate::helpers::{ unwrap_reply};
 
@@ -218,11 +221,23 @@ pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> StdResult<Response
     state.fee_rate.save(deps.storage,&Decimal::from_ratio(10u32,100u32))?;
 
      */
+    let active_validators = VALIDATORS_ACTIVE
+        .items(deps.storage, None, None, Order::Ascending)
+        .collect::<StdResult<Vec<_>>>()?;
+    let mut validator_registry_repairs = 0u64;
+    for validator in active_validators {
+        if !VALIDATORS.contains(deps.storage, &validator) {
+            VALIDATORS.insert(deps.storage, &validator)?;
+            validator_registry_repairs += 1;
+        }
+    }
+
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
 
     Ok(Response::new()
         .add_attribute("previous_contract_name", &contract_version.contract)
         .add_attribute("previous_contract_version", &contract_version.version)
         .add_attribute("new_contract_name", CONTRACT_NAME)
-        .add_attribute("new_contract_version", CONTRACT_VERSION))
+        .add_attribute("new_contract_version", CONTRACT_VERSION)
+        .add_attribute("validator_registry_repairs", validator_registry_repairs.to_string()))
 }
