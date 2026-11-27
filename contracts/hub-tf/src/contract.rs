@@ -215,7 +215,7 @@ pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
 }
 
 #[entry_point]
-pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> StdResult<Response> {
+pub fn migrate(mut deps: DepsMut, env: Env, _msg: MigrateMsg) -> StdResult<Response> {
     let contract_version = get_contract_version(deps.storage).unwrap_or_else(|_| ContractVersion {
         contract: "steak-hub-tf".to_string(),
         version: "0".to_string(),
@@ -261,6 +261,9 @@ pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> StdResult<Response
         }
     }
 
+    let (native_reserved, legacy_written_down) =
+        execute::initialize_native_reserved(deps.branch(), &env)?;
+
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
 
     Ok(Response::new()
@@ -268,5 +271,7 @@ pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> StdResult<Response
         .add_attribute("previous_contract_version", &contract_version.version)
         .add_attribute("new_contract_name", CONTRACT_NAME)
         .add_attribute("new_contract_version", CONTRACT_VERSION)
-        .add_attribute("validator_registry_repairs", validator_registry_repairs.to_string()))
+        .add_attribute("validator_registry_repairs", validator_registry_repairs.to_string())
+        .add_attribute("native_reserved", native_reserved)
+        .add_attribute("legacy_reconciled_written_down", legacy_written_down))
 }

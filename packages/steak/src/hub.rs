@@ -135,7 +135,12 @@ pub enum ExecuteMsg {
         limit: Option<u32>,
         exclude: Option<Vec<String>>,
     },
-    /// Update Luna amounts in unbonding batches to reflect any slashing or rounding errors
+    /// Update Luna amounts in unbonding batches to reflect any slashing or rounding errors.
+    ///
+    /// A batch is reconciled only by a call in a later block than the one in which it was first
+    /// observed past its estimated unbonding end (the staking module pays out at the end of a
+    /// block). So `Reconcile` followed by `WithdrawUnbonded` in the same transaction cannot
+    /// withdraw a batch that has only just matured: send the withdrawal in a later block.
     Reconcile {},
     /// Submit the current pending batch of unbonding requests to be unbonded
     SubmitBatch {},

@@ -28,7 +28,7 @@ use crate::{
         compute_redelegations_for_inactive, compute_redelegations_for_rebalancing,
         compute_redelegations_for_removal, compute_undelegations, reconcile_batches,
     },
-    state::State,
+    state::{NATIVE_RESERVED, State},
     types::{Coins, Delegation, Redelegation, Undelegation},
 };
 
@@ -1130,6 +1130,7 @@ fn reconciling() {
         Coin::new(69420, "ibc/0471F1C4E7AFD3F07702BEF6DC365268D64570F7C1FDC98EA6098DD6DE59817B"),
     ]);
 
+    NATIVE_RESERVED.save(deps.as_mut().storage, &Uint128::new(95197)).unwrap();
     observe_and_reconcile(&mut deps, 35000);
 
     // Expected received: batch 2 + batch 3 = 1385 + 1506 = 2891
@@ -2476,6 +2477,7 @@ fn reconcile_does_not_count_funds_owed_to_reconciled_batches() {
     };
     state.previous_batches.save(deps.as_mut().storage, batch1.id, &batch1).unwrap();
     state.previous_batches.save(deps.as_mut().storage, batch2.id, &batch2).unwrap();
+    NATIVE_RESERVED.save(deps.as_mut().storage, &Uint128::new(500)).unwrap();
     deps.querier.set_bank_balances(&[Coin::new(500 + 800, "uxyz")]);
 
     observe_and_reconcile(&mut deps, 30000);
@@ -2655,4 +2657,104 @@ fn reinvest_after_redelegation_skips_excluded_validators() {
     assert_eq!(legacy, CallbackMsg::ReinvestIfNeeded {
         exclude: vec![],
     });
+}
+
+#[test]
+fn reserve_tracks_reconciles_and_withdrawals() {
+    let mut deps = setup_test();
+    let state = State::default();
+    let batch = Batch {
+        id: 1,
+        reconciled: false,
+        total_shares: Uint128::new(1000),
+        amount_unclaimed: Uint128::new(1000),
+        est_unbond_end_time: 20000,
+    };
+    state.previous_batches.save(deps.as_mut().storage, batch.id, &batch).unwrap();
+    state
+        .unbond_requests
+        .save(deps.as_mut().storage, (1, &Addr::unchecked("user_1")), &UnbondRequest {
+            id: 1,
+            user: Addr::unchecked("user_1"),
+            shares: Uint128::new(400),
+        })
+        .unwrap();
+    deps.querier.set_bank_balances(&[Coin::new(1000, "uxyz")]);
+
+    // Observed in one block, reconciled in the next.
+    let mut env = mock_env_at_timestamp(20001);
+    execute(deps.as_mut(), env.clone(), mock_info("anyone", &[]), ExecuteMsg::Reconcile {})
+        .unwrap();
+    assert_eq!(NATIVE_RESERVED.load(deps.as_ref().storage).unwrap(), Uint128::zero());
+    env.block.height += 1;
+    execute(deps.as_mut(), env.clone(), mock_info("anyone", &[]), ExecuteMsg::Reconcile {})
+        .unwrap();
+    assert!(state.previous_batches.load(deps.as_ref().storage, 1u64).unwrap().reconciled);
+    assert_eq!(NATIVE_RESERVED.load(deps.as_ref().storage).unwrap(), Uint128::new(1000));
+
+    // A withdrawal releases exactly what it pays out.
+    execute(deps.as_mut(), env, mock_info("user_1", &[]), ExecuteMsg::WithdrawUnbonded {
+        receiver: None,
+    })
+    .unwrap();
+    assert_eq!(NATIVE_RESERVED.load(deps.as_ref().storage).unwrap(), Uint128::new(600));
+}
+
+#[test]
+fn migration_writes_down_legacy_reconciled_shortfall() {
+    let mut deps = setup_test();
+    let state = State::default();
+    // An older version reconciled two batches but left part of a shortfall unapplied: they claim
+    // 2000, the contract holds 1500 for them.
+    for id in 1..=2u64 {
+        let batch = Batch {
+            id,
+            reconciled: true,
+            total_shares: Uint128::new(1000),
+            amount_unclaimed: Uint128::new(1000),
+            est_unbond_end_time: 10000,
+        };
+        state.previous_batches.save(deps.as_mut().storage, batch.id, &batch).unwrap();
+    }
+    // A newer batch matured long ago and its 700 arrived; it is not theirs to use.
+    let batch = Batch {
+        id: 3,
+        reconciled: false,
+        total_shares: Uint128::new(700),
+        amount_unclaimed: Uint128::new(700),
+        est_unbond_end_time: 20000,
+    };
+    state.previous_batches.save(deps.as_mut().storage, batch.id, &batch).unwrap();
+    deps.querier.set_bank_balances(&[Coin::new(1500 + 700, "uxyz")]);
+    NATIVE_RESERVED.remove(deps.as_mut().storage);
+
+    let res = migrate(deps.as_mut(), mock_env(), Default::default()).unwrap();
+    assert!(
+        res.attributes
+            .iter()
+            .any(|a| a.key == "legacy_reconciled_written_down" && a.value == "500")
+    );
+    assert_eq!(NATIVE_RESERVED.load(deps.as_ref().storage).unwrap(), Uint128::new(1500));
+    assert_eq!(
+        state.previous_batches.load(deps.as_ref().storage, 1u64).unwrap().amount_unclaimed,
+        Uint128::new(750)
+    );
+    assert_eq!(
+        state.previous_batches.load(deps.as_ref().storage, 2u64).unwrap().amount_unclaimed,
+        Uint128::new(750)
+    );
+    assert_eq!(
+        state.previous_batches.load(deps.as_ref().storage, 3u64).unwrap().amount_unclaimed,
+        Uint128::new(700)
+    );
+
+    // Running it again changes nothing.
+    let res = migrate(deps.as_mut(), mock_env(), Default::default()).unwrap();
+    assert!(
+        res.attributes.iter().any(|a| a.key == "legacy_reconciled_written_down" && a.value == "0")
+    );
+    assert_eq!(
+        state.previous_batches.load(deps.as_ref().storage, 1u64).unwrap().amount_unclaimed,
+        Uint128::new(750)
+    );
 }

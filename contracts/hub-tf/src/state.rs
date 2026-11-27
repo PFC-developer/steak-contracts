@@ -16,6 +16,12 @@ pub(crate) const UNBOND_KEY_USER_V101: &str = "unbond_owner_101";
 pub(crate) const RECONCILE_OBSERVED_HEIGHTS: Map<u64, u64> =
     Map::new("reconcile_observed_heights_001");
 
+/// Native the contract owes to reconciled batches that are not yet fully withdrawn: the sum of
+/// their `amount_unclaimed`. Kept as a running total (added on reconcile, subtracted on withdraw)
+/// so `Reconcile` does not have to scan every reconciled batch, which grows without bound when
+/// unbond requests are never claimed. Initialised by `migrate`.
+pub(crate) const NATIVE_RESERVED: Item<Uint128> = Item::new("native_reserved_001");
+
 /// Validators who currently have delegations. This can be different due to being
 /// paused/re-delegations
 pub(crate) const VALIDATORS: Set<&str> = Set::new("validators_001", "validator_counter_001");
