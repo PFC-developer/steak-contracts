@@ -1,8 +1,8 @@
 use std::convert::TryInto;
 
 use cosmwasm_std::{
-    Binary, Deps, DepsMut, Env, MessageInfo, Reply, Response, StdError, StdResult, entry_point,
-    to_json_binary,
+    Binary, Deps, DepsMut, Env, MessageInfo, Order, Reply, Response, StdError, StdResult,
+    entry_point, to_json_binary,
 };
 use cw2::{ContractVersion, get_contract_version, set_contract_version};
 use pfc_steak::{
@@ -10,7 +10,10 @@ use pfc_steak::{
     hub_tf::{ExecuteMsg, InstantiateMsg, TokenFactoryType},
 };
 
-use crate::{execute, queries, state::State};
+use crate::{
+    execute, queries,
+    state::{State, VALIDATORS, VALIDATORS_ACTIVE},
+};
 
 //use crate::helpers::{ unwrap_reply};
 
@@ -20,6 +23,7 @@ pub const CONTRACT_NAME: &str = "steak-hub-tf";
 pub const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const REPLY_INSTANTIATE_TOKEN: u64 = 1;
 pub const REPLY_REGISTER_RECEIVED_COINS: u64 = 2;
+pub const REPLY_SUBMIT_BATCH: u64 = 3;
 pub const SPECIAL_SEND_MESSAGE_TO_TRANSFER: &str = "PFC_TRANSFER_NOT_SEND";
 
 #[entry_point]
@@ -153,6 +157,7 @@ fn callback(
 pub fn reply(_deps: DepsMut, _env: Env, reply: Reply) -> StdResult<Response> {
     match reply.id {
         REPLY_REGISTER_RECEIVED_COINS => Ok(Response::default()),
+        REPLY_SUBMIT_BATCH => Ok(execute::submit_batch_deferred(reply)),
         _ => Err(StdError::generic_err(format!(
             "invalid reply id: {}  {:?}",
             reply.id, reply.result
@@ -218,11 +223,26 @@ pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> StdResult<Response
     state.fee_rate.save(deps.storage,&Decimal::from_ratio(10u32,100u32))?;
 
      */
+    let active_validators = VALIDATORS_ACTIVE
+        .items(deps.storage, None, None, Order::Ascending)
+        .collect::<StdResult<Vec<_>>>()?;
+    // The pre-fix `remove_validator` dropped a validator from the whitelist but then added it to
+    // the active set. The whitelist reflects the owner's removal decision, so the repair drops
+    // active entries that are no longer whitelisted rather than re-whitelisting them.
+    let mut validator_registry_repairs = 0u64;
+    for validator in active_validators {
+        if !VALIDATORS.contains(deps.storage, &validator) {
+            VALIDATORS_ACTIVE.remove(deps.storage, &validator)?;
+            validator_registry_repairs += 1;
+        }
+    }
+
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
 
     Ok(Response::new()
         .add_attribute("previous_contract_name", &contract_version.contract)
         .add_attribute("previous_contract_version", &contract_version.version)
         .add_attribute("new_contract_name", CONTRACT_NAME)
-        .add_attribute("new_contract_version", CONTRACT_VERSION))
+        .add_attribute("new_contract_version", CONTRACT_VERSION)
+        .add_attribute("validator_registry_repairs", validator_registry_repairs.to_string()))
 }

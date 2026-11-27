@@ -33,13 +33,13 @@ impl PrimaryKey<'_> for BooleanKey {
     type Suffix = ();
     type SuperSuffix = ();
 
-    fn key(&self) -> Vec<Key> {
+    fn key(&self) -> Vec<Key<'_>> {
         self.wrapped.key()
     }
 }
 
 impl Prefixer<'_> for BooleanKey {
-    fn prefix(&self) -> Vec<Key> {
+    fn prefix(&self) -> Vec<Key<'_>> {
         self.wrapped.prefix()
     }
 }

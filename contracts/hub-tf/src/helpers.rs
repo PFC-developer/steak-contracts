@@ -69,7 +69,7 @@ pub(crate) fn query_delegations(
 ///
 /// This assumes the denom never starts with a number, which is true on Terra.
 pub(crate) fn parse_coin(s: &str) -> StdResult<Coin> {
-    for (i, c) in s.chars().enumerate() {
+    for (i, c) in s.char_indices() {
         if c.is_alphabetic() {
             let amount = Uint128::from_str(&s[..i])?;
             let denom = &s[i..];
