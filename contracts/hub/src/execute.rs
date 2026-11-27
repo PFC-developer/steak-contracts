@@ -28,7 +28,7 @@ use crate::{
     math::{
         compute_mint_amount, compute_redelegations_for_inactive,
         compute_redelegations_for_rebalancing, compute_redelegations_for_removal,
-        compute_unbond_amount, compute_undelegations, pro_rata_share, reconcile_batches,
+        compute_unbond_amount, compute_undelegations, cumulative_share, reconcile_batches,
     },
     state::{NATIVE_RESERVED, RECONCILE_OBSERVED_HEIGHTS, RESERVE_INIT, ReserveInit, State},
     types::{Coins, Delegation, Redelegation},
@@ -901,6 +901,7 @@ pub(crate) fn advance_reserve_initialization(
         owed: Uint128::zero(),
         shortfall: Uint128::zero(),
         applied: Uint128::zero(),
+        cumulative: Uint128::zero(),
     });
     let pool_time = init.pool_time;
     let in_pool = |b: &Batch| b.reconciled || b.est_unbond_end_time < pool_time;
@@ -921,9 +922,10 @@ pub(crate) fn advance_reserve_initialization(
         if pass_done {
             let denom = state.denom.load(deps.storage)?;
             let unlocked = Coins(state.unlocked_coins.load(deps.storage)?).find(&denom).amount;
-            // Batches that matured after the pool was fixed may already have been paid; their
-            // funds are not the pool's.
-            let later_matured: Uint128 = state
+            // A batch that matured after the pool was fixed may already have been paid, and if it
+            // was slashed that is just as unattributable: restart the sum with it in the pool
+            // rather than assume it was paid in full.
+            let matured_since = state
                 .previous_batches
                 .idx
                 .reconciled
@@ -932,15 +934,25 @@ pub(crate) fn advance_reserve_initialization(
                 .map(|item| item.map(|(_, b)| b))
                 .collect::<StdResult<Vec<Batch>>>()?
                 .into_iter()
-                .filter(|b| !in_pool(b) && b.est_unbond_end_time < now)
-                .map(|b| b.amount_unclaimed)
-                .sum();
+                .any(|b| !in_pool(&b) && b.est_unbond_end_time < now);
+            if matured_since {
+                init = ReserveInit {
+                    pool_time: now,
+                    applying: false,
+                    cursor: None,
+                    owed: Uint128::zero(),
+                    shortfall: Uint128::zero(),
+                    applied: Uint128::zero(),
+                    cumulative: Uint128::zero(),
+                };
+                RESERVE_INIT.save(deps.storage, &init)?;
+                return Ok(ReserveInitStep::InProgress(init));
+            }
             let available = deps
                 .querier
                 .query_balance(&env.contract.address, &denom)?
                 .amount
-                .saturating_sub(unlocked)
-                .saturating_sub(later_matured);
+                .saturating_sub(unlocked);
             init.shortfall = init.owed.saturating_sub(available);
             init.applying = true;
             init.cursor = None;
@@ -950,10 +962,10 @@ pub(crate) fn advance_reserve_initialization(
     }
 
     for mut batch in page.into_iter().filter(|b| in_pool(b)) {
-        let share = pro_rata_share(init.shortfall, batch.amount_unclaimed, init.owed)
-            .min(init.shortfall - init.applied);
-        batch.amount_unclaimed -= share;
-        init.applied += share;
+        init.cumulative += batch.amount_unclaimed;
+        let target = cumulative_share(init.shortfall, init.cumulative, init.owed);
+        batch.amount_unclaimed -= target - init.applied;
+        init.applied = target;
         if !batch.reconciled {
             batch.reconciled = true;
             RECONCILE_OBSERVED_HEIGHTS.remove(deps.storage, batch.id);
@@ -1026,6 +1038,7 @@ pub fn withdraw_unbonded(
     let mut ids: Vec<String> = vec![];
     let mut zero_refund_ids: Vec<String> = vec![];
     let mut awaiting: Vec<u64> = vec![];
+    let mut dust_ids: Vec<String> = vec![];
     let mut withdrawals: Vec<(u64, Option<Batch>)> = vec![];
     for request in &requests {
         if let Ok(mut batch) = state.previous_batches.load(deps.storage, request.id) {
@@ -1042,6 +1055,7 @@ pub fn withdraw_unbonded(
                 if !batch.amount_unclaimed.is_zero() {
                     // The share rounds to nothing while the batch still holds value: keep the
                     // claim rather than deleting it for nothing.
+                    dust_ids.push(request.id.to_string());
                     continue;
                 }
                 // Fully written down: clear the request, but say so.
@@ -1065,17 +1079,36 @@ pub fn withdraw_unbonded(
 
     if ids.is_empty() {
         if awaiting.is_empty() {
+            if !dust_ids.is_empty() {
+                return Err(StdError::generic_err(format!(
+                    "claim in batch(es) {} currently rounds to zero; it stays claimable",
+                    dust_ids.join(",")
+                )));
+            }
             return Err(StdError::generic_err("withdrawable amount is zero"));
         }
-        // Record matured batches that are still waiting for `Reconcile`, so that a withdrawal
-        // bundled after `Reconcile` still moves them towards settlement even though it pays
-        // nothing yet.
+        // A matured batch still awaiting `Reconcile`. When it is first observed in this block (by
+        // this call or by a `Reconcile` bundled before it), record that and succeed without paying,
+        // so a bundled client still moves it towards settlement. Once it was observed in an earlier
+        // block it only needs `Reconcile`: say so instead of succeeding with nothing.
+        let mut observed_now = false;
         for id in &awaiting {
-            if RECONCILE_OBSERVED_HEIGHTS.may_load(deps.storage, *id)?.is_none() {
-                RECONCILE_OBSERVED_HEIGHTS.save(deps.storage, *id, &env.block.height)?;
+            match RECONCILE_OBSERVED_HEIGHTS.may_load(deps.storage, *id)? {
+                None => {
+                    RECONCILE_OBSERVED_HEIGHTS.save(deps.storage, *id, &env.block.height)?;
+                    observed_now = true;
+                },
+                Some(height) if height == env.block.height => observed_now = true,
+                Some(_) => {},
             }
         }
         let awaiting = awaiting.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+        if !observed_now {
+            return Err(StdError::generic_err(format!(
+                "batch(es) {} matured and await Reconcile; call Reconcile, then withdraw",
+                awaiting
+            )));
+        }
         return Ok(Response::new()
             .add_event(
                 Event::new("steakhub/withdraw_awaiting_reconcile")

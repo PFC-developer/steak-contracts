@@ -282,33 +282,31 @@ pub(crate) fn compute_redelegations_for_rebalancing(
 // Batch logics
 //--------------------------------------------------------------------------------------------------
 
-/// The part of `deduct` that a batch holding `amount` out of `total` bears pro rata, rounded up so
-/// the parts add up to at least `deduct`. Never more than `amount` when `deduct <= total`.
-pub(crate) fn pro_rata_share(deduct: Uint128, amount: Uint128, total: Uint128) -> Uint128 {
+/// `floor(deduct * cumulative / total)`: how much of `deduct` the batches holding the first
+/// `cumulative` of `total` bear together. Charging each batch the step between consecutive
+/// cumulative values shares `deduct` pro rata, keeps every batch within one unit of its exact
+/// share, and adds up to exactly `deduct` once `cumulative` reaches `total`.
+pub(crate) fn cumulative_share(deduct: Uint128, cumulative: Uint128, total: Uint128) -> Uint128 {
     if total.is_zero() {
         return Uint128::zero();
     }
-    let numerator = deduct.full_mul(amount);
-    let denominator = Uint256::from(total);
-    let mut share = numerator / denominator;
-    if share * denominator < numerator {
-        share += Uint256::one();
-    }
-    Uint128::try_from(share).unwrap_or(Uint128::MAX).min(amount)
+    let share = deduct.full_mul(cumulative) / Uint256::from(total);
+    Uint128::try_from(share).unwrap_or(Uint128::MAX)
 }
 
 /// Write `native_to_deduct` (capped at what the batches hold) down across `batches` in proportion
 /// to what each holds, and mark them reconciled. The batches share one balance, so a missing
-/// amount cannot be attributed to any one of them. Rounding goes to the earlier batches; exactly
-/// the capped amount is applied.
+/// amount cannot be attributed to any one of them. Exactly the capped amount is applied.
 pub(crate) fn reconcile_batches(batches: &mut [Batch], native_to_deduct: Uint128) {
     let total: Uint128 = batches.iter().map(|b| b.amount_unclaimed).sum();
     let deduct = native_to_deduct.min(total);
-    let mut remaining = deduct;
+    let mut cumulative = Uint128::zero();
+    let mut taken = Uint128::zero();
     for batch in batches.iter_mut() {
-        let share = pro_rata_share(deduct, batch.amount_unclaimed, total).min(remaining);
-        batch.amount_unclaimed -= share;
-        remaining -= share;
+        cumulative += batch.amount_unclaimed;
+        let target = cumulative_share(deduct, cumulative, total);
+        batch.amount_unclaimed -= target - taken;
+        taken = target;
         batch.reconciled = true;
     }
 }

@@ -38,6 +38,10 @@ pub(crate) struct ReserveInit {
     pub shortfall: Uint128,
     /// How much of `shortfall` has been written down so far.
     pub applied: Uint128,
+    /// What the pool batches processed so far in the applying pass are owed (for pro-rata
+    /// rounding).
+    #[serde(default)]
+    pub cumulative: Uint128,
 }
 
 pub(crate) const RESERVE_INIT: Item<ReserveInit> = Item::new("reserve_init_001");
