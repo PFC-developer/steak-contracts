@@ -409,7 +409,6 @@ pub fn reinvest(deps: DepsMut, env: Env) -> StdResult<Response> {
     if amount_to_bond.is_zero() {
         return Err(StdError::generic_err("no rewards"));
     }
-    let validators = bonded_targets(&deps.querier, validators)?;
     let delegations = query_delegations(&deps.querier, &validators, &env.contract.address, &denom)?;
     let mut validator = &delegations[0].validator;
     let mut amount = delegations[0].amount;

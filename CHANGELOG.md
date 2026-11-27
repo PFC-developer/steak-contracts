@@ -1,7 +1,7 @@
 # changelog
 
 ## 3.0.22
-* bond, reinvest, `ReinvestIdle` and `RemoveValidator` only send stake to active validators the chain currently has bonded (falling back to the whole active set if none is bonded), instead of the smallest delegation, which was often a slashed, jailed validator; `RemoveValidator` no longer redelegates onto paused validators
+* bond, `ReinvestIdle` and `RemoveValidator` only send stake to active validators the chain currently has bonded (falling back to the whole active set if none is bonded; `Reinvest` requires a bonded one), instead of the smallest delegation, which was often a slashed, jailed validator; `RemoveValidator` no longer redelegates onto paused validators
 * `Rebalance` is owner only (anyone could lock validators against redelegation for an unbonding period), drains every validator outside the bonded active set in full, tops up active validators that hold nothing, and sends each move as an isolated submessage (max 50 per call)
 * rewards withdrawn automatically by bond / unbond / redelegate / rebalance / remove-validator are now recorded (hub-tf replies to every staking message, like the CW20 hub) and reinvested at the next harvest; `Reinvest` bonds the recorded rewards instead of a balance delta that skipped them, and never bonds funds owed to matured batches
 * new `QueryMsg::IdleFunds` and owner-only `ExecuteMsg::ReinvestIdle { amount }` to find and restake native that sits in the contract unaccounted for (legacy unrecorded rewards, late unbonding funds), fee-free
