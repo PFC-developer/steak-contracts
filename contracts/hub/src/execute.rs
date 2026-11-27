@@ -301,7 +301,11 @@ pub fn harvest(deps: DepsMut, env: Env) -> StdResult<Response> {
 /// `prev_denom` before those redelegations; preserve that baseline, withdraw rewards from every
 /// remaining delegation, then reinvest the complete balance delta. Withdrawing first also prevents
 /// the final delegation from surfacing an active validator's older rewards after reinvestment.
-pub fn harvest_after_redelegation(deps: DepsMut, env: Env) -> StdResult<Response> {
+pub fn harvest_after_redelegation(
+    deps: DepsMut,
+    env: Env,
+    exclude: Vec<String>,
+) -> StdResult<Response> {
     let withdraw_submsgs = deps
         .querier
         .query_all_delegations(&env.contract.address)?
@@ -316,7 +320,10 @@ pub fn harvest_after_redelegation(deps: DepsMut, env: Env) -> StdResult<Response
         })
         .collect::<Vec<_>>();
 
-    let callback_msg = CallbackMsg::ReinvestIfNeeded {}.into_cosmos_msg(&env.contract.address)?;
+    let callback_msg = CallbackMsg::ReinvestIfNeeded {
+        exclude,
+    }
+    .into_cosmos_msg(&env.contract.address)?;
 
     Ok(Response::new()
         .add_submessages(withdraw_submsgs)
@@ -324,7 +331,7 @@ pub fn harvest_after_redelegation(deps: DepsMut, env: Env) -> StdResult<Response
         .add_attribute("action", "steakhub/harvest_after_redelegation"))
 }
 
-pub fn reinvest_if_needed(deps: DepsMut, env: Env) -> StdResult<Response> {
+pub fn reinvest_if_needed(deps: DepsMut, env: Env, exclude: Vec<String>) -> StdResult<Response> {
     let state = State::default();
     let denom = state.denom.load(deps.storage)?;
     let prev_coin = state.prev_denom.load(deps.storage)?;
@@ -334,7 +341,7 @@ pub fn reinvest_if_needed(deps: DepsMut, env: Env) -> StdResult<Response> {
         return Ok(Response::new().add_attribute("action", "steakhub/reinvest_not_needed"));
     }
 
-    reinvest(deps, env)
+    reinvest_excluding(deps, env, &exclude)
 }
 
 /// NOTE:
@@ -344,6 +351,14 @@ pub fn reinvest_if_needed(deps: DepsMut, env: Env) -> StdResult<Response> {
 /// 2. Same as with `bond`, in the latest implementation we only delegate staking rewards with the
 ///    validator that has the smallest delegation amount.
 pub fn reinvest(deps: DepsMut, env: Env) -> StdResult<Response> {
+    reinvest_excluding(deps, env, &[])
+}
+
+/// `reinvest`, never choosing a validator in `exclude` for the delegation. After
+/// `RedelegateInactive`, the operator's exclude list may name a destination that refuses new stake
+/// (e.g. one at a liquid-staking cap); delegating the rewards to it would revert the whole call on
+/// every re-run, since reward handling is atomic with the redelegations.
+fn reinvest_excluding(deps: DepsMut, env: Env, exclude: &[String]) -> StdResult<Response> {
     let state = State::default();
     let denom = state.denom.load(deps.storage)?;
     let fee = state.fee_rate.load(deps.storage)?;
@@ -351,8 +366,10 @@ pub fn reinvest(deps: DepsMut, env: Env) -> StdResult<Response> {
     let validators_active = state.validators_active.load(deps.storage)?;
     let bonded: Vec<String> =
         deps.querier.query_all_validators()?.into_iter().map(|v| v.address).collect();
-    let validators: Vec<String> =
-        validators_active.into_iter().filter(|v| bonded.contains(v)).collect();
+    let validators: Vec<String> = validators_active
+        .into_iter()
+        .filter(|v| bonded.contains(v) && !exclude.contains(v))
+        .collect();
     if validators.is_empty() {
         return Err(StdError::generic_err("cannot reinvest without a bonded active validator"));
     }
@@ -980,7 +997,10 @@ pub fn redelegate_inactive(
         // pre-redelegation balance baseline instead of committing rewards that no later harvest
         // can distinguish from the contract's existing balance.
         response = response.add_message(
-            CallbackMsg::HarvestAfterRedelegation {}.into_cosmos_msg(&env.contract.address)?,
+            CallbackMsg::HarvestAfterRedelegation {
+                exclude,
+            }
+            .into_cosmos_msg(&env.contract.address)?,
         );
     }
 
