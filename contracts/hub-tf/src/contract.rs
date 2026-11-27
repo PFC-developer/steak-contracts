@@ -261,8 +261,12 @@ pub fn migrate(mut deps: DepsMut, env: Env, _msg: MigrateMsg) -> StdResult<Respo
         }
     }
 
-    let (native_reserved, legacy_written_down) =
-        execute::initialize_native_reserved(deps.branch(), &env)?;
+    let reserve_initialization =
+        execute::prepare_native_reserved_initialization(deps.branch(), &env)?;
+    let (native_reserved, legacy_written_down) = match reserve_initialization {
+        Some((reserved, written_down)) => (reserved.to_string(), written_down.to_string()),
+        None => ("pending".to_string(), "pending".to_string()),
+    };
 
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
 

@@ -931,7 +931,6 @@ fn reconciling() {
     for previous_batch in &previous_batch_list {
         previous_batches().save(deps.as_mut().storage, previous_batch.id, previous_batch).unwrap();
     }
-
     state
         .unlocked_coins
         .save(deps.as_mut().storage, &vec![
@@ -1073,6 +1072,17 @@ fn withdrawing_unbonded() {
     for previous_batch in &previous_batch_list {
         previous_batches().save(deps.as_mut().storage, previous_batch.id, previous_batch).unwrap();
     }
+
+    NATIVE_RESERVED
+        .save(
+            deps.as_mut().storage,
+            &previous_batch_list
+                .iter()
+                .filter(|batch| batch.reconciled)
+                .map(|batch| batch.amount_unclaimed)
+                .sum(),
+        )
+        .unwrap();
 
     state
         .pending_batch
@@ -2617,6 +2627,7 @@ fn reserve_tracks_reconciles_and_withdrawals() {
 #[test]
 fn migration_writes_down_legacy_reconciled_shortfall() {
     let mut deps = setup_test();
+    let env = mock_env();
     // An older version reconciled two batches but left part of a shortfall unapplied: they claim
     // 2000, the contract holds 1500 for them.
     for id in 1..=2u64 {
@@ -2629,29 +2640,70 @@ fn migration_writes_down_legacy_reconciled_shortfall() {
         };
         previous_batches().save(deps.as_mut().storage, batch.id, &batch).unwrap();
     }
-    // A newer batch matured long ago and its 700 arrived; it is not theirs to use.
+    // A newer batch matured only just before migration and its 700 has already arrived; it is not
+    // theirs to use. Migration must not rely on a time margin to decide whether that payout is in
+    // the shared balance.
     let batch = Batch {
         id: 3,
         reconciled: false,
         total_shares: Uint128::new(700),
         amount_unclaimed: Uint128::new(700),
-        est_unbond_end_time: 20000,
+        est_unbond_end_time: env.block.time.seconds() - 1,
     };
     previous_batches().save(deps.as_mut().storage, batch.id, &batch).unwrap();
+    let user = Addr::unchecked("legacy_user");
+    unbond_requests()
+        .save(deps.as_mut().storage, (1, user.as_str()), &UnbondRequest {
+            id: 1,
+            user: user.clone(),
+            shares: Uint128::new(100),
+        })
+        .unwrap();
     deps.querier.set_bank_balances(&[Coin::new(1500 + 700, "uxyz")]);
     NATIVE_RESERVED.remove(deps.as_mut().storage);
 
-    let res = migrate(deps.as_mut(), mock_env(), Default::default()).unwrap();
+    // The migration block records the newly matured batch but cannot know whether its EndBlock
+    // payout is present yet, so reserve initialization remains pending.
+    let res = migrate(deps.as_mut(), env.clone(), Default::default()).unwrap();
+    assert!(
+        res.attributes
+            .iter()
+            .any(|a| a.key == "legacy_reconciled_written_down" && a.value == "pending")
+    );
+    assert!(NATIVE_RESERVED.may_load(deps.as_ref().storage).unwrap().is_none());
+    assert_eq!(
+        previous_batches().load(deps.as_ref().storage, 1u64).unwrap().amount_unclaimed,
+        Uint128::new(1000)
+    );
+
+    // Reconciled funds cannot leave while the reserve is unknown.
+    let err = execute(
+        deps.as_mut(),
+        env.clone(),
+        mock_info(user.as_str(), &[]),
+        ExecuteMsg::WithdrawUnbonded {
+            receiver: None,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        StdError::generic_err(
+            "native reserve initialization is pending; call Reconcile in a later block"
+        )
+    );
+
+    // A later block has completed an EndBlock after the observation, so migration can now
+    // separate the newer payout and write the legacy shortfall down on the older batches.
+    let mut finalize_env = env;
+    finalize_env.block.height += 1;
+    let res = migrate(deps.as_mut(), finalize_env.clone(), Default::default()).unwrap();
     assert!(
         res.attributes
             .iter()
             .any(|a| a.key == "legacy_reconciled_written_down" && a.value == "500")
     );
     assert_eq!(NATIVE_RESERVED.load(deps.as_ref().storage).unwrap(), Uint128::new(1500));
-    assert_eq!(
-        previous_batches().load(deps.as_ref().storage, 1u64).unwrap().amount_unclaimed,
-        Uint128::new(750)
-    );
     assert_eq!(
         previous_batches().load(deps.as_ref().storage, 2u64).unwrap().amount_unclaimed,
         Uint128::new(750)
@@ -2662,7 +2714,7 @@ fn migration_writes_down_legacy_reconciled_shortfall() {
     );
 
     // Running it again changes nothing.
-    let res = migrate(deps.as_mut(), mock_env(), Default::default()).unwrap();
+    let res = migrate(deps.as_mut(), finalize_env.clone(), Default::default()).unwrap();
     assert!(
         res.attributes.iter().any(|a| a.key == "legacy_reconciled_written_down" && a.value == "0")
     );
@@ -2670,4 +2722,13 @@ fn migration_writes_down_legacy_reconciled_shortfall() {
         previous_batches().load(deps.as_ref().storage, 1u64).unwrap().amount_unclaimed,
         Uint128::new(750)
     );
+
+    // The newer payout remains fully available when that batch is reconciled later.
+    execute(deps.as_mut(), finalize_env, mock_info("anyone", &[]), ExecuteMsg::Reconcile {})
+        .unwrap();
+    assert_eq!(
+        previous_batches().load(deps.as_ref().storage, 3u64).unwrap().amount_unclaimed,
+        Uint128::new(700)
+    );
+    assert_eq!(NATIVE_RESERVED.load(deps.as_ref().storage).unwrap(), Uint128::new(2200));
 }

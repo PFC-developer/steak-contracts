@@ -140,7 +140,9 @@ pub enum ExecuteMsg {
     /// A batch is reconciled only by a call in a later block than the one in which it was first
     /// observed past its estimated unbonding end (the staking module pays out at the end of a
     /// block). So `Reconcile` followed by `WithdrawUnbonded` in the same transaction cannot
-    /// withdraw a batch that has only just matured: send the withdrawal in a later block.
+    /// withdraw a batch that has only just matured: send the withdrawal in a later block. After a
+    /// migration that finds an already-matured batch, a later-block `Reconcile` also finalises the
+    /// one-time reserve initialisation before withdrawals resume.
     Reconcile {},
     /// Submit the current pending batch of unbonding requests to be unbonded
     SubmitBatch {},

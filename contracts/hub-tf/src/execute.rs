@@ -765,7 +765,7 @@ pub fn submit_batch(deps: DepsMut, env: Env) -> StdResult<Response> {
         .add_attribute("action", "steakhub/unbond"))
 }
 
-pub fn reconcile(deps: DepsMut, env: Env) -> StdResult<Response> {
+pub fn reconcile(mut deps: DepsMut, env: Env) -> StdResult<Response> {
     let state = State::default();
     let current_time = env.block.time.seconds();
 
@@ -799,17 +799,29 @@ pub fn reconcile(deps: DepsMut, env: Env) -> StdResult<Response> {
     // set and guarantees that each has had an EndBlock opportunity to receive its unbonding.
     if !waiting.is_empty() {
         let ids = waiting.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+        let native_reserved = NATIVE_RESERVED
+            .may_load(deps.storage)?
+            .map(|reserved| reserved.to_string())
+            .unwrap_or_else(|| "pending".to_string());
         return Ok(Response::new()
             .add_event(
                 Event::new("steakhub/reconcile_observed")
                     .add_attribute("ids", ids)
                     .add_attribute("height", env.block.height.to_string()),
             )
+            .add_attribute("native_reserved", native_reserved)
             .add_attribute("action", "steakhub/reconcile"));
     }
+
+    // Migration leaves the reserve uninitialised while any matured batch has not yet passed an
+    // EndBlock. Reaching here proves every currently matured batch was observed in an earlier
+    // block, so its payout can be separated from the legacy reconciled obligations safely.
+    let (native_reserved, legacy_written_down) = initialize_native_reserved(deps.branch(), &env)?;
     if batches.is_empty() {
         return Ok(Response::new()
             .add_event(Event::new("steakhub/reconciled").add_attribute("ids", ""))
+            .add_attribute("native_reserved", native_reserved)
+            .add_attribute("legacy_reconciled_written_down", legacy_written_down)
             .add_attribute("action", "steakhub/reconcile"));
     }
 
@@ -823,7 +835,6 @@ pub fn reconcile(deps: DepsMut, env: Env) -> StdResult<Response> {
     // Funds owed to batches that were already reconciled but not yet fully withdrawn sit in the
     // same balance. They are not available to cover the batches being reconciled now; counting
     // them would hide a shortfall until the last claimers of the older batches fail to withdraw.
-    let native_reserved = NATIVE_RESERVED.may_load(deps.storage)?.unwrap_or_default();
     let native_actual = deps
         .querier
         .query_balance(&env.contract.address, &denom)?
@@ -846,7 +857,8 @@ pub fn reconcile(deps: DepsMut, env: Env) -> StdResult<Response> {
         RECONCILE_OBSERVED_HEIGHTS.remove(deps.storage, batch.id);
     }
     let newly_reserved: Uint128 = batches.iter().map(|b| b.amount_unclaimed).sum();
-    NATIVE_RESERVED.save(deps.storage, &(native_reserved + newly_reserved))?;
+    let native_reserved = native_reserved.checked_add(newly_reserved)?;
+    NATIVE_RESERVED.save(deps.storage, &native_reserved)?;
 
     let ids = batches.iter().map(|b| b.id.to_string()).collect::<Vec<_>>().join(",");
 
@@ -854,18 +866,65 @@ pub fn reconcile(deps: DepsMut, env: Env) -> StdResult<Response> {
         .add_attribute("ids", ids)
         .add_attribute("native_deducted", native_to_deduct.to_string());
 
-    Ok(Response::new().add_event(event).add_attribute("action", "steakhub/reconcile"))
+    Ok(Response::new()
+        .add_event(event)
+        .add_attribute("native_reserved", native_reserved)
+        .add_attribute("legacy_reconciled_written_down", legacy_written_down)
+        .add_attribute("action", "steakhub/reconcile"))
 }
 
-/// Run once, by `migrate`, before `NATIVE_RESERVED` exists. Reconciled batches written by earlier
-/// versions may claim more than the contract holds for them: the old `reconcile_batches` could
-/// leave part of a shortfall unapplied. Counting those claims as funded would charge the next
-/// batches reconciled for the old loss, so write the shortfall down across the reconciled batches
-/// themselves, then start the running total from what they are really owed.
+/// Start or resume the migration-time reserve initialisation. A matured unreconciled batch is
+/// ambiguous in the migration block: its payout may arrive only at that block's EndBlock. Record
+/// the observation and leave the reserve pending until every matured batch has been observed in an
+/// earlier block. At that point `initialize_native_reserved` can classify the shared balance
+/// without guessing from elapsed wall-clock time.
+pub(crate) fn prepare_native_reserved_initialization(
+    mut deps: DepsMut,
+    env: &Env,
+) -> StdResult<Option<(Uint128, Uint128)>> {
+    if let Some(reserved) = NATIVE_RESERVED.may_load(deps.storage)? {
+        return Ok(Some((reserved, Uint128::zero())));
+    }
+
+    let current_time = env.block.time.seconds();
+    let unreconciled = previous_batches()
+        .idx
+        .reconciled
+        .prefix("false".to_string())
+        .range(deps.storage, None, None, Order::Ascending)
+        .map(|item| item.map(|(_, batch)| batch))
+        .collect::<StdResult<Vec<_>>>()?;
+
+    let mut waiting = false;
+    for batch in unreconciled.into_iter().filter(|b| current_time > b.est_unbond_end_time) {
+        match RECONCILE_OBSERVED_HEIGHTS.may_load(deps.storage, batch.id)? {
+            Some(observed_height) if env.block.height > observed_height => {},
+            Some(_) => waiting = true,
+            None => {
+                RECONCILE_OBSERVED_HEIGHTS.save(deps.storage, batch.id, &env.block.height)?;
+                waiting = true;
+            },
+        }
+    }
+
+    if waiting {
+        Ok(None)
+    } else {
+        initialize_native_reserved(deps.branch(), env).map(Some)
+    }
+}
+
+/// Run once, after migration's completed-block gate and before `NATIVE_RESERVED` exists.
+/// Reconciled batches written by earlier versions may claim more than the contract holds for them:
+/// the old `reconcile_batches` could leave part of a shortfall unapplied. Counting those claims as
+/// funded would charge the next batches reconciled for the old loss, so write the shortfall down
+/// across the reconciled batches themselves, then start the running total from what they are
+/// really owed.
 ///
-/// Available to them is the balance minus recorded rewards and minus what matured, unreconciled
-/// batches expect. Batches that matured within `LEGACY_ARRIVAL_MARGIN_SECONDS` may not have been
-/// paid yet, so their expectation is not subtracted (which can only favour the older batches).
+/// Available to them is the balance minus recorded rewards and minus what every matured,
+/// unreconciled batch expects. A recently matured batch may already have been paid at EndBlock;
+/// treating its funds as available to older batches would move a legacy shortfall onto the newer
+/// batch when it is reconciled.
 ///
 /// Returns (initial reserve, amount written down).
 pub(crate) fn initialize_native_reserved(
@@ -886,9 +945,9 @@ pub(crate) fn initialize_native_reserved(
     let (mut reconciled, unreconciled): (Vec<Batch>, Vec<Batch>) =
         all.into_iter().partition(|b| b.reconciled);
     let owed: Uint128 = reconciled.iter().map(|b| b.amount_unclaimed).sum();
-    let arrived_unreconciled: Uint128 = unreconciled
+    let matured_unreconciled: Uint128 = unreconciled
         .iter()
-        .filter(|b| b.est_unbond_end_time.saturating_add(LEGACY_ARRIVAL_MARGIN_SECONDS) < now)
+        .filter(|b| b.est_unbond_end_time < now)
         .map(|b| b.amount_unclaimed)
         .sum();
     let unlocked = Coins(state_cfg.unlocked_coins.load(deps.storage)?).find(&denom).amount;
@@ -897,7 +956,7 @@ pub(crate) fn initialize_native_reserved(
         .query_balance(&env.contract.address, &denom)?
         .amount
         .saturating_sub(unlocked)
-        .saturating_sub(arrived_unreconciled);
+        .saturating_sub(matured_unreconciled);
 
     let shortfall = owed.saturating_sub(available);
     if !shortfall.is_zero() {
@@ -910,9 +969,6 @@ pub(crate) fn initialize_native_reserved(
     NATIVE_RESERVED.save(deps.storage, &reserved)?;
     Ok((reserved, shortfall))
 }
-
-/// See `initialize_native_reserved`.
-const LEGACY_ARRIVAL_MARGIN_SECONDS: u64 = 600;
 
 pub fn withdraw_unbonded_admin(
     deps: DepsMut,
@@ -936,6 +992,11 @@ pub fn withdraw_unbonded(
     let state = State::default();
     let denom = state.denom.load(deps.storage)?;
     let current_time = env.block.time.seconds();
+    let reserved = NATIVE_RESERVED.may_load(deps.storage)?.ok_or_else(|| {
+        StdError::generic_err(
+            "native reserve initialization is pending; call Reconcile in a later block",
+        )
+    })?;
 
     // NOTE: If the user has too many unclaimed requests, this may not fit in the WASM memory...
     // However, this is practically never going to happen. Who would create hundreds of unbonding
@@ -988,11 +1049,11 @@ pub fn withdraw_unbonded(
     }
     // Only reconciled batches pay out, so everything refunded (plus dust left on a batch that was
     // removed) was part of the reserve.
-    let reserved = NATIVE_RESERVED.may_load(deps.storage)?.unwrap_or_default();
-    NATIVE_RESERVED.save(
-        deps.storage,
-        &reserved.saturating_sub(total_native_to_refund).saturating_sub(released),
-    )?;
+    let released_total = total_native_to_refund.checked_add(released)?;
+    let remaining_reserved = reserved.checked_sub(released_total).map_err(|_| {
+        StdError::generic_err("native reserve is smaller than the reconciled withdrawal")
+    })?;
+    NATIVE_RESERVED.save(deps.storage, &remaining_reserved)?;
 
     let event = Event::new("steakhub/unbonded_withdrawn")
         .add_attribute("time", env.block.time.seconds().to_string())
