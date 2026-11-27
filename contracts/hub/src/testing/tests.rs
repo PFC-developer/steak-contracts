@@ -26,8 +26,9 @@ use crate::{
     },
     helpers::{parse_coin, parse_received_fund},
     math::{
-        compute_redelegations_for_inactive, compute_redelegations_for_rebalancing,
-        compute_redelegations_for_removal, compute_undelegations,
+        compute_mint_amount, compute_redelegations_for_inactive,
+        compute_redelegations_for_rebalancing, compute_redelegations_for_removal,
+        compute_undelegations,
     },
     state::State,
     types::{Coins, Delegation, Redelegation, Undelegation},
@@ -2759,4 +2760,120 @@ fn removing_validator_redelegates_only_to_bonded_active_validators() {
         res.messages[0].msg,
         Redelegation::new("charlie", "alice", 300, "uxyz").to_cosmos_msg()
     );
+}
+
+#[test]
+fn submit_batch_defers_while_unbonding_entries_are_full() {
+    let mut deps = setup_test();
+    let state = State::default();
+    let now = 10_000_000u64;
+    deps.querier.set_staking_delegations(&[
+        Delegation::new("alice", 400, "uxyz"),
+        Delegation::new("bob", 300, "uxyz"),
+        Delegation::new("charlie", 300, "uxyz"),
+    ]);
+    deps.querier.set_cw20_total_supply("steak_token", 1000);
+    state
+        .pending_batch
+        .save(deps.as_mut().storage, &PendingBatch {
+            id: 8,
+            usteak_to_burn: Uint128::new(100),
+            est_unbond_start_time: 0,
+        })
+        .unwrap();
+    // Seven earlier batches are still unbonding: the 8th undelegation per validator would be
+    // refused by the staking module and fail the whole batch.
+    for id in 1..=7u64 {
+        let batch = Batch {
+            id,
+            reconciled: false,
+            total_shares: Uint128::new(10),
+            amount_unclaimed: Uint128::new(10),
+            est_unbond_end_time: now + id,
+        };
+        state.previous_batches.save(deps.as_mut().storage, id, &batch).unwrap();
+    }
+
+    let err = execute(
+        deps.as_mut(),
+        mock_env_at_timestamp(now),
+        mock_info("worker", &[]),
+        ExecuteMsg::SubmitBatch {},
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        StdError::generic_err(format!(
+            "7 unbonding batches are still in flight; batch can be submitted after {}",
+            now + 1 + RECONCILE_GRACE_SECONDS + 1
+        ))
+    );
+
+    // Once the oldest has matured (plus the grace), the batch goes through.
+    execute(
+        deps.as_mut(),
+        mock_env_at_timestamp(now + 1 + RECONCILE_GRACE_SECONDS + 1),
+        mock_info("worker", &[]),
+        ExecuteMsg::SubmitBatch {},
+    )
+    .unwrap();
+}
+
+#[test]
+fn minting_with_zero_supply_or_dust_amounts() {
+    // Everyone unbonded but rounding dust is still delegated: mint 1:1 instead of 0.
+    assert_eq!(
+        compute_mint_amount(
+            Uint128::zero(),
+            Uint128::new(1000),
+            &[Delegation::new("alice", 5, "uxyz")],
+            Uint128::zero()
+        )
+        .unwrap(),
+        Uint128::new(1000)
+    );
+    // A deposit worth less than one token is refused rather than swallowed.
+    assert_eq!(
+        compute_mint_amount(
+            Uint128::new(1000),
+            Uint128::new(1),
+            &[Delegation::new("alice", 2000, "uxyz")],
+            Uint128::zero()
+        )
+        .unwrap_err(),
+        StdError::generic_err("bond amount is too small to mint any derivative token")
+    );
+}
+
+#[test]
+fn burning_stray_steak() {
+    let mut deps = setup_test();
+    let state = State::default();
+    state
+        .pending_batch
+        .save(deps.as_mut().storage, &PendingBatch {
+            id: 1,
+            usteak_to_burn: Uint128::new(100),
+            est_unbond_start_time: 0,
+        })
+        .unwrap();
+    // The hub holds 150: 100 queued for unbonding, 50 transferred to it directly.
+    deps.querier.set_cw20_balance("steak_token", MOCK_CONTRACT_ADDR, 150);
+
+    let err =
+        execute(deps.as_mut(), mock_env(), mock_info("jake", &[]), ExecuteMsg::BurnStraySteak {})
+            .unwrap_err();
+    assert_eq!(err, StdError::generic_err("unauthorized: sender is not owner"));
+
+    let res =
+        execute(deps.as_mut(), mock_env(), mock_info("larry", &[]), ExecuteMsg::BurnStraySteak {})
+            .unwrap();
+    assert_eq!(res.messages, vec![SubMsg::new(CosmosMsg::Wasm(WasmMsg::Execute {
+        contract_addr: "steak_token".to_string(),
+        msg: to_json_binary(&Cw20ExecuteMsg::Burn {
+            amount: Uint128::new(50),
+        })
+        .unwrap(),
+        funds: vec![],
+    }))]);
 }

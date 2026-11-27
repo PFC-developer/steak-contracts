@@ -25,19 +25,23 @@ pub(crate) fn compute_mint_amount(
     let native_bonded = total_delegated(all_delegations)?
         .checked_add(pending_rewards.u128())
         .ok_or_else(|| StdError::generic_err("delegation total overflow"))?;
-    if native_bonded == 0 {
-        if usteak_supply.is_zero() {
-            Ok(native_to_bond)
-        } else {
-            Err(StdError::generic_err(
-                "cannot mint while derivative supply exists without delegated backing",
-            ))
-        }
-    } else {
-        usteak_supply
-            .checked_multiply_ratio(native_to_bond, native_bonded)
-            .map_err(|err| StdError::generic_err(format!("failed to compute mint amount: {err}")))
+    // With no supply, mint 1:1 even if dust is still delegated (e.g. rounding left behind when
+    // everyone unbonded): pricing against that dust would mint 0 and swallow the deposit.
+    if usteak_supply.is_zero() {
+        return Ok(native_to_bond);
     }
+    if native_bonded == 0 {
+        return Err(StdError::generic_err(
+            "cannot mint while derivative supply exists without delegated backing",
+        ));
+    }
+    let minted = usteak_supply
+        .checked_multiply_ratio(native_to_bond, native_bonded)
+        .map_err(|err| StdError::generic_err(format!("failed to compute mint amount: {err}")))?;
+    if minted.is_zero() {
+        return Err(StdError::generic_err("bond amount is too small to mint any derivative token"));
+    }
+    Ok(minted)
 }
 
 /// Compute the amount of `native` to unbond for a specific `usteak` burn amount

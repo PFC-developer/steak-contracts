@@ -30,6 +30,10 @@ pub const REPLY_SUBMIT_BATCH: u64 = 3;
 /// estimated end sees the funds as missing and writes the batch down permanently. Ten minutes
 /// covers well over ten blocks on every chain the hub is deployed on, plus small clock skew.
 pub const RECONCILE_GRACE_SECONDS: u64 = 600;
+/// The staking module's default `MaxEntries`: at most this many unbonding entries may be pending
+/// per (delegator, validator). Each batch undelegates from a validator at most once, so this also
+/// bounds the batches that may be unbonding at the same time.
+pub const MAX_UNBONDING_ENTRIES: usize = 7;
 /// `RedelegateInactive` uses one reply id per planned redelegation, starting here, so the reply
 /// handler can say which redelegation the staking module refused.
 pub const REPLY_REDELEGATE_INACTIVE_BASE: u64 = 1_000;
@@ -95,6 +99,7 @@ pub fn execute(deps: DepsMut, env: Env, info: MessageInfo, msg: ExecuteMsg) -> S
             validator_from,
             validator_to,
         } => execute::redelegate(deps, env, info.sender, validator_from, validator_to),
+        ExecuteMsg::BurnStraySteak {} => execute::burn_stray_steak(deps, env, info.sender),
         ExecuteMsg::ReinvestIdle {
             amount,
         } => execute::reinvest_idle(deps, env, info.sender, amount),

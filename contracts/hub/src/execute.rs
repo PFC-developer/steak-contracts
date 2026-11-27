@@ -17,9 +17,9 @@ use pfc_steak::{
 
 use crate::{
     contract::{
-        RECONCILE_GRACE_SECONDS, REDELEGATE_INACTIVE_DEFAULT_LIMIT, REDELEGATE_INACTIVE_MAX_LIMIT,
-        REPLY_INSTANTIATE_TOKEN, REPLY_REDELEGATE_INACTIVE_BASE, REPLY_REGISTER_RECEIVED_COINS,
-        REPLY_SUBMIT_BATCH,
+        MAX_UNBONDING_ENTRIES, RECONCILE_GRACE_SECONDS, REDELEGATE_INACTIVE_DEFAULT_LIMIT,
+        REDELEGATE_INACTIVE_MAX_LIMIT, REPLY_INSTANTIATE_TOKEN, REPLY_REDELEGATE_INACTIVE_BASE,
+        REPLY_REGISTER_RECEIVED_COINS, REPLY_SUBMIT_BATCH,
     },
     helpers::{
         get_denom_balance, parse_received_fund, query_all_delegations, query_cw20_total_supply,
@@ -722,6 +722,26 @@ pub fn submit_batch(deps: DepsMut, env: Env) -> StdResult<Response> {
     if pending_batch.usteak_to_burn.is_zero() {
         return Err(StdError::generic_err("cannot submit an empty unbond batch"));
     }
+    // The staking module refuses an undelegation once `MAX_UNBONDING_ENTRIES` are pending for the
+    // same validator, which would fail the whole batch. Defer while that many earlier batches are
+    // still unbonding (with the same grace as `Reconcile`: matured entries are only removed at
+    // the end of the block). `queue_unbond` tolerates the deferral, so requests keep queueing.
+    let mut in_flight: Vec<u64> = state
+        .previous_batches
+        .range(deps.storage, None, None, Order::Ascending)
+        .map(|item| {
+            item.map(|(_, b)| b.est_unbond_end_time.saturating_add(RECONCILE_GRACE_SECONDS))
+        })
+        .filter(|end| end.as_ref().map_or(true, |end| *end >= current_time))
+        .collect::<StdResult<_>>()?;
+    if in_flight.len() >= MAX_UNBONDING_ENTRIES {
+        in_flight.sort_unstable();
+        return Err(StdError::generic_err(format!(
+            "{} unbonding batches are still in flight; batch can be submitted after {}",
+            in_flight.len(),
+            in_flight[in_flight.len() - MAX_UNBONDING_ENTRIES] + 1
+        )));
+    }
 
     let delegations = query_all_delegations(&deps.querier, &env.contract.address)?;
     let usteak_supply = query_cw20_total_supply(&deps.querier, &steak_token)?;
@@ -1024,6 +1044,33 @@ pub fn add_validator(deps: DepsMut, sender: Addr, validator: String) -> StdResul
     let event = Event::new("steakhub/validator_added").add_attribute("validator", validator);
 
     Ok(Response::new().add_event(event).add_attribute("action", "steakhub/add_validator"))
+}
+
+/// See `ExecuteMsg::BurnStraySteak`.
+pub fn burn_stray_steak(deps: DepsMut, env: Env, sender: Addr) -> StdResult<Response> {
+    let state = State::default();
+    state.assert_owner(deps.storage, &sender)?;
+    let steak_token = state.steak_token.load(deps.storage)?;
+    let held: cw20::BalanceResponse =
+        deps.querier.query_wasm_smart(&steak_token, &cw20::Cw20QueryMsg::Balance {
+            address: env.contract.address.to_string(),
+        })?;
+    let queued = state.pending_batch.load(deps.storage)?.usteak_to_burn;
+    let stray = held.balance.saturating_sub(queued);
+    if stray.is_zero() {
+        return Err(StdError::generic_err("no stray derivative tokens to burn"));
+    }
+
+    Ok(Response::new()
+        .add_message(CosmosMsg::Wasm(WasmMsg::Execute {
+            contract_addr: steak_token.into(),
+            msg: to_json_binary(&Cw20ExecuteMsg::Burn {
+                amount: stray,
+            })?,
+            funds: vec![],
+        }))
+        .add_event(Event::new("steakhub/stray_steak_burned").add_attribute("amount", stray))
+        .add_attribute("action", "steakhub/burn_stray_steak"))
 }
 
 /// See `ExecuteMsg::RedelegateInactive`. Stateless: every call plans from the current on-chain

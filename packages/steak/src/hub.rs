@@ -136,6 +136,10 @@ pub enum ExecuteMsg {
     /// Owner only. Delegate native that sits in the contract unaccounted for (see
     /// `QueryMsg::IdleFunds`) so it earns for current holders. `amount` defaults to all of it and
     /// may not exceed it. No fee is taken.
+    /// Owner only. Burn derivative tokens the hub holds beyond those queued for unbonding: tokens
+    /// sent to the hub directly instead of through unbond can never be redeemed, so burning them
+    /// returns their backing to the remaining holders.
+    BurnStraySteak {},
     ReinvestIdle {
         amount: Option<Uint128>,
     },

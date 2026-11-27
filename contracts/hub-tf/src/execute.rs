@@ -14,9 +14,9 @@ use pfc_steak::{
 use crate::types::{Coins, Delegation, Redelegation};
 use crate::{
     contract::{
-        RECONCILE_GRACE_SECONDS, REDELEGATE_INACTIVE_DEFAULT_LIMIT, REDELEGATE_INACTIVE_MAX_LIMIT,
-        REPLY_REDELEGATE_INACTIVE_BASE, REPLY_REGISTER_RECEIVED_COINS, REPLY_SUBMIT_BATCH,
-        SPECIAL_SEND_MESSAGE_TO_TRANSFER,
+        MAX_UNBONDING_ENTRIES, RECONCILE_GRACE_SECONDS, REDELEGATE_INACTIVE_DEFAULT_LIMIT,
+        REDELEGATE_INACTIVE_MAX_LIMIT, REPLY_REDELEGATE_INACTIVE_BASE,
+        REPLY_REGISTER_RECEIVED_COINS, REPLY_SUBMIT_BATCH, SPECIAL_SEND_MESSAGE_TO_TRANSFER,
     },
     helpers::{
         get_denom_balance, parse_received_fund, query_all_delegations, query_delegation,
@@ -784,6 +784,25 @@ pub fn submit_batch(deps: DepsMut, env: Env) -> StdResult<Response> {
     if pending_batch.usteak_to_burn.is_zero() {
         return Err(StdError::generic_err("cannot submit an empty unbond batch"));
     }
+    // The staking module refuses an undelegation once `MAX_UNBONDING_ENTRIES` are pending for the
+    // same validator, which would fail the whole batch. Defer while that many earlier batches are
+    // still unbonding (with the same grace as `Reconcile`: matured entries are only removed at
+    // the end of the block). `queue_unbond` tolerates the deferral, so requests keep queueing.
+    let mut in_flight: Vec<u64> = previous_batches()
+        .range(deps.storage, None, None, Order::Ascending)
+        .map(|item| {
+            item.map(|(_, b)| b.est_unbond_end_time.saturating_add(RECONCILE_GRACE_SECONDS))
+        })
+        .filter(|end| end.as_ref().map_or(true, |end| *end >= current_time))
+        .collect::<StdResult<_>>()?;
+    if in_flight.len() >= MAX_UNBONDING_ENTRIES {
+        in_flight.sort_unstable();
+        return Err(StdError::generic_err(format!(
+            "{} unbonding batches are still in flight; batch can be submitted after {}",
+            in_flight.len(),
+            in_flight[in_flight.len() - MAX_UNBONDING_ENTRIES] + 1
+        )));
+    }
     if usteak_supply.is_zero() || pending_batch.usteak_to_burn > usteak_supply {
         return Err(StdError::generic_err("unbond batch exceeds the derivative token supply"));
     }
@@ -835,45 +854,12 @@ pub fn submit_batch(deps: DepsMut, env: Env) -> StdResult<Response> {
 
     let mut msgs = vec![];
     if !pending_batch.usteak_to_burn.is_zero() {
-        let burn_msg = match token_factory_type {
-            TokenFactoryType::Kujira => {
-                <kujira::denom::MsgBurn as Into<CosmosMsg>>::into(kujira::denom::MsgBurn {
-                    sender: env.contract.address.to_string(),
-                    amount: Some(kujira::denom::Coin {
-                        denom: steak_denom,
-                        amount: pending_batch.usteak_to_burn.to_string(),
-                    }),
-                })
-            },
-            TokenFactoryType::CosmWasm => <token_factory::denom::MsgBurn as Into<CosmosMsg>>::into(
-                token_factory::denom::MsgBurn {
-                    sender: env.contract.address.to_string(),
-                    amount: Some(token_factory::denom::Coin {
-                        denom: steak_denom,
-                        amount: pending_batch.usteak_to_burn.to_string(),
-                    }),
-                },
-            ),
-            TokenFactoryType::Injective => {
-                <injective::denom::MsgBurn as Into<CosmosMsg>>::into(injective::denom::MsgBurn {
-                    sender: env.contract.address.to_string(),
-                    amount: Some(injective::denom::Coin {
-                        denom: steak_denom,
-                        amount: pending_batch.usteak_to_burn.to_string(),
-                    }),
-                })
-            },
-            TokenFactoryType::Osmosis => {
-                <osmosis::denom::MsgBurn as Into<CosmosMsg>>::into(osmosis::denom::MsgBurn {
-                    sender: env.contract.address.to_string(),
-                    amount: Some(osmosis::denom::Coin {
-                        denom: steak_denom,
-                        amount: pending_batch.usteak_to_burn.to_string(),
-                    }),
-                    burn_from_address: env.contract.address.to_string(),
-                })
-            },
-        };
+        let burn_msg = burn_steak_msg(
+            &token_factory_type,
+            &env.contract.address,
+            steak_denom,
+            pending_batch.usteak_to_burn,
+        );
         // yes.. this will fail if supply is less than the amount to burn. this is intentional.
         state.steak_minted.save(deps.storage, &(usteak_supply - pending_batch.usteak_to_burn))?;
         msgs.push(burn_msg);
@@ -1112,6 +1098,74 @@ pub fn add_validator(deps: DepsMut, sender: Addr, validator: String) -> StdResul
     let event = Event::new("steakhub/validator_added").add_attribute("validator", validator);
 
     Ok(Response::new().add_event(event).add_attribute("action", "steakhub/add_validator"))
+}
+
+fn burn_steak_msg(
+    token_factory_type: &TokenFactoryType,
+    contract: &Addr,
+    steak_denom: String,
+    amount: Uint128,
+) -> CosmosMsg {
+    match token_factory_type {
+        TokenFactoryType::Kujira => {
+            <kujira::denom::MsgBurn as Into<CosmosMsg>>::into(kujira::denom::MsgBurn {
+                sender: contract.to_string(),
+                amount: Some(kujira::denom::Coin {
+                    denom: steak_denom,
+                    amount: amount.to_string(),
+                }),
+            })
+        },
+        TokenFactoryType::CosmWasm => <token_factory::denom::MsgBurn as Into<CosmosMsg>>::into(
+            token_factory::denom::MsgBurn {
+                sender: contract.to_string(),
+                amount: Some(token_factory::denom::Coin {
+                    denom: steak_denom,
+                    amount: amount.to_string(),
+                }),
+            },
+        ),
+        TokenFactoryType::Injective => {
+            <injective::denom::MsgBurn as Into<CosmosMsg>>::into(injective::denom::MsgBurn {
+                sender: contract.to_string(),
+                amount: Some(injective::denom::Coin {
+                    denom: steak_denom,
+                    amount: amount.to_string(),
+                }),
+            })
+        },
+        TokenFactoryType::Osmosis => {
+            <osmosis::denom::MsgBurn as Into<CosmosMsg>>::into(osmosis::denom::MsgBurn {
+                sender: contract.to_string(),
+                amount: Some(osmosis::denom::Coin {
+                    denom: steak_denom,
+                    amount: amount.to_string(),
+                }),
+                burn_from_address: contract.to_string(),
+            })
+        },
+    }
+}
+
+/// See `ExecuteMsg::BurnStraySteak`.
+pub fn burn_stray_steak(deps: DepsMut, env: Env, sender: Addr) -> StdResult<Response> {
+    let state = State::default();
+    state.assert_owner(deps.storage, &sender)?;
+    let steak_denom = state.steak_denom.load(deps.storage)?;
+    let held = deps.querier.query_balance(&env.contract.address, &steak_denom)?.amount;
+    let queued = state.pending_batch.load(deps.storage)?.usteak_to_burn;
+    let stray = held.saturating_sub(queued);
+    if stray.is_zero() {
+        return Err(StdError::generic_err("no stray derivative tokens to burn"));
+    }
+    let minted = state.steak_minted.load(deps.storage)?;
+    state.steak_minted.save(deps.storage, &minted.checked_sub(stray)?)?;
+
+    let token_factory_type = state.token_factory_type.load(deps.storage)?;
+    Ok(Response::new()
+        .add_message(burn_steak_msg(&token_factory_type, &env.contract.address, steak_denom, stray))
+        .add_event(Event::new("steakhub/stray_steak_burned").add_attribute("amount", stray))
+        .add_attribute("action", "steakhub/burn_stray_steak"))
 }
 
 /// See `ExecuteMsg::RedelegateInactive`. Stateless: every call plans from the current on-chain
