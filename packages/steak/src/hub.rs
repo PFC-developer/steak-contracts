@@ -187,10 +187,18 @@ pub enum CallbackMsg {
     /// Following the swaps, stake the Luna acquired to the whitelisted validators
     Reinvest {},
     /// Following inactive-validator redelegations, withdraw the remaining validator rewards
-    /// without replacing the balance baseline captured before those redelegations.
-    HarvestAfterRedelegation {},
+    /// without replacing the balance baseline captured before those redelegations. `exclude` is
+    /// the caller's `RedelegateInactive` exclude list, passed on to the reinvest.
+    HarvestAfterRedelegation {
+        #[serde(default)]
+        exclude: Vec<String>,
+    },
     /// Reinvest rewards if the preceding operations produced any; otherwise succeed as a no-op.
-    ReinvestIfNeeded {},
+    /// Validators in `exclude` are not chosen for the reinvest delegation.
+    ReinvestIfNeeded {
+        #[serde(default)]
+        exclude: Vec<String>,
+    },
 }
 
 impl CallbackMsg {
