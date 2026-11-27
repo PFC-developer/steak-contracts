@@ -1,6 +1,6 @@
 use cosmwasm_std::{Addr, Coin, Decimal, StdError, StdResult, Storage, Uint128};
 use cw_item_set::Set;
-use cw_storage_plus::{Index, IndexList, IndexedMap, Item, MultiIndex};
+use cw_storage_plus::{Index, IndexList, IndexedMap, Item, Map, MultiIndex};
 use pfc_steak::{
     hub::{Batch, FeeType, PendingBatch, UnbondRequest},
     hub_tf::TokenFactoryType,
@@ -10,6 +10,11 @@ pub(crate) const BATCH_KEY_V101: &str = "previous_batches_101";
 pub(crate) const BATCH_KEY_OWNER_V101: &str = "previous_batches_owner_101";
 pub(crate) const UNBOND_KEY_V101: &str = "unbond_101";
 pub(crate) const UNBOND_KEY_USER_V101: &str = "unbond_owner_101";
+/// First block height at which an unreconciled batch was observed past its estimated maturity.
+/// Reconciliation is allowed only in a later block, after the staking module had an EndBlock in
+/// which to pay the matured unbonding.
+pub(crate) const RECONCILE_OBSERVED_HEIGHTS: Map<u64, u64> =
+    Map::new("reconcile_observed_heights_001");
 
 /// Validators who currently have delegations. This can be different due to being
 /// paused/re-delegations

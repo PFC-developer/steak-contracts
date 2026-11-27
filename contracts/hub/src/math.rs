@@ -1,4 +1,4 @@
-use std::{cmp, cmp::Ordering, collections::HashMap};
+use std::{cmp, cmp::Ordering};
 
 use cosmwasm_std::{StdError, StdResult, Uint128};
 use pfc_steak::hub::Batch;
@@ -289,67 +289,43 @@ pub(crate) fn compute_redelegations_for_rebalancing(
 /// The idea of "reconciling" is based on Stader's implementation:
 /// https://github.com/stader-labs/stader-liquid-token/blob/v0.2.1/contracts/staking/src/contract.rs#L968-L1048
 pub(crate) fn reconcile_batches(batches: &mut [Batch], native_to_deduct: Uint128) {
-    let batch_count = batches.len() as u128;
-    if batch_count == 0 {
-        return;
-    }
-    let native_per_batch = native_to_deduct.u128() / batch_count;
-    let remainder = native_to_deduct.u128() % batch_count;
-    //let mut remaining_underflow = Uint128::zero();
-    let mut underflows: HashMap<usize, Uint128> = HashMap::default();
+    let mut remaining = native_to_deduct;
+    let mut active = batches
+        .iter()
+        .enumerate()
+        .filter_map(|(index, batch)| (!batch.amount_unclaimed.is_zero()).then_some(index))
+        .collect::<Vec<_>>();
 
-    // distribute the underflows uniformly accross non-underflowing batches
-    for (i, batch) in batches.iter_mut().enumerate() {
-        let remainder_for_batch: u128 = u128::from((i + 1) as u128 <= remainder);
-        let native_for_batch = Uint128::new(native_per_batch + remainder_for_batch);
+    // Repeatedly distribute the remaining shortfall across only the batches that still have
+    // value. This water-fill guarantees that the exact capped deduction is applied even when
+    // small batches hit zero in an earlier pass.
+    while !remaining.is_zero() && !active.is_empty() {
+        let batch_count = active.len() as u128;
+        let native_per_batch = remaining.u128() / batch_count;
+        let mut remainder = remaining.u128() % batch_count;
+        let mut deducted = Uint128::zero();
+        let mut next_active = Vec::with_capacity(active.len());
 
-        if batch.amount_unclaimed < native_for_batch && batch_count > 1 {
-            //    remaining_underflow += native_for_batch - batch.amount_unclaimed;
-            underflows.insert(i, native_for_batch - batch.amount_unclaimed);
+        for index in active {
+            let extra = u128::from(remainder > 0);
+            remainder = remainder.saturating_sub(extra);
+            let target = Uint128::new(native_per_batch + extra);
+            let amount = batches[index].amount_unclaimed.min(target);
+            batches[index].amount_unclaimed -= amount;
+            deducted += amount;
+            if !batches[index].amount_unclaimed.is_zero() {
+                next_active.push(index);
+            }
         }
-        batch.amount_unclaimed = batch.amount_unclaimed.saturating_sub(native_for_batch);
 
+        if deducted.is_zero() {
+            break;
+        }
+        remaining -= deducted;
+        active = next_active;
+    }
+
+    for batch in batches {
         batch.reconciled = true;
-    }
-    if !underflows.is_empty() {
-        let batch_count: u128 = batch_count - (underflows.len() as u128);
-        if batch_count == 0 {
-            return;
-        }
-        let to_deduct: Uint128 = underflows.iter().map(|v| v.1).sum();
-        let native_per_batch = to_deduct.u128() / batch_count;
-        let remainder = to_deduct.u128() % batch_count;
-        let mut remaining_underflow = Uint128::zero();
-        // the remaining underflow will be applied by oldest batch first.
-        for (i, batch) in batches.iter_mut().enumerate() {
-            if !batch.amount_unclaimed.is_zero() {
-                let remainder_for_batch: u128 = u128::from((i + 1) as u128 <= remainder);
-                let native_for_batch = Uint128::new(native_per_batch + remainder_for_batch);
-                if batch.amount_unclaimed < native_for_batch && batch_count > 1 {
-                    remaining_underflow += native_for_batch - batch.amount_unclaimed;
-                }
-                batch.amount_unclaimed = batch.amount_unclaimed.saturating_sub(native_for_batch);
-            }
-        }
-
-        if !remaining_underflow.is_zero() {
-            // the remaining underflow will be applied by oldest batch first.
-            for batch in batches.iter_mut() {
-                //.enumerate() {
-                if !batch.amount_unclaimed.is_zero() && !remaining_underflow.is_zero() {
-                    if batch.amount_unclaimed >= remaining_underflow {
-                        batch.amount_unclaimed -= remaining_underflow;
-                        remaining_underflow = Uint128::zero()
-                    } else {
-                        remaining_underflow -= batch.amount_unclaimed;
-                        batch.amount_unclaimed = Uint128::zero();
-                    }
-                }
-            }
-
-            if !remaining_underflow.is_zero() {
-                // no way to reconcile right now, need to top up some funds.
-            }
-        }
     }
 }

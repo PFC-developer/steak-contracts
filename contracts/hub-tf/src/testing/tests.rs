@@ -20,13 +20,13 @@ use super::{
 };
 use crate::{
     contract::{
-        RECONCILE_GRACE_SECONDS, REDELEGATE_INACTIVE_MAX_LIMIT, REPLY_REDELEGATE_INACTIVE_BASE,
+        REDELEGATE_INACTIVE_MAX_LIMIT, REPLY_REDELEGATE_INACTIVE_BASE,
         REPLY_REGISTER_RECEIVED_COINS, REPLY_SUBMIT_BATCH, execute, instantiate, migrate, reply,
     },
     helpers::{parse_coin, parse_received_fund},
     math::{
         compute_redelegations_for_inactive, compute_redelegations_for_rebalancing,
-        compute_redelegations_for_removal, compute_undelegations,
+        compute_redelegations_for_removal, compute_undelegations, reconcile_batches,
     },
     state::{State, VALIDATORS, VALIDATORS_ACTIVE, previous_batches, unbond_requests},
     token_factory::{
@@ -82,6 +82,17 @@ fn callback_submsg(callback: CallbackMsg) -> SubMsg {
         msg: to_json_binary(&ExecuteMsg::Callback(callback)).unwrap(),
         funds: vec![],
     }))
+}
+
+fn observe_and_reconcile(
+    deps: &mut OwnedDeps<MockStorage, MockApi, CustomQuerier>,
+    timestamp: u64,
+) {
+    let mut env = mock_env_at_timestamp(timestamp);
+    execute(deps.as_mut(), env.clone(), mock_info("worker", &[]), ExecuteMsg::Reconcile {})
+        .unwrap();
+    env.block.height += 1;
+    execute(deps.as_mut(), env, mock_info("worker", &[]), ExecuteMsg::Reconcile {}).unwrap();
 }
 
 #[test]
@@ -927,13 +938,7 @@ fn reconciling() {
         Coin::new(69420, "ibc/0471F1C4E7AFD3F07702BEF6DC365268D64570F7C1FDC98EA6098DD6DE59817B"),
     ]);
 
-    execute(
-        deps.as_mut(),
-        mock_env_at_timestamp(35000),
-        mock_info("worker", &[]),
-        ExecuteMsg::Reconcile {},
-    )
-    .unwrap();
+    observe_and_reconcile(&mut deps, 35000);
 
     // Expected received: batch 2 + batch 3 = 1385 + 1506 = 2891
     // Expected unlocked: 10000
@@ -1876,13 +1881,7 @@ fn reconciling_underflow() {
         Coin::new(345, "uusd"),
         Coin::new(69420, "ibc/0471F1C4E7AFD3F07702BEF6DC365268D64570F7C1FDC98EA6098DD6DE59817B"),
     ]);
-    execute(
-        deps.as_mut(),
-        mock_env_at_timestamp(35000),
-        mock_info("worker", &[]),
-        ExecuteMsg::Reconcile {},
-    )
-    .unwrap();
+    observe_and_reconcile(&mut deps, 35000);
 }
 
 #[test]
@@ -1940,13 +1939,7 @@ fn reconciling_underflow_second() {
         Coin::new(345, "uusd"),
         Coin::new(69420, "ibc/0471F1C4E7AFD3F07702BEF6DC365268D64570F7C1FDC98EA6098DD6DE59817B"),
     ]);
-    execute(
-        deps.as_mut(),
-        mock_env_at_timestamp(35000),
-        mock_info("worker", &[]),
-        ExecuteMsg::Reconcile {},
-    )
-    .unwrap();
+    observe_and_reconcile(&mut deps, 35000);
 }
 #[test]
 fn dust_return_denom() {
@@ -2325,10 +2318,8 @@ fn redelegating_inactive_respects_exclude_and_bonded_set() {
 }
 
 #[test]
-fn reconcile_waits_out_the_grace_period() {
+fn reconcile_waits_for_a_completed_block_after_maturity() {
     let mut deps = setup_test();
-    // Batch 1 is due at 20000 but its funds are paid out at the end of the block, so they are not
-    // in the balance yet when a Reconcile lands in the first block after.
     let batch = Batch {
         id: 1,
         reconciled: false,
@@ -2339,30 +2330,28 @@ fn reconcile_waits_out_the_grace_period() {
     previous_batches().save(deps.as_mut().storage, batch.id, &batch).unwrap();
     deps.querier.set_bank_balances(&[]);
 
-    execute(
-        deps.as_mut(),
-        mock_env_at_timestamp(20000 + RECONCILE_GRACE_SECONDS),
-        mock_info("anyone", &[]),
-        ExecuteMsg::Reconcile {},
-    )
-    .unwrap();
+    // Even after a long chain halt, the first block past maturity only records an observation.
+    let mut env = mock_env_at_timestamp(30000);
+    execute(deps.as_mut(), env.clone(), mock_info("anyone", &[]), ExecuteMsg::Reconcile {})
+        .unwrap();
     assert_eq!(
         previous_batches().load(deps.as_ref().storage, 1u64).unwrap(),
         batch,
-        "a reconcile inside the grace period must not write down"
+        "the first post-halt block must not write the batch down"
     );
 
-    // Past the grace period, funds that are still missing are treated as slashed.
-    execute(
-        deps.as_mut(),
-        mock_env_at_timestamp(20000 + RECONCILE_GRACE_SECONDS + 1),
-        mock_info("anyone", &[]),
-        ExecuteMsg::Reconcile {},
-    )
-    .unwrap();
+    // A second transaction in that same block is still unable to reconcile it.
+    execute(deps.as_mut(), env.clone(), mock_info("anyone", &[]), ExecuteMsg::Reconcile {})
+        .unwrap();
+    assert_eq!(previous_batches().load(deps.as_ref().storage, 1u64).unwrap(), batch);
+
+    // The staking module pays at EndBlock; reconciliation in the next block sees those funds.
+    deps.querier.set_bank_balances(&[Coin::new(1000, "uxyz")]);
+    env.block.height += 1;
+    execute(deps.as_mut(), env, mock_info("anyone", &[]), ExecuteMsg::Reconcile {}).unwrap();
     let reconciled = previous_batches().load(deps.as_ref().storage, 1u64).unwrap();
     assert!(reconciled.reconciled);
-    assert_eq!(reconciled.amount_unclaimed, Uint128::zero());
+    assert_eq!(reconciled.amount_unclaimed, Uint128::new(1000));
 }
 
 #[test]
@@ -2387,13 +2376,7 @@ fn reconcile_does_not_count_funds_owed_to_reconciled_batches() {
     previous_batches().save(deps.as_mut().storage, batch2.id, &batch2).unwrap();
     deps.querier.set_bank_balances(&[Coin::new(500 + 800, "uxyz")]);
 
-    execute(
-        deps.as_mut(),
-        mock_env_at_timestamp(30000),
-        mock_info("anyone", &[]),
-        ExecuteMsg::Reconcile {},
-    )
-    .unwrap();
+    observe_and_reconcile(&mut deps, 30000);
 
     // Without the reserve, batch 1's 500 would cover the 200 shortfall and batch 2 would keep 1000.
     assert_eq!(
@@ -2403,5 +2386,119 @@ fn reconcile_does_not_count_funds_owed_to_reconciled_batches() {
     assert_eq!(
         previous_batches().load(deps.as_ref().storage, 1u64).unwrap().amount_unclaimed,
         Uint128::new(500)
+    );
+}
+
+#[test]
+fn reconcile_waits_for_every_matured_batch_before_accounting() {
+    let mut deps = setup_test();
+    let batch_a = Batch {
+        id: 1,
+        reconciled: false,
+        total_shares: Uint128::new(100),
+        amount_unclaimed: Uint128::new(100),
+        est_unbond_end_time: 10000,
+    };
+    let batch_b = Batch {
+        id: 2,
+        reconciled: false,
+        total_shares: Uint128::new(100),
+        amount_unclaimed: Uint128::new(100),
+        est_unbond_end_time: 20000,
+    };
+    previous_batches().save(deps.as_mut().storage, 1, &batch_a).unwrap();
+    previous_batches().save(deps.as_mut().storage, 2, &batch_b).unwrap();
+    deps.querier.set_bank_balances(&[Coin::new(80, "uxyz")]);
+
+    let mut env = mock_env_at_timestamp(15000);
+    execute(deps.as_mut(), env.clone(), mock_info("anyone", &[]), ExecuteMsg::Reconcile {})
+        .unwrap();
+
+    // B has now matured and paid, but observing B must also hold A back for this entire block.
+    deps.querier.set_bank_balances(&[Coin::new(180, "uxyz")]);
+    env.block.height += 1;
+    env.block.time = cosmwasm_std::Timestamp::from_seconds(20300);
+    execute(deps.as_mut(), env.clone(), mock_info("anyone", &[]), ExecuteMsg::Reconcile {})
+        .unwrap();
+    execute(deps.as_mut(), env.clone(), mock_info("anyone", &[]), ExecuteMsg::Reconcile {})
+        .unwrap();
+    assert!(!previous_batches().load(deps.as_ref().storage, 1).unwrap().reconciled);
+
+    env.block.height += 1;
+    execute(deps.as_mut(), env, mock_info("anyone", &[]), ExecuteMsg::Reconcile {}).unwrap();
+    assert_eq!(
+        previous_batches().load(deps.as_ref().storage, 1).unwrap().amount_unclaimed,
+        Uint128::new(90)
+    );
+    assert_eq!(
+        previous_batches().load(deps.as_ref().storage, 2).unwrap().amount_unclaimed,
+        Uint128::new(90)
+    );
+}
+
+#[test]
+fn reconcile_batches_applies_the_exact_capped_deduction() {
+    let mut batches = [1u128, 1, 100, 100, 9798].map(|amount| Batch {
+        id: amount as u64,
+        reconciled: false,
+        total_shares: Uint128::new(amount),
+        amount_unclaimed: Uint128::new(amount),
+        est_unbond_end_time: 1,
+    });
+
+    reconcile_batches(&mut batches, Uint128::new(500));
+    assert_eq!(batches.map(|batch| batch.amount_unclaimed), [
+        Uint128::zero(),
+        Uint128::zero(),
+        Uint128::zero(),
+        Uint128::zero(),
+        Uint128::new(9500),
+    ]);
+
+    let mut fully_slashed = [1u128, 1, 100, 100, 298].map(|amount| Batch {
+        id: amount as u64,
+        reconciled: false,
+        total_shares: Uint128::new(amount),
+        amount_unclaimed: Uint128::new(amount),
+        est_unbond_end_time: 1,
+    });
+    reconcile_batches(&mut fully_slashed, Uint128::new(500));
+    assert!(fully_slashed.iter().all(|batch| batch.amount_unclaimed.is_zero()));
+}
+
+#[test]
+fn withdrawing_a_fully_written_down_request_clears_it() {
+    let mut deps = setup_test();
+    previous_batches()
+        .save(deps.as_mut().storage, 1, &Batch {
+            id: 1,
+            reconciled: true,
+            total_shares: Uint128::new(100),
+            amount_unclaimed: Uint128::zero(),
+            est_unbond_end_time: 10000,
+        })
+        .unwrap();
+    let user = Addr::unchecked("user");
+    unbond_requests()
+        .save(deps.as_mut().storage, (1, user.as_str()), &UnbondRequest {
+            id: 1,
+            user: user.clone(),
+            shares: Uint128::new(100),
+        })
+        .unwrap();
+
+    let response = execute(
+        deps.as_mut(),
+        mock_env_at_timestamp(20000),
+        mock_info(user.as_str(), &[]),
+        ExecuteMsg::WithdrawUnbonded {
+            receiver: None,
+        },
+    )
+    .unwrap();
+    assert!(response.messages.is_empty());
+    assert!(previous_batches().may_load(deps.as_ref().storage, 1).unwrap().is_none());
+    assert!(
+        unbond_requests().may_load(deps.as_ref().storage, (1, user.as_str())).unwrap().is_none()
     );
 }

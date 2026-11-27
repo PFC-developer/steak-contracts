@@ -17,9 +17,8 @@ use pfc_steak::{
 
 use crate::{
     contract::{
-        RECONCILE_GRACE_SECONDS, REDELEGATE_INACTIVE_DEFAULT_LIMIT, REDELEGATE_INACTIVE_MAX_LIMIT,
-        REPLY_INSTANTIATE_TOKEN, REPLY_REDELEGATE_INACTIVE_BASE, REPLY_REGISTER_RECEIVED_COINS,
-        REPLY_SUBMIT_BATCH,
+        REDELEGATE_INACTIVE_DEFAULT_LIMIT, REDELEGATE_INACTIVE_MAX_LIMIT, REPLY_INSTANTIATE_TOKEN,
+        REPLY_REDELEGATE_INACTIVE_BASE, REPLY_REGISTER_RECEIVED_COINS, REPLY_SUBMIT_BATCH,
     },
     helpers::{
         get_denom_balance, parse_received_fund, query_all_delegations, query_cw20_total_supply,
@@ -30,7 +29,7 @@ use crate::{
         compute_redelegations_for_rebalancing, compute_redelegations_for_removal,
         compute_unbond_amount, compute_undelegations, reconcile_batches,
     },
-    state::State,
+    state::{RECONCILE_OBSERVED_HEIGHTS, State},
     types::{Coins, Delegation, Redelegation},
 };
 //--------------------------------------------------------------------------------------------------
@@ -666,10 +665,32 @@ pub fn reconcile(deps: DepsMut, env: Env) -> StdResult<Response> {
         })
         .collect::<StdResult<Vec<_>>>()?;
 
-    let mut batches = all_batches
-        .into_iter()
-        .filter(|b| current_time > b.est_unbond_end_time.saturating_add(RECONCILE_GRACE_SECONDS))
-        .collect::<Vec<_>>();
+    let mut batches = Vec::new();
+    let mut waiting = Vec::new();
+    for batch in all_batches.into_iter().filter(|b| current_time > b.est_unbond_end_time) {
+        match RECONCILE_OBSERVED_HEIGHTS.may_load(deps.storage, batch.id)? {
+            Some(observed_height) if env.block.height > observed_height => batches.push(batch),
+            Some(_) => waiting.push(batch.id),
+            None => {
+                RECONCILE_OBSERVED_HEIGHTS.save(deps.storage, batch.id, &env.block.height)?;
+                waiting.push(batch.id);
+            },
+        }
+    }
+
+    // Do not reconcile older batches while a newly matured batch may already have paid into the
+    // shared balance. Waiting one more block makes every matured batch part of the same accounting
+    // set and guarantees that each has had an EndBlock opportunity to receive its unbonding.
+    if !waiting.is_empty() {
+        let ids = waiting.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+        return Ok(Response::new()
+            .add_event(
+                Event::new("steakhub/reconcile_observed")
+                    .add_attribute("ids", ids)
+                    .add_attribute("height", env.block.height.to_string()),
+            )
+            .add_attribute("action", "steakhub/reconcile"));
+    }
     if batches.is_empty() {
         return Ok(Response::new()
             .add_event(Event::new("steakhub/reconciled").add_attribute("ids", ""))
@@ -713,6 +734,7 @@ pub fn reconcile(deps: DepsMut, env: Env) -> StdResult<Response> {
     for batch in batches.iter_mut() {
         batch.reconciled = true;
         state.previous_batches.save(deps.storage, batch.id, batch)?;
+        RECONCILE_OBSERVED_HEIGHTS.remove(deps.storage, batch.id);
     }
 
     let ids = batches.iter().map(|b| b.id.to_string()).collect::<Vec<_>>().join(",");
@@ -793,27 +815,28 @@ pub fn withdraw_unbonded(
         }
     }
 
-    if total_native_to_refund.is_zero() {
+    if ids.is_empty() {
         return Err(StdError::generic_err("withdrawable amount is zero"));
     }
-
-    let refund_msg = CosmosMsg::Bank(BankMsg::Send {
-        to_address: receiver.clone().into(),
-        amount: vec![Coin::new(total_native_to_refund.u128(), denom)],
-    });
 
     let event = Event::new("steakhub/unbonded_withdrawn")
         .add_attribute("time", env.block.time.seconds().to_string())
         .add_attribute("height", env.block.height.to_string())
         .add_attribute("ids", ids.join(","))
         .add_attribute("user", user)
-        .add_attribute("receiver", receiver)
+        .add_attribute("receiver", &receiver)
         .add_attribute("amount_refunded", total_native_to_refund);
 
-    Ok(Response::new()
-        .add_message(refund_msg)
-        .add_event(event)
-        .add_attribute("action", "steakhub/withdraw_unbonded"))
+    let mut response =
+        Response::new().add_event(event).add_attribute("action", "steakhub/withdraw_unbonded");
+    if !total_native_to_refund.is_zero() {
+        response = response.add_message(CosmosMsg::Bank(BankMsg::Send {
+            to_address: receiver.into(),
+            amount: vec![Coin::new(total_native_to_refund.u128(), denom)],
+        }));
+    }
+
+    Ok(response)
 }
 
 //--------------------------------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 # changelog
 
 ## 3.0.22
-* `Reconcile` waits `RECONCILE_GRACE_SECONDS` (10 min) past a batch's estimated unbond end before writing it down, so a reconcile in the block where the unbonding matures can no longer wipe out the batch; funds owed to already-reconciled batches no longer hide a shortfall; the write-down is capped at the batches' total
+* `Reconcile` records the first block in which a batch is observed past its estimated unbond end and waits for a later block before accounting it, so the staking module always gets an EndBlock opportunity to pay matured unbondings; every matured batch must pass that gate before any are reconciled, preventing one batch's funds from masking another's loss; reconciled obligations are reserved, write-downs conserve the exact capped shortfall, and fully written-down requests remain cleanly claimable
 * add owner-only `RedelegateInactive { limit, exclude }` to both hubs: moves stake off validators outside the active set (paused, or removed without redelegation) onto the active validators the chain currently has bonded. Each redelegation is an isolated submessage, so ones the staking module refuses (transitive redelegation, max entries) are skipped and reported, and the call can be re-run once they mature; `exclude` keeps known-blocked validators from using up `limit` (default 25, max 50). Rewards withdrawn by the redelegations are harvested and reinvested atomically through the new `CallbackMsg::HarvestAfterRedelegation` / `ReinvestIfNeeded`; a reward-finalization failure reverts the transaction so no reward balance can be stranded, and reinvestment targets only active validators currently bonded on chain
 * `pfc-steak` 3.0.21: new `ExecuteMsg::RedelegateInactive` and `CallbackMsg` variants
 

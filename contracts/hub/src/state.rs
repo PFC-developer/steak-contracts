@@ -1,10 +1,15 @@
 use cosmwasm_std::{Addr, Coin, Decimal, StdError, StdResult, Storage, Uint128};
-use cw_storage_plus::{Index, IndexList, IndexedMap, Item, MultiIndex};
+use cw_storage_plus::{Index, IndexList, IndexedMap, Item, Map, MultiIndex};
 use pfc_steak::hub::{Batch, FeeType, PendingBatch, UnbondRequest};
 
 use crate::types::BooleanKey;
 pub(crate) const BATCH_KEY_V101: &str = "previous_batches_101";
 pub(crate) const BATCH_KEY_RECONCILED_V101: &str = "previous_batches__reconciled_101";
+/// First block height at which an unreconciled batch was observed past its estimated maturity.
+/// Reconciliation is allowed only in a later block, after the staking module had an EndBlock in
+/// which to pay the matured unbonding.
+pub(crate) const RECONCILE_OBSERVED_HEIGHTS: Map<u64, u64> =
+    Map::new("reconcile_observed_heights_001");
 
 pub(crate) struct State<'a> {
     /// Account who can call certain privileged functions
