@@ -24,6 +24,11 @@ pub const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const REPLY_INSTANTIATE_TOKEN: u64 = 1;
 pub const REPLY_REGISTER_RECEIVED_COINS: u64 = 2;
 pub const REPLY_SUBMIT_BATCH: u64 = 3;
+/// `RedelegateInactive` uses one reply id per planned redelegation, starting here, so the reply
+/// handler can say which redelegation the staking module refused.
+pub const REPLY_REDELEGATE_INACTIVE_BASE: u64 = 1_000;
+pub const REDELEGATE_INACTIVE_DEFAULT_LIMIT: u32 = 25;
+pub const REDELEGATE_INACTIVE_MAX_LIMIT: u32 = 50;
 pub const SPECIAL_SEND_MESSAGE_TO_TRANSFER: &str = "PFC_TRANSFER_NOT_SEND";
 
 #[entry_point]
@@ -84,6 +89,12 @@ pub fn execute(deps: DepsMut, env: Env, info: MessageInfo, msg: ExecuteMsg) -> S
             validator_from,
             validator_to,
         } => execute::redelegate(deps, env, info.sender, validator_from, validator_to),
+        ExecuteMsg::RedelegateInactive {
+            limit,
+            exclude,
+        } => {
+            execute::redelegate_inactive(deps, env, info.sender, limit, exclude.unwrap_or_default())
+        },
 
         ExecuteMsg::TransferOwnership {
             new_owner,
@@ -150,7 +161,15 @@ fn callback(
 
     match callback_msg {
         CallbackMsg::Reinvest {} => execute::reinvest(deps, env),
+        CallbackMsg::HarvestAfterRedelegation {} => execute::harvest_after_redelegation(deps, env),
+        CallbackMsg::ReinvestIfNeeded {} => execute::reinvest_if_needed(deps, env),
     }
+}
+
+fn is_redelegate_inactive_reply(id: u64) -> bool {
+    (REPLY_REDELEGATE_INACTIVE_BASE
+        ..REPLY_REDELEGATE_INACTIVE_BASE + u64::from(REDELEGATE_INACTIVE_MAX_LIMIT))
+        .contains(&id)
 }
 
 #[entry_point]
@@ -158,6 +177,7 @@ pub fn reply(_deps: DepsMut, _env: Env, reply: Reply) -> StdResult<Response> {
     match reply.id {
         REPLY_REGISTER_RECEIVED_COINS => Ok(Response::default()),
         REPLY_SUBMIT_BATCH => Ok(execute::submit_batch_deferred(reply)),
+        id if is_redelegate_inactive_reply(id) => Ok(execute::redelegate_inactive_reply(reply)),
         _ => Err(StdError::generic_err(format!(
             "invalid reply id: {}  {:?}",
             reply.id, reply.result

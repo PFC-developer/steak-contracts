@@ -150,6 +150,53 @@ pub(crate) fn compute_redelegations_for_removal(
     new_redelegations
 }
 
+/// Plan redelegations that move stake off every validator that is not in `non_sources` and spread
+/// it over `destinations`, topping up the destination delegations toward an even split.
+///
+/// `non_sources` is the contract's active set plus anything the caller excluded; `destinations`
+/// is the subset of the active set that should receive stake (bonded on chain, not excluded).
+///
+/// The plan is derived purely from the current on-chain delegations, so running it again after
+/// some redelegations were skipped (or after `limit` cut a run short) picks up exactly what is
+/// left. At most `limit` redelegations are returned.
+pub(crate) fn compute_redelegations_for_inactive(
+    non_sources: &[String],
+    destinations: &[String],
+    current_delegations: &[Delegation],
+    limit: usize,
+    denom: &str,
+) -> Vec<Redelegation> {
+    if destinations.is_empty() || limit == 0 {
+        return vec![];
+    }
+
+    let mut targets: Vec<Delegation> = destinations
+        .iter()
+        .map(|v| {
+            let amount =
+                current_delegations.iter().filter(|d| d.validator == *v).map(|d| d.amount).sum();
+            Delegation::new(v, amount, denom)
+        })
+        .collect();
+
+    let mut new_redelegations: Vec<Redelegation> = vec![];
+    for source in
+        current_delegations.iter().filter(|d| d.amount > 0 && !non_sources.contains(&d.validator))
+    {
+        for rd in compute_redelegations_for_removal(source, &targets, denom) {
+            if new_redelegations.len() >= limit {
+                return new_redelegations;
+            }
+            if let Some(target) = targets.iter_mut().find(|t| t.validator == rd.dst) {
+                target.amount += rd.amount;
+            }
+            new_redelegations.push(rd);
+        }
+    }
+
+    new_redelegations
+}
+
 /// Compute redelegation moves that will make each validator's delegation the targeted amount
 /// (hopefully this sentence makes sense)
 ///

@@ -2,8 +2,8 @@ use std::str::FromStr;
 
 use cosmwasm_std::{
     Addr, BankMsg, Binary, Coin, CosmosMsg, Decimal, DepsMut, DistributionMsg, Env, Event, Order,
-    Response, StdError, StdResult, SubMsg, SubMsgResponse, Uint128, WasmMsg, from_json,
-    to_json_binary,
+    Reply, ReplyOn, Response, StdError, StdResult, SubMsg, SubMsgResponse, SubMsgResult, Uint128,
+    WasmMsg, from_json, to_json_binary,
 };
 use cw20::{Cw20ExecuteMsg, MinterResponse};
 use cw20_base::msg::InstantiateMsg as Cw20InstantiateMsg;
@@ -16,15 +16,18 @@ use pfc_steak::{
 };
 
 use crate::{
-    contract::{REPLY_INSTANTIATE_TOKEN, REPLY_REGISTER_RECEIVED_COINS, REPLY_SUBMIT_BATCH},
+    contract::{
+        REDELEGATE_INACTIVE_DEFAULT_LIMIT, REDELEGATE_INACTIVE_MAX_LIMIT, REPLY_INSTANTIATE_TOKEN,
+        REPLY_REDELEGATE_INACTIVE_BASE, REPLY_REGISTER_RECEIVED_COINS, REPLY_SUBMIT_BATCH,
+    },
     helpers::{
         get_denom_balance, parse_received_fund, query_all_delegations, query_cw20_total_supply,
         query_delegation, query_delegations,
     },
     math::{
-        compute_mint_amount, compute_redelegations_for_rebalancing,
-        compute_redelegations_for_removal, compute_unbond_amount, compute_undelegations,
-        reconcile_batches,
+        compute_mint_amount, compute_redelegations_for_inactive,
+        compute_redelegations_for_rebalancing, compute_redelegations_for_removal,
+        compute_unbond_amount, compute_undelegations, reconcile_batches,
     },
     state::State,
     types::{Coins, Delegation, Redelegation},
@@ -294,6 +297,46 @@ pub fn harvest(deps: DepsMut, env: Env) -> StdResult<Response> {
         .add_attribute("action", "steakhub/harvest"))
 }
 
+/// Complete reward processing after inactive-validator redelegations. The caller captured
+/// `prev_denom` before those redelegations; preserve that baseline, withdraw rewards from every
+/// remaining delegation, then reinvest the complete balance delta. Withdrawing first also prevents
+/// the final delegation from surfacing an active validator's older rewards after reinvestment.
+pub fn harvest_after_redelegation(deps: DepsMut, env: Env) -> StdResult<Response> {
+    let withdraw_submsgs = deps
+        .querier
+        .query_all_delegations(&env.contract.address)?
+        .into_iter()
+        .map(|d| {
+            SubMsg::reply_on_success(
+                CosmosMsg::Distribution(DistributionMsg::WithdrawDelegatorReward {
+                    validator: d.validator,
+                }),
+                REPLY_REGISTER_RECEIVED_COINS,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let callback_msg = CallbackMsg::ReinvestIfNeeded {}.into_cosmos_msg(&env.contract.address)?;
+
+    Ok(Response::new()
+        .add_submessages(withdraw_submsgs)
+        .add_message(callback_msg)
+        .add_attribute("action", "steakhub/harvest_after_redelegation"))
+}
+
+pub fn reinvest_if_needed(deps: DepsMut, env: Env) -> StdResult<Response> {
+    let state = State::default();
+    let denom = state.denom.load(deps.storage)?;
+    let prev_coin = state.prev_denom.load(deps.storage)?;
+    let current_coin = get_denom_balance(&deps.querier, env.contract.address.clone(), denom)?;
+
+    if current_coin <= prev_coin {
+        return Ok(Response::new().add_attribute("action", "steakhub/reinvest_not_needed"));
+    }
+
+    reinvest(deps, env)
+}
+
 /// NOTE:
 /// 1. When delegation Native denom here, we don't need to use a `SubMsg` to handle the received
 ///    coins, because we have already withdrawn all claimable staking rewards previously in the same
@@ -305,9 +348,13 @@ pub fn reinvest(deps: DepsMut, env: Env) -> StdResult<Response> {
     let denom = state.denom.load(deps.storage)?;
     let fee = state.fee_rate.load(deps.storage)?;
 
-    let validators = state.validators_active.load(deps.storage)?;
+    let validators_active = state.validators_active.load(deps.storage)?;
+    let bonded: Vec<String> =
+        deps.querier.query_all_validators()?.into_iter().map(|v| v.address).collect();
+    let validators: Vec<String> =
+        validators_active.into_iter().filter(|v| bonded.contains(v)).collect();
     if validators.is_empty() {
-        return Err(StdError::generic_err("cannot reinvest without an active validator"));
+        return Err(StdError::generic_err("cannot reinvest without a bonded active validator"));
     }
     let prev_coin = state.prev_denom.load(deps.storage)?;
     let current_coin =
@@ -803,6 +850,163 @@ pub fn add_validator(deps: DepsMut, sender: Addr, validator: String) -> StdResul
 
     Ok(Response::new().add_event(event).add_attribute("action", "steakhub/add_validator"))
 }
+
+/// See `ExecuteMsg::RedelegateInactive`. Stateless: every call plans from the current on-chain
+/// delegations, so it is safe to re-run after skipped redelegations mature.
+///
+/// Staking-module rules that can refuse an individual redelegation (each is isolated in its own
+/// submessage and reported by the reply handler rather than failing the whole call):
+/// - transitive redelegation: stake cannot leave a validator while this contract has an unmatured
+///   redelegation *into* that validator; this blocks the whole source until it matures. A blocked
+///   source is planned again on every run, so pass it in `exclude` until it matures
+/// - max entries: at most `MaxEntries` (default 7) unmatured redelegations per (delegator, source,
+///   destination) triple
+/// - destinations: only validators in the contract's active set that the chain currently has bonded
+///   are used, so stake is not moved onto a jailed, unbonded or missing validator
+///
+/// A redelegation out of a bonded or unbonding (e.g. jailed) source creates an entry that matures
+/// when the source's own unbonding completes; until then its destination cannot act as a
+/// redelegation source, which affects later `Rebalance` / `RemoveValidator` / `Redelegate` calls.
+/// A redelegation out of an unbonded source completes immediately and creates no entry.
+///
+/// Running out of gas is not isolated (submessages carry no gas limit), so `limit` is capped at
+/// `REDELEGATE_INACTIVE_MAX_LIMIT`.
+pub fn redelegate_inactive(
+    deps: DepsMut,
+    env: Env,
+    sender: Addr,
+    limit: Option<u32>,
+    exclude: Vec<String>,
+) -> StdResult<Response> {
+    let state = State::default();
+    state.assert_owner(deps.storage, &sender)?;
+
+    let limit = limit.unwrap_or(REDELEGATE_INACTIVE_DEFAULT_LIMIT);
+    if limit == 0 || limit > REDELEGATE_INACTIVE_MAX_LIMIT {
+        return Err(StdError::generic_err(format!(
+            "limit must be between 1 and {}",
+            REDELEGATE_INACTIVE_MAX_LIMIT
+        )));
+    }
+
+    let denom = state.denom.load(deps.storage)?;
+    let validators_active = state.validators_active.load(deps.storage)?;
+    if validators_active.is_empty() {
+        return Err(StdError::generic_err("cannot redelegate without an active validator"));
+    }
+
+    // Only move stake onto validators the chain has bonded right now: the staking module accepts
+    // redelegations to jailed or unbonded validators, but that stake would earn nothing, and one
+    // that no longer exists would refuse every move and stall re-runs.
+    let bonded: Vec<String> =
+        deps.querier.query_all_validators()?.into_iter().map(|v| v.address).collect();
+    let destinations: Vec<String> = validators_active
+        .iter()
+        .filter(|v| bonded.contains(v) && !exclude.contains(v))
+        .cloned()
+        .collect();
+    if destinations.is_empty() {
+        return Err(StdError::generic_err(
+            "no active validator is currently bonded on chain to redelegate to",
+        ));
+    }
+    let mut non_sources = validators_active.clone();
+    non_sources.extend(exclude.iter().cloned());
+
+    let delegations = query_all_delegations(&deps.querier, &env.contract.address)?;
+    let new_redelegations = compute_redelegations_for_inactive(
+        &non_sources,
+        &destinations,
+        &delegations,
+        limit as usize,
+        &denom,
+    );
+
+    let inactive_total: u128 = delegations
+        .iter()
+        .filter(|d| !validators_active.contains(&d.validator))
+        .map(|d| d.amount)
+        .sum();
+    let excluded_total: u128 = delegations
+        .iter()
+        .filter(|d| !validators_active.contains(&d.validator) && exclude.contains(&d.validator))
+        .map(|d| d.amount)
+        .sum();
+    let planned_total: u128 = new_redelegations.iter().map(|rd| rd.amount).sum();
+
+    if !new_redelegations.is_empty() {
+        state.prev_denom.save(
+            deps.storage,
+            &get_denom_balance(&deps.querier, env.contract.address.clone(), denom)?,
+        )?;
+    }
+
+    let mut submsgs = Vec::with_capacity(new_redelegations.len());
+    let mut events = Vec::with_capacity(new_redelegations.len() + 1);
+    for (index, rd) in new_redelegations.iter().enumerate() {
+        submsgs.push(SubMsg {
+            id: REPLY_REDELEGATE_INACTIVE_BASE + index as u64,
+            msg: rd.to_cosmos_msg(),
+            gas_limit: None,
+            reply_on: REDELEGATE_INACTIVE_REPLY_ON,
+        });
+        events.push(
+            Event::new("steakhub/redelegation_planned")
+                .add_attribute("index", index.to_string())
+                .add_attribute("validator_from", &rd.src)
+                .add_attribute("validator_to", &rd.dst)
+                .add_attribute("amount", rd.amount.to_string()),
+        );
+    }
+    events.push(
+        Event::new("steakhub/redelegated_inactive")
+            .add_attribute("redelegations", new_redelegations.len().to_string())
+            .add_attribute("amount_planned", planned_total.to_string())
+            .add_attribute("inactive_before", inactive_total.to_string())
+            .add_attribute("inactive_excluded", excluded_total.to_string())
+            .add_attribute(
+                "inactive_unplanned",
+                inactive_total.saturating_sub(planned_total).to_string(),
+            ),
+    );
+
+    let mut response = Response::new()
+        .add_submessages(submsgs)
+        .add_events(events)
+        .add_attribute("action", "steakhub/redelegate_inactive");
+    if !new_redelegations.is_empty() {
+        // Reward finalization is atomic with the successful redelegations. If withdrawing,
+        // reinvesting or paying fees fails, rolling the whole transaction back preserves the
+        // pre-redelegation balance baseline instead of committing rewards that no later harvest
+        // can distinguish from the contract's existing balance.
+        response = response.add_message(
+            CallbackMsg::HarvestAfterRedelegation {}.into_cosmos_msg(&env.contract.address)?,
+        );
+    }
+
+    Ok(response)
+}
+
+fn redelegation_skipped(id: u64, reason: String) -> Response {
+    Response::new().add_event(
+        Event::new("steakhub/redelegation_skipped")
+            .add_attribute("index", (id - REPLY_REDELEGATE_INACTIVE_BASE).to_string())
+            .add_attribute("reason", reason),
+    )
+}
+
+/// Reply for a `RedelegateInactive` redelegation. Success registers the staking rewards the
+/// redelegation withdrew, as for other redelegations; failure (the staking module refused it, and
+/// its state changes are already reverted) is recorded so the operator knows to re-run later.
+pub fn redelegate_inactive_reply(deps: DepsMut, env: Env, reply: Reply) -> StdResult<Response> {
+    match reply.result {
+        SubMsgResult::Ok(response) => register_received_coins(deps, env, response.events),
+        SubMsgResult::Err(err) => Ok(redelegation_skipped(reply.id, err)),
+    }
+}
+
+// Success is needed too: the redelegation withdraws pending rewards, which must be registered.
+const REDELEGATE_INACTIVE_REPLY_ON: ReplyOn = ReplyOn::Always;
 
 pub fn remove_validator(
     deps: DepsMut,

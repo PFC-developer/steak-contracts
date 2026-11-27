@@ -126,6 +126,25 @@ pub enum ExecuteMsg {
         validator_from: String,
         validator_to: String,
     },
+    /// Owner only. Redelegate all stake held on validators that are not in the active set (paused,
+    /// or removed without redelegation) onto the active validators the chain currently has bonded,
+    /// evening them out.
+    ///
+    /// Each redelegation is dispatched as its own submessage, so one the staking module refuses
+    /// (for example a transitive redelegation, or the per-validator-pair entry limit) is skipped
+    /// and reported in a `steakhub/redelegation_skipped` event while the rest go through. wasmd
+    /// redacts submessage errors, so the event's `reason` is the error code
+    /// (`codespace: staking, code: N`), and its `index` matches a `steakhub/redelegation_planned`
+    /// event that names the validators.
+    ///
+    /// The plan is recomputed from on-chain delegations on every call, so re-run it once blocking
+    /// redelegations mature. A source that is blocked is planned again on every run; pass it in
+    /// `exclude` (which skips a validator as both source and destination) so it does not use up
+    /// `limit`. `limit` caps the number of redelegations sent in one call (default 25, max 50).
+    RedelegateInactive {
+        limit: Option<u32>,
+        exclude: Option<Vec<String>>,
+    },
     /// Update Luna amounts in unbonding batches to reflect any slashing or rounding errors
     Reconcile {},
     /// Submit the current pending batch of unbonding requests to be unbonded

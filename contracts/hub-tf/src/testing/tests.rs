@@ -20,12 +20,13 @@ use super::{
 };
 use crate::{
     contract::{
+        REDELEGATE_INACTIVE_MAX_LIMIT, REPLY_REDELEGATE_INACTIVE_BASE,
         REPLY_REGISTER_RECEIVED_COINS, REPLY_SUBMIT_BATCH, execute, instantiate, migrate, reply,
     },
     helpers::{parse_coin, parse_received_fund},
     math::{
-        compute_redelegations_for_rebalancing, compute_redelegations_for_removal,
-        compute_undelegations,
+        compute_redelegations_for_inactive, compute_redelegations_for_rebalancing,
+        compute_redelegations_for_removal, compute_undelegations,
     },
     state::{State, VALIDATORS, VALIDATORS_ACTIVE, previous_batches, unbond_requests},
     token_factory::{
@@ -71,7 +72,16 @@ fn setup_test() -> OwnedDeps<MockStorage, MockApi, CustomQuerier> {
     });
     assert_eq!(res.messages[0], SubMsg::new(c));
 
+    deps.querier.set_bonded_validators(&["alice", "bob", "charlie"]);
     deps
+}
+
+fn callback_submsg(callback: CallbackMsg) -> SubMsg {
+    SubMsg::new(CosmosMsg::Wasm(WasmMsg::Execute {
+        contract_addr: MOCK_CONTRACT_ADDR.to_string(),
+        msg: to_json_binary(&ExecuteMsg::Callback(callback)).unwrap(),
+        funds: vec![],
+    }))
 }
 
 #[test]
@@ -144,6 +154,7 @@ fn setup_test_fee_split() -> OwnedDeps<MockStorage, MockApi, CustomQuerier> {
     });
     assert_eq!(res.messages[0], SubMsg::new(c));
 
+    deps.querier.set_bonded_validators(&["alice", "bob", "charlie"]);
     deps
 }
 
@@ -402,6 +413,101 @@ fn harvesting() {
         gas_limit: None,
         reply_on: ReplyOn::Never,
     });
+}
+
+#[test]
+fn harvesting_and_reinvesting_after_inactive_redelegation() {
+    let mut deps = setup_test();
+    let state = State::default();
+
+    deps.querier.set_staking_delegations(&[
+        Delegation::new("alice", 100, "uxyz"),
+        Delegation::new("bob", 200, "uxyz"),
+        Delegation::new("charlie", 300, "uxyz"),
+    ]);
+    state.prev_denom.save(deps.as_mut().storage, &Uint128::new(100)).unwrap();
+
+    let err = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info("worker", &[]),
+        ExecuteMsg::Callback(CallbackMsg::HarvestAfterRedelegation {}),
+    )
+    .unwrap_err();
+    assert_eq!(err, StdError::generic_err("callbacks can only be invoked by the contract itself"));
+
+    let res = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info(MOCK_CONTRACT_ADDR, &[]),
+        ExecuteMsg::Callback(CallbackMsg::HarvestAfterRedelegation {}),
+    )
+    .unwrap();
+
+    assert_eq!(res.messages, vec![
+        SubMsg {
+            id: REPLY_REGISTER_RECEIVED_COINS,
+            msg: CosmosMsg::Distribution(DistributionMsg::WithdrawDelegatorReward {
+                validator: "alice".to_string(),
+            }),
+            gas_limit: None,
+            reply_on: ReplyOn::Never,
+        },
+        SubMsg {
+            id: REPLY_REGISTER_RECEIVED_COINS,
+            msg: CosmosMsg::Distribution(DistributionMsg::WithdrawDelegatorReward {
+                validator: "bob".to_string(),
+            }),
+            gas_limit: None,
+            reply_on: ReplyOn::Never,
+        },
+        SubMsg {
+            id: REPLY_REGISTER_RECEIVED_COINS,
+            msg: CosmosMsg::Distribution(DistributionMsg::WithdrawDelegatorReward {
+                validator: "charlie".to_string(),
+            }),
+            gas_limit: None,
+            reply_on: ReplyOn::Never,
+        },
+        callback_submsg(CallbackMsg::ReinvestIfNeeded {}),
+    ]);
+    assert_eq!(state.prev_denom.load(deps.as_ref().storage).unwrap(), Uint128::new(100));
+
+    deps.querier.set_bank_balances(&[Coin::new(150, "uxyz")]);
+    deps.querier.set_bonded_validators(&[]);
+    let err = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info(MOCK_CONTRACT_ADDR, &[]),
+        ExecuteMsg::Callback(CallbackMsg::ReinvestIfNeeded {}),
+    )
+    .unwrap_err();
+    assert_eq!(err, StdError::generic_err("cannot reinvest without a bonded active validator"));
+
+    // alice has the smallest delegation but is no longer bonded, so reinvest with bob instead.
+    deps.querier.set_bonded_validators(&["bob", "charlie"]);
+    let res = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info(MOCK_CONTRACT_ADDR, &[]),
+        ExecuteMsg::Callback(CallbackMsg::ReinvestIfNeeded {}),
+    )
+    .unwrap();
+    assert_eq!(res.messages[0], SubMsg::new(Delegation::new("bob", 45, "uxyz").to_cosmos_msg()));
+
+    state.prev_denom.save(deps.as_mut().storage, &Uint128::new(150)).unwrap();
+    let res = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info(MOCK_CONTRACT_ADDR, &[]),
+        ExecuteMsg::Callback(CallbackMsg::ReinvestIfNeeded {}),
+    )
+    .unwrap();
+    assert!(res.messages.is_empty());
+    assert_eq!(res.attributes, vec![cosmwasm_std::Attribute::new(
+        "action",
+        "steakhub/reinvest_not_needed"
+    )]);
 }
 
 #[test]
@@ -1964,4 +2070,256 @@ fn test_128() {
         .unwrap();
 
     assert_eq!(elements.len(), 1);
+}
+
+#[test]
+fn redelegating_inactive_validators() {
+    let mut deps = setup_test();
+    deps.querier.set_bonded_validators(&["alice", "bob", "charlie"]);
+
+    // charlie is paused (whitelisted, inactive); dave was removed without redelegation and still
+    // holds stake. alice and bob are the active set.
+    execute(deps.as_mut(), mock_env(), mock_info("larry", &[]), ExecuteMsg::PauseValidator {
+        validator: "charlie".to_string(),
+    })
+    .unwrap();
+    deps.querier.set_staking_delegations(&[
+        Delegation::new("alice", 100, "uxyz"),
+        Delegation::new("bob", 300, "uxyz"),
+        Delegation::new("charlie", 200, "uxyz"),
+        Delegation::new("dave", 50, "uxyz"),
+    ]);
+
+    let err = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info("jake", &[]),
+        ExecuteMsg::RedelegateInactive {
+            limit: None,
+            exclude: None,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(err, StdError::generic_err("unauthorized: sender is not owner"));
+
+    for limit in [0, REDELEGATE_INACTIVE_MAX_LIMIT + 1] {
+        let err = execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("larry", &[]),
+            ExecuteMsg::RedelegateInactive {
+                limit: Some(limit),
+                exclude: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err, StdError::generic_err("limit must be between 1 and 50"));
+    }
+
+    // Full plan: charlie->alice 200 (alice 300, bob 300), then dave's 50 split 25/25.
+    // limit 2 cuts the run short; the remainder is picked up by the next call.
+    let res = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info("larry", &[]),
+        ExecuteMsg::RedelegateInactive {
+            limit: Some(2),
+            exclude: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(res.messages, vec![
+        SubMsg {
+            id: REPLY_REDELEGATE_INACTIVE_BASE,
+            msg: Redelegation::new("charlie", "alice", 200, "uxyz").to_cosmos_msg(),
+            gas_limit: None,
+            reply_on: ReplyOn::Error,
+        },
+        SubMsg {
+            id: REPLY_REDELEGATE_INACTIVE_BASE + 1,
+            msg: Redelegation::new("dave", "alice", 25, "uxyz").to_cosmos_msg(),
+            gas_limit: None,
+            reply_on: ReplyOn::Error,
+        },
+        callback_submsg(CallbackMsg::HarvestAfterRedelegation {}),
+    ]);
+    let summary = res.events.iter().find(|e| e.ty == "steakhub/redelegated_inactive").unwrap();
+    let attr = |key: &str| {
+        summary.attributes.iter().find(|a| a.key == key).map(|a| a.value.clone()).unwrap()
+    };
+    assert_eq!(attr("amount_planned"), "225");
+    assert_eq!(attr("inactive_before"), "250");
+    assert_eq!(attr("inactive_unplanned"), "25");
+
+    // Restart: charlie's move went through but dave's was refused (e.g. a transitive
+    // redelegation). The next call plans only what is still on inactive validators.
+    deps.querier.set_staking_delegations(&[
+        Delegation::new("alice", 300, "uxyz"),
+        Delegation::new("bob", 300, "uxyz"),
+        Delegation::new("dave", 50, "uxyz"),
+    ]);
+    let res = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info("larry", &[]),
+        ExecuteMsg::RedelegateInactive {
+            limit: None,
+            exclude: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(res.messages, vec![
+        SubMsg {
+            id: REPLY_REDELEGATE_INACTIVE_BASE,
+            msg: Redelegation::new("dave", "alice", 25, "uxyz").to_cosmos_msg(),
+            gas_limit: None,
+            reply_on: ReplyOn::Error,
+        },
+        SubMsg {
+            id: REPLY_REDELEGATE_INACTIVE_BASE + 1,
+            msg: Redelegation::new("dave", "bob", 25, "uxyz").to_cosmos_msg(),
+            gas_limit: None,
+            reply_on: ReplyOn::Error,
+        },
+        callback_submsg(CallbackMsg::HarvestAfterRedelegation {}),
+    ]);
+
+    // Nothing left on inactive validators: re-running is a harmless no-op.
+    let state = State::default();
+    state.prev_denom.save(deps.as_mut().storage, &Uint128::new(123)).unwrap();
+    deps.querier.set_staking_delegations(&[
+        Delegation::new("alice", 325, "uxyz"),
+        Delegation::new("bob", 325, "uxyz"),
+    ]);
+    let res = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info("larry", &[]),
+        ExecuteMsg::RedelegateInactive {
+            limit: None,
+            exclude: None,
+        },
+    )
+    .unwrap();
+    assert!(res.messages.is_empty());
+    assert_eq!(state.prev_denom.load(deps.as_ref().storage).unwrap(), Uint128::new(123));
+}
+
+#[test]
+fn refused_inactive_redelegation_is_skipped() {
+    let mut deps = setup_test();
+
+    let res = reply(deps.as_mut(), mock_env(), cosmwasm_std::Reply {
+        id: REPLY_REDELEGATE_INACTIVE_BASE + 1,
+        result: cosmwasm_std::SubMsgResult::Err(
+            "redelegation to this validator already in progress; first redelegation to this \
+             validator must complete before next redelegation"
+                .to_string(),
+        ),
+    })
+    .unwrap();
+    assert!(res.messages.is_empty());
+    assert_eq!(res.events, vec![
+        cosmwasm_std::Event::new("steakhub/redelegation_skipped")
+            .add_attribute("index", "1")
+            .add_attribute(
+                "reason",
+                "redelegation to this validator already in progress; first redelegation to this \
+                 validator must complete before next redelegation",
+            )
+    ]);
+}
+
+#[test]
+fn computing_redelegations_for_inactive() {
+    let active = vec!["alice".to_string(), "bob".to_string()];
+    let delegations = [
+        Delegation::new("alice", 100, "uxyz"),
+        Delegation::new("bob", 300, "uxyz"),
+        Delegation::new("charlie", 200, "uxyz"),
+        Delegation::new("dave", 50, "uxyz"),
+    ];
+
+    assert_eq!(
+        compute_redelegations_for_inactive(&active, &active, &delegations, 10, "uxyz"),
+        vec![
+            Redelegation::new("charlie", "alice", 200, "uxyz"),
+            Redelegation::new("dave", "alice", 25, "uxyz"),
+            Redelegation::new("dave", "bob", 25, "uxyz"),
+        ]
+    );
+    assert_eq!(
+        compute_redelegations_for_inactive(&active, &active, &delegations, 1, "uxyz"),
+        vec![Redelegation::new("charlie", "alice", 200, "uxyz"),]
+    );
+    // An active validator with no delegation yet is still a target.
+    let active = vec!["alice".to_string(), "erin".to_string()];
+    let delegations = [Delegation::new("alice", 100, "uxyz"), Delegation::new("dave", 100, "uxyz")];
+    assert_eq!(
+        compute_redelegations_for_inactive(&active, &active, &delegations, 10, "uxyz"),
+        vec![Redelegation::new("dave", "erin", 100, "uxyz"),]
+    );
+    assert!(compute_redelegations_for_inactive(&[], &[], &delegations, 10, "uxyz").is_empty());
+}
+
+#[test]
+fn redelegating_inactive_respects_exclude_and_bonded_set() {
+    let mut deps = setup_test();
+    execute(deps.as_mut(), mock_env(), mock_info("larry", &[]), ExecuteMsg::PauseValidator {
+        validator: "charlie".to_string(),
+    })
+    .unwrap();
+    deps.querier.set_staking_delegations(&[
+        Delegation::new("alice", 100, "uxyz"),
+        Delegation::new("bob", 300, "uxyz"),
+        Delegation::new("charlie", 200, "uxyz"),
+        Delegation::new("dave", 50, "uxyz"),
+    ]);
+
+    // Nothing in the active set is bonded on chain: refuse rather than move stake nowhere useful.
+    deps.querier.set_bonded_validators(&[]);
+    let err = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info("larry", &[]),
+        ExecuteMsg::RedelegateInactive {
+            limit: None,
+            exclude: None,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        StdError::generic_err("no active validator is currently bonded on chain to redelegate to")
+    );
+
+    // bob is active but not bonded (e.g. jailed): he receives nothing. charlie is excluded as a
+    // source (e.g. blocked by an incoming redelegation), so only dave's stake moves, all to alice.
+    deps.querier.set_bonded_validators(&["alice", "charlie"]);
+    let res = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info("larry", &[]),
+        ExecuteMsg::RedelegateInactive {
+            limit: None,
+            exclude: Some(vec!["charlie".to_string()]),
+        },
+    )
+    .unwrap();
+    assert_eq!(res.messages, vec![
+        SubMsg {
+            id: REPLY_REDELEGATE_INACTIVE_BASE,
+            msg: Redelegation::new("dave", "alice", 50, "uxyz").to_cosmos_msg(),
+            gas_limit: None,
+            reply_on: ReplyOn::Error,
+        },
+        callback_submsg(CallbackMsg::HarvestAfterRedelegation {}),
+    ]);
+    let summary = res.events.iter().find(|e| e.ty == "steakhub/redelegated_inactive").unwrap();
+    let attr = |key: &str| {
+        summary.attributes.iter().find(|a| a.key == key).map(|a| a.value.clone()).unwrap()
+    };
+    assert_eq!(attr("inactive_before"), "250");
+    assert_eq!(attr("inactive_excluded"), "200");
+    assert_eq!(attr("inactive_unplanned"), "200");
 }
