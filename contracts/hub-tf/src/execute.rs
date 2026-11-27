@@ -161,6 +161,7 @@ pub fn bond(
     // The code for linear search is a bit uglier than using `sort_by` but cheaper: O(n) vs O(n *
     // log(n))
     let delegations_all = query_all_delegations(&deps.querier, &env.contract.address)?;
+    let validators = bonded_targets(&deps.querier, validators)?;
     let delegations = query_delegations(&deps.querier, &validators, &env.contract.address, &denom)?;
 
     if !steak_minted.is_zero() && delegations_all.iter().all(|d| d.amount == 0) {
@@ -404,6 +405,7 @@ pub fn reinvest(deps: DepsMut, env: Env) -> StdResult<Response> {
     if amount_to_bond.is_zero() {
         return Err(StdError::generic_err("no rewards"));
     }
+    let validators = bonded_targets(&deps.querier, validators)?;
     let delegations = query_delegations(&deps.querier, &validators, &env.contract.address, &denom)?;
     let mut validator = &delegations[0].validator;
     let mut amount = delegations[0].amount;
@@ -464,6 +466,49 @@ pub fn reinvest(deps: DepsMut, env: Env) -> StdResult<Response> {
             .add_event(event)
             .add_attribute("action", "steakhub/reinvest"))
     }
+}
+
+/// The validators new stake should go to: the active set, narrowed to those the chain currently
+/// has bonded (`StakingQuery::AllValidators` returns only the bonded set). Stake on a jailed or
+/// unbonded validator earns nothing, and the smallest delegation, which bonds and reinvests
+/// target, is often exactly such a slashed validator. Falls back to the whole active set if none
+/// of it is bonded, so bonding keeps working.
+pub(crate) fn bonded_targets(
+    querier: &cosmwasm_std::QuerierWrapper,
+    active: Vec<String>,
+) -> StdResult<Vec<String>> {
+    let bonded: Vec<String> =
+        querier.query_all_validators()?.into_iter().map(|v| v.address).collect();
+    let targets: Vec<String> = active.iter().filter(|v| bonded.contains(v)).cloned().collect();
+    Ok(if targets.is_empty() {
+        active
+    } else {
+        targets
+    })
+}
+
+/// Dispatch redelegations as isolated submessages (reply ids from `REPLY_REDELEGATE_INACTIVE_BASE`)
+/// so one the staking module refuses is skipped and reported instead of reverting the rest.
+fn isolated_redelegations(redelegations: &[Redelegation]) -> (Vec<SubMsg>, Vec<Event>) {
+    redelegations
+        .iter()
+        .enumerate()
+        .map(|(index, rd)| {
+            (
+                SubMsg {
+                    id: REPLY_REDELEGATE_INACTIVE_BASE + index as u64,
+                    msg: rd.to_cosmos_msg(),
+                    gas_limit: None,
+                    reply_on: REDELEGATE_INACTIVE_REPLY_ON,
+                },
+                Event::new("steakhub/redelegation_planned")
+                    .add_attribute("index", index.to_string())
+                    .add_attribute("validator_from", &rd.src)
+                    .add_attribute("validator_to", &rd.dst)
+                    .add_attribute("amount", rd.amount.to_string()),
+            )
+        })
+        .unzip()
 }
 
 /// Holders' share (after the fee) of rewards earned but not yet restaked: recorded rewards waiting
@@ -566,6 +611,7 @@ pub fn reinvest_idle(
     if validators.is_empty() {
         return Err(StdError::generic_err("cannot reinvest without an active validator"));
     }
+    let validators = bonded_targets(&deps.querier, validators)?;
     let delegations =
         query_delegations(&deps.querier, &validators, &env.contract.address, &idle.denom)?;
     let target = delegations.iter().min_by_key(|d| d.amount).map(|d| d.validator.clone()).unwrap();
@@ -1010,8 +1056,16 @@ pub fn withdraw_unbonded(
 // Ownership and management logics
 //--------------------------------------------------------------------------------------------------
 
-pub fn rebalance(deps: DepsMut, env: Env, minimum: Uint128) -> StdResult<Response> {
-    let delegations = query_all_delegations(&deps.querier, &env.contract.address)?;
+/// Owner only. Even out stake across the active validators the chain has bonded, draining
+/// validators that are paused, removed, or not bonded. Each move is an isolated submessage (see
+/// `RedelegateInactive`), and at most `REDELEGATE_INACTIVE_MAX_LIMIT` moves are sent per call.
+///
+/// Owner only because every redelegation locks its destination as a redelegation source for an
+/// unbonding period; a permissionless caller could otherwise keep the owner from moving stake off
+/// a validator.
+pub fn rebalance(deps: DepsMut, env: Env, sender: Addr, minimum: Uint128) -> StdResult<Response> {
+    let state = State::default();
+    state.assert_owner(deps.storage, &sender)?;
 
     let mut validators_active: Vec<String> = Default::default();
     for v in VALIDATORS_ACTIVE.items(deps.storage, None, None, Order::Ascending) {
@@ -1020,27 +1074,25 @@ pub fn rebalance(deps: DepsMut, env: Env, minimum: Uint128) -> StdResult<Respons
     if validators_active.is_empty() {
         return Err(StdError::generic_err("cannot rebalance without an active validator"));
     }
+    let targets = bonded_targets(&deps.querier, validators_active)?;
 
-    let new_redelegations =
-        compute_redelegations_for_rebalancing(validators_active, &delegations, minimum);
+    let denom = state.denom.load(deps.storage)?;
+    let delegations = query_all_delegations(&deps.querier, &env.contract.address)?;
+    let mut new_redelegations =
+        compute_redelegations_for_rebalancing(targets, &delegations, minimum, &denom);
+    new_redelegations.truncate(REDELEGATE_INACTIVE_MAX_LIMIT as usize);
 
-    let redelegate_submsgs = new_redelegations
-        .iter()
-        .map(|rd| SubMsg {
-            id: REPLY_REGISTER_RECEIVED_COINS,
-            msg: rd.to_cosmos_msg(),
-            gas_limit: None,
-            reply_on: ReplyOn::Success,
-        })
-        .collect::<Vec<_>>();
-
+    let (submsgs, mut events) = isolated_redelegations(&new_redelegations);
     let amount: u128 = new_redelegations.iter().map(|rd| rd.amount).sum();
-
-    let event = Event::new("steakhub/rebalanced").add_attribute("amount_moved", amount.to_string());
+    events.push(
+        Event::new("steakhub/rebalanced")
+            .add_attribute("amount_moved", amount.to_string())
+            .add_attribute("redelegations", new_redelegations.len().to_string()),
+    );
 
     Ok(Response::new()
-        .add_submessages(redelegate_submsgs)
-        .add_event(event)
+        .add_submessages(submsgs)
+        .add_events(events)
         .add_attribute("action", "steakhub/rebalance"))
 }
 
@@ -1241,9 +1293,11 @@ pub fn remove_validator(
     }
     VALIDATORS.remove(deps.storage, &validator)?;
     VALIDATORS_ACTIVE.remove(deps.storage, &validator)?;
-    let mut validators: Vec<String> = Default::default();
-    for v in VALIDATORS.items(deps.storage, None, None, Order::Ascending) {
-        validators.push(v?);
+    // Spread the removed stake over the active validators the chain has bonded, never onto a
+    // paused or jailed one.
+    let validators = bonded_targets(&deps.querier, active_validator_list(deps.storage)?)?;
+    if validators.is_empty() {
+        return Err(StdError::generic_err("no active validator to redelegate to"));
     }
 
     let delegations = query_delegations(&deps.querier, &validators, &env.contract.address, &denom)?;
