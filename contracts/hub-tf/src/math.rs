@@ -150,6 +150,50 @@ pub(crate) fn compute_redelegations_for_removal(
     new_redelegations
 }
 
+/// Plan redelegations that move stake off every validator outside `active_validators` and spread
+/// it over the active set, topping up the active delegations toward an even split.
+///
+/// The plan is derived purely from the current on-chain delegations, so running it again after
+/// some redelegations were skipped (or after `limit` cut a run short) picks up exactly what is
+/// left. At most `limit` redelegations are returned.
+pub(crate) fn compute_redelegations_for_inactive(
+    active_validators: &[String],
+    current_delegations: &[Delegation],
+    limit: usize,
+    denom: &str,
+) -> Vec<Redelegation> {
+    if active_validators.is_empty() || limit == 0 {
+        return vec![];
+    }
+
+    let mut targets: Vec<Delegation> = active_validators
+        .iter()
+        .map(|v| {
+            let amount =
+                current_delegations.iter().filter(|d| d.validator == *v).map(|d| d.amount).sum();
+            Delegation::new(v, amount, denom)
+        })
+        .collect();
+
+    let mut new_redelegations: Vec<Redelegation> = vec![];
+    for source in current_delegations
+        .iter()
+        .filter(|d| d.amount > 0 && !active_validators.contains(&d.validator))
+    {
+        for rd in compute_redelegations_for_removal(source, &targets, denom) {
+            if new_redelegations.len() >= limit {
+                return new_redelegations;
+            }
+            if let Some(target) = targets.iter_mut().find(|t| t.validator == rd.dst) {
+                target.amount += rd.amount;
+            }
+            new_redelegations.push(rd);
+        }
+    }
+
+    new_redelegations
+}
+
 /// Compute redelegation moves that will make each validator's delegation the targeted amount
 /// (hopefully this sentence makes sense)
 ///

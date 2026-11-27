@@ -2,8 +2,8 @@ use std::str::FromStr;
 
 use cosmwasm_std::{
     Addr, BankMsg, Binary, Coin, CosmosMsg, Decimal, DepsMut, DistributionMsg, Env, Event, Order,
-    Response, StdError, StdResult, SubMsg, SubMsgResponse, Uint128, WasmMsg, from_json,
-    to_json_binary,
+    Reply, ReplyOn, Response, StdError, StdResult, SubMsg, SubMsgResponse, SubMsgResult, Uint128,
+    WasmMsg, from_json, to_json_binary,
 };
 use cw20::{Cw20ExecuteMsg, MinterResponse};
 use cw20_base::msg::InstantiateMsg as Cw20InstantiateMsg;
@@ -16,15 +16,18 @@ use pfc_steak::{
 };
 
 use crate::{
-    contract::{REPLY_INSTANTIATE_TOKEN, REPLY_REGISTER_RECEIVED_COINS, REPLY_SUBMIT_BATCH},
+    contract::{
+        REDELEGATE_INACTIVE_DEFAULT_LIMIT, REDELEGATE_INACTIVE_MAX_LIMIT, REPLY_INSTANTIATE_TOKEN,
+        REPLY_REDELEGATE_INACTIVE_BASE, REPLY_REGISTER_RECEIVED_COINS, REPLY_SUBMIT_BATCH,
+    },
     helpers::{
         get_denom_balance, parse_received_fund, query_all_delegations, query_cw20_total_supply,
         query_delegation, query_delegations,
     },
     math::{
-        compute_mint_amount, compute_redelegations_for_rebalancing,
-        compute_redelegations_for_removal, compute_unbond_amount, compute_undelegations,
-        reconcile_batches,
+        compute_mint_amount, compute_redelegations_for_inactive,
+        compute_redelegations_for_rebalancing, compute_redelegations_for_removal,
+        compute_unbond_amount, compute_undelegations, reconcile_batches,
     },
     state::State,
     types::{Coins, Delegation, Redelegation},
@@ -803,6 +806,115 @@ pub fn add_validator(deps: DepsMut, sender: Addr, validator: String) -> StdResul
 
     Ok(Response::new().add_event(event).add_attribute("action", "steakhub/add_validator"))
 }
+
+/// See `ExecuteMsg::RedelegateInactive`. Stateless: every call plans from the current on-chain
+/// delegations, so it is safe to re-run after skipped redelegations mature.
+///
+/// Staking-module rules that can refuse an individual redelegation (each is isolated in its own
+/// submessage and reported by the reply handler rather than failing the whole call):
+/// - transitive redelegation: stake cannot leave a validator while this contract has an unmatured
+///   redelegation *into* that validator; this blocks the whole source until it matures
+/// - max entries: at most `MaxEntries` (default 7) unmatured redelegations per (delegator, source,
+///   destination) triple
+///
+/// A completed redelegation also makes its destination unable to act as a redelegation source
+/// until the unbonding period passes, which affects later `Rebalance` / `RemoveValidator` calls.
+pub fn redelegate_inactive(
+    deps: DepsMut,
+    env: Env,
+    sender: Addr,
+    limit: Option<u32>,
+) -> StdResult<Response> {
+    let state = State::default();
+    state.assert_owner(deps.storage, &sender)?;
+
+    let limit = limit.unwrap_or(REDELEGATE_INACTIVE_DEFAULT_LIMIT);
+    if limit == 0 || limit > REDELEGATE_INACTIVE_MAX_LIMIT {
+        return Err(StdError::generic_err(format!(
+            "limit must be between 1 and {}",
+            REDELEGATE_INACTIVE_MAX_LIMIT
+        )));
+    }
+
+    let denom = state.denom.load(deps.storage)?;
+    let validators_active = state.validators_active.load(deps.storage)?;
+    if validators_active.is_empty() {
+        return Err(StdError::generic_err("cannot redelegate without an active validator"));
+    }
+
+    let delegations = query_all_delegations(&deps.querier, &env.contract.address)?;
+    let new_redelegations = compute_redelegations_for_inactive(
+        &validators_active,
+        &delegations,
+        limit as usize,
+        &denom,
+    );
+
+    let inactive_total: u128 = delegations
+        .iter()
+        .filter(|d| !validators_active.contains(&d.validator))
+        .map(|d| d.amount)
+        .sum();
+    let planned_total: u128 = new_redelegations.iter().map(|rd| rd.amount).sum();
+
+    state
+        .prev_denom
+        .save(deps.storage, &get_denom_balance(&deps.querier, env.contract.address, denom)?)?;
+
+    let mut submsgs = Vec::with_capacity(new_redelegations.len());
+    let mut events = Vec::with_capacity(new_redelegations.len() + 1);
+    for (index, rd) in new_redelegations.iter().enumerate() {
+        submsgs.push(SubMsg {
+            id: REPLY_REDELEGATE_INACTIVE_BASE + index as u64,
+            msg: rd.to_cosmos_msg(),
+            gas_limit: None,
+            reply_on: REDELEGATE_INACTIVE_REPLY_ON,
+        });
+        events.push(
+            Event::new("steakhub/redelegation_planned")
+                .add_attribute("index", index.to_string())
+                .add_attribute("validator_from", &rd.src)
+                .add_attribute("validator_to", &rd.dst)
+                .add_attribute("amount", rd.amount.to_string()),
+        );
+    }
+    events.push(
+        Event::new("steakhub/redelegated_inactive")
+            .add_attribute("redelegations", new_redelegations.len().to_string())
+            .add_attribute("amount_planned", planned_total.to_string())
+            .add_attribute("inactive_before", inactive_total.to_string())
+            .add_attribute(
+                "inactive_unplanned",
+                inactive_total.saturating_sub(planned_total).to_string(),
+            ),
+    );
+
+    Ok(Response::new()
+        .add_submessages(submsgs)
+        .add_events(events)
+        .add_attribute("action", "steakhub/redelegate_inactive"))
+}
+
+fn redelegation_skipped(id: u64, reason: String) -> Response {
+    Response::new().add_event(
+        Event::new("steakhub/redelegation_skipped")
+            .add_attribute("index", (id - REPLY_REDELEGATE_INACTIVE_BASE).to_string())
+            .add_attribute("reason", reason),
+    )
+}
+
+/// Reply for a `RedelegateInactive` redelegation. Success registers the staking rewards the
+/// redelegation withdrew, as for other redelegations; failure (the staking module refused it, and
+/// its state changes are already reverted) is recorded so the operator knows to re-run later.
+pub fn redelegate_inactive_reply(deps: DepsMut, env: Env, reply: Reply) -> StdResult<Response> {
+    match reply.result {
+        SubMsgResult::Ok(response) => register_received_coins(deps, env, response.events),
+        SubMsgResult::Err(err) => Ok(redelegation_skipped(reply.id, err)),
+    }
+}
+
+// Success is needed too: the redelegation withdraws pending rewards, which must be registered.
+const REDELEGATE_INACTIVE_REPLY_ON: ReplyOn = ReplyOn::Always;
 
 pub fn remove_validator(
     deps: DepsMut,

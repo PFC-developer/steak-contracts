@@ -20,12 +20,13 @@ use super::{
 };
 use crate::{
     contract::{
+        REDELEGATE_INACTIVE_MAX_LIMIT, REPLY_REDELEGATE_INACTIVE_BASE,
         REPLY_REGISTER_RECEIVED_COINS, REPLY_SUBMIT_BATCH, execute, instantiate, migrate, reply,
     },
     helpers::{parse_coin, parse_received_fund},
     math::{
-        compute_redelegations_for_rebalancing, compute_redelegations_for_removal,
-        compute_undelegations,
+        compute_redelegations_for_inactive, compute_redelegations_for_rebalancing,
+        compute_redelegations_for_removal, compute_undelegations,
     },
     state::{State, VALIDATORS, VALIDATORS_ACTIVE, previous_batches, unbond_requests},
     token_factory::{
@@ -1964,4 +1965,178 @@ fn test_128() {
         .unwrap();
 
     assert_eq!(elements.len(), 1);
+}
+
+#[test]
+fn redelegating_inactive_validators() {
+    let mut deps = setup_test();
+
+    // charlie is paused (whitelisted, inactive); dave was removed without redelegation and still
+    // holds stake. alice and bob are the active set.
+    execute(deps.as_mut(), mock_env(), mock_info("larry", &[]), ExecuteMsg::PauseValidator {
+        validator: "charlie".to_string(),
+    })
+    .unwrap();
+    deps.querier.set_staking_delegations(&[
+        Delegation::new("alice", 100, "uxyz"),
+        Delegation::new("bob", 300, "uxyz"),
+        Delegation::new("charlie", 200, "uxyz"),
+        Delegation::new("dave", 50, "uxyz"),
+    ]);
+
+    let err = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info("jake", &[]),
+        ExecuteMsg::RedelegateInactive {
+            limit: None,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(err, StdError::generic_err("unauthorized: sender is not owner"));
+
+    for limit in [0, REDELEGATE_INACTIVE_MAX_LIMIT + 1] {
+        let err = execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("larry", &[]),
+            ExecuteMsg::RedelegateInactive {
+                limit: Some(limit),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err, StdError::generic_err("limit must be between 1 and 100"));
+    }
+
+    // Full plan: charlie->alice 200 (alice 300, bob 300), then dave's 50 split 25/25.
+    // limit 2 cuts the run short; the remainder is picked up by the next call.
+    let res = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info("larry", &[]),
+        ExecuteMsg::RedelegateInactive {
+            limit: Some(2),
+        },
+    )
+    .unwrap();
+    assert_eq!(res.messages, vec![
+        SubMsg {
+            id: REPLY_REDELEGATE_INACTIVE_BASE,
+            msg: Redelegation::new("charlie", "alice", 200, "uxyz").to_cosmos_msg(),
+            gas_limit: None,
+            reply_on: ReplyOn::Error,
+        },
+        SubMsg {
+            id: REPLY_REDELEGATE_INACTIVE_BASE + 1,
+            msg: Redelegation::new("dave", "alice", 25, "uxyz").to_cosmos_msg(),
+            gas_limit: None,
+            reply_on: ReplyOn::Error,
+        },
+    ]);
+    let summary = res.events.iter().find(|e| e.ty == "steakhub/redelegated_inactive").unwrap();
+    let attr = |key: &str| {
+        summary.attributes.iter().find(|a| a.key == key).map(|a| a.value.clone()).unwrap()
+    };
+    assert_eq!(attr("amount_planned"), "225");
+    assert_eq!(attr("inactive_before"), "250");
+    assert_eq!(attr("inactive_unplanned"), "25");
+
+    // Restart: charlie's move went through but dave's was refused (e.g. a transitive
+    // redelegation). The next call plans only what is still on inactive validators.
+    deps.querier.set_staking_delegations(&[
+        Delegation::new("alice", 300, "uxyz"),
+        Delegation::new("bob", 300, "uxyz"),
+        Delegation::new("dave", 50, "uxyz"),
+    ]);
+    let res = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info("larry", &[]),
+        ExecuteMsg::RedelegateInactive {
+            limit: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(res.messages, vec![
+        SubMsg {
+            id: REPLY_REDELEGATE_INACTIVE_BASE,
+            msg: Redelegation::new("dave", "alice", 25, "uxyz").to_cosmos_msg(),
+            gas_limit: None,
+            reply_on: ReplyOn::Error,
+        },
+        SubMsg {
+            id: REPLY_REDELEGATE_INACTIVE_BASE + 1,
+            msg: Redelegation::new("dave", "bob", 25, "uxyz").to_cosmos_msg(),
+            gas_limit: None,
+            reply_on: ReplyOn::Error,
+        },
+    ]);
+
+    // Nothing left on inactive validators: re-running is a harmless no-op.
+    deps.querier.set_staking_delegations(&[
+        Delegation::new("alice", 325, "uxyz"),
+        Delegation::new("bob", 325, "uxyz"),
+    ]);
+    let res = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info("larry", &[]),
+        ExecuteMsg::RedelegateInactive {
+            limit: None,
+        },
+    )
+    .unwrap();
+    assert!(res.messages.is_empty());
+}
+
+#[test]
+fn refused_inactive_redelegation_is_skipped() {
+    let mut deps = setup_test();
+
+    let res = reply(deps.as_mut(), mock_env(), cosmwasm_std::Reply {
+        id: REPLY_REDELEGATE_INACTIVE_BASE + 1,
+        result: cosmwasm_std::SubMsgResult::Err(
+            "redelegation to this validator already in progress; first redelegation to this \
+             validator must complete before next redelegation"
+                .to_string(),
+        ),
+    })
+    .unwrap();
+    assert!(res.messages.is_empty());
+    assert_eq!(res.events, vec![
+        cosmwasm_std::Event::new("steakhub/redelegation_skipped")
+            .add_attribute("index", "1")
+            .add_attribute(
+                "reason",
+                "redelegation to this validator already in progress; first redelegation to this \
+                 validator must complete before next redelegation",
+            )
+    ]);
+}
+
+#[test]
+fn computing_redelegations_for_inactive() {
+    let active = vec!["alice".to_string(), "bob".to_string()];
+    let delegations = [
+        Delegation::new("alice", 100, "uxyz"),
+        Delegation::new("bob", 300, "uxyz"),
+        Delegation::new("charlie", 200, "uxyz"),
+        Delegation::new("dave", 50, "uxyz"),
+    ];
+
+    assert_eq!(compute_redelegations_for_inactive(&active, &delegations, 10, "uxyz"), vec![
+        Redelegation::new("charlie", "alice", 200, "uxyz"),
+        Redelegation::new("dave", "alice", 25, "uxyz"),
+        Redelegation::new("dave", "bob", 25, "uxyz"),
+    ]);
+    assert_eq!(compute_redelegations_for_inactive(&active, &delegations, 1, "uxyz"), vec![
+        Redelegation::new("charlie", "alice", 200, "uxyz"),
+    ]);
+    // An active validator with no delegation yet is still a target.
+    let active = vec!["alice".to_string(), "erin".to_string()];
+    let delegations = [Delegation::new("alice", 100, "uxyz"), Delegation::new("dave", 100, "uxyz")];
+    assert_eq!(compute_redelegations_for_inactive(&active, &delegations, 10, "uxyz"), vec![
+        Redelegation::new("dave", "erin", 100, "uxyz"),
+    ]);
+    assert!(compute_redelegations_for_inactive(&[], &delegations, 10, "uxyz").is_empty());
 }
