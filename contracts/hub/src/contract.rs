@@ -24,6 +24,7 @@ pub const CONTRACT_NAME: &str = "steak-hub";
 pub const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const REPLY_INSTANTIATE_TOKEN: u64 = 1;
 pub const REPLY_REGISTER_RECEIVED_COINS: u64 = 2;
+pub const REPLY_SUBMIT_BATCH: u64 = 3;
 pub const SPECIAL_SEND_MESSAGE_TO_TRANSFER: &str = "PFC_TRANSFER_NOT_SEND";
 
 #[entry_point]
@@ -187,7 +188,8 @@ pub fn reply(deps: DepsMut, env: Env, reply: Reply) -> StdResult<Response> {
         REPLY_REGISTER_RECEIVED_COINS => {
             execute::register_received_coins(deps, env, unwrap_reply(reply)?.events)
         },
-        id => Err(StdError::generic_err(format!("invalid reply id: {}; must be 1-2", id))),
+        REPLY_SUBMIT_BATCH => Ok(execute::submit_batch_deferred(reply)),
+        id => Err(StdError::generic_err(format!("invalid reply id: {}; must be 1-3", id))),
     }
 }
 
@@ -286,17 +288,17 @@ pub fn migrate(deps: DepsMut, env: Env, _msg: MigrateMsg) -> StdResult<Response>
     state.fee_rate.save(deps.storage,&Decimal::from_ratio(10u32,100u32))?;
 
      */
+    // The pre-fix `remove_validator` dropped a validator from the whitelist but then added it to
+    // the active set. The whitelist reflects the owner's removal decision, so the repair drops
+    // active entries that are no longer whitelisted rather than re-whitelisting them.
     let state = State::default();
     let mut validator_registry_repairs = 0u64;
-    if let Some(active_validators) = state.validators_active.may_load(deps.storage)? {
-        let mut validators = state.validators.may_load(deps.storage)?.unwrap_or_default();
-        for validator in active_validators {
-            if !validators.contains(&validator) {
-                validators.push(validator);
-                validator_registry_repairs += 1;
-            }
-        }
-        state.validators.save(deps.storage, &validators)?;
+    if let Some(mut active_validators) = state.validators_active.may_load(deps.storage)? {
+        let validators = state.validators.may_load(deps.storage)?.unwrap_or_default();
+        let before = active_validators.len();
+        active_validators.retain(|v| validators.contains(v));
+        validator_registry_repairs = (before - active_validators.len()) as u64;
+        state.validators_active.save(deps.storage, &active_validators)?;
     }
 
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;

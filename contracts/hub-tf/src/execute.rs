@@ -13,7 +13,9 @@ use pfc_steak::{
 //use crate::token_factory::denom::{MsgBurn, MsgCreateDenom, MsgMint};
 use crate::types::{Coins, Delegation, Redelegation};
 use crate::{
-    contract::{REPLY_REGISTER_RECEIVED_COINS, SPECIAL_SEND_MESSAGE_TO_TRANSFER},
+    contract::{
+        REPLY_REGISTER_RECEIVED_COINS, REPLY_SUBMIT_BATCH, SPECIAL_SEND_MESSAGE_TO_TRANSFER,
+    },
     helpers::{
         get_denom_balance, parse_received_fund, query_all_delegations, query_delegation,
         query_delegations,
@@ -526,13 +528,19 @@ pub fn queue_unbond(
         },
     )?;
 
-    let mut msgs: Vec<CosmosMsg> = vec![];
+    // Submitting the batch is opportunistic: if it fails (e.g. a supply/backing invariant trips),
+    // the reply handler swallows the error so the user's request still lands in the queue and the
+    // batch can be submitted later, instead of reverting every unbond.
+    let mut msgs: Vec<SubMsg> = vec![];
     if env.block.time.seconds() >= pending_batch.est_unbond_start_time {
-        msgs.push(CosmosMsg::Wasm(WasmMsg::Execute {
-            contract_addr: env.contract.address.into(),
-            msg: to_json_binary(&ExecuteMsg::SubmitBatch {})?,
-            funds: vec![],
-        }));
+        msgs.push(SubMsg::reply_on_error(
+            CosmosMsg::Wasm(WasmMsg::Execute {
+                contract_addr: env.contract.address.into(),
+                msg: to_json_binary(&ExecuteMsg::SubmitBatch {})?,
+                funds: vec![],
+            }),
+            REPLY_SUBMIT_BATCH,
+        ));
     }
 
     let event = Event::new("steakhub/unbond_queued")
@@ -543,9 +551,20 @@ pub fn queue_unbond(
         .add_attribute("usteak_to_burn", usteak_to_burn);
 
     Ok(Response::new()
-        .add_messages(msgs)
+        .add_submessages(msgs)
         .add_event(event)
         .add_attribute("action", "steakhub/queue_unbond"))
+}
+
+/// Reply handler for the opportunistic `SubmitBatch` dispatched by `queue_unbond`. Only invoked on
+/// error; the failed submission's state changes are already reverted, so record why and carry on.
+pub fn submit_batch_deferred(reply: cosmwasm_std::Reply) -> Response {
+    let reason = match reply.result {
+        cosmwasm_std::SubMsgResult::Err(err) => err,
+        cosmwasm_std::SubMsgResult::Ok(_) => String::new(),
+    };
+    Response::new()
+        .add_event(Event::new("steakhub/submit_batch_deferred").add_attribute("reason", reason))
 }
 
 pub fn submit_batch(deps: DepsMut, env: Env) -> StdResult<Response> {

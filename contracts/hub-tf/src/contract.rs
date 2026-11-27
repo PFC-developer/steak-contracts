@@ -23,6 +23,7 @@ pub const CONTRACT_NAME: &str = "steak-hub-tf";
 pub const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const REPLY_INSTANTIATE_TOKEN: u64 = 1;
 pub const REPLY_REGISTER_RECEIVED_COINS: u64 = 2;
+pub const REPLY_SUBMIT_BATCH: u64 = 3;
 pub const SPECIAL_SEND_MESSAGE_TO_TRANSFER: &str = "PFC_TRANSFER_NOT_SEND";
 
 #[entry_point]
@@ -156,6 +157,7 @@ fn callback(
 pub fn reply(_deps: DepsMut, _env: Env, reply: Reply) -> StdResult<Response> {
     match reply.id {
         REPLY_REGISTER_RECEIVED_COINS => Ok(Response::default()),
+        REPLY_SUBMIT_BATCH => Ok(execute::submit_batch_deferred(reply)),
         _ => Err(StdError::generic_err(format!(
             "invalid reply id: {}  {:?}",
             reply.id, reply.result
@@ -224,10 +226,13 @@ pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> StdResult<Response
     let active_validators = VALIDATORS_ACTIVE
         .items(deps.storage, None, None, Order::Ascending)
         .collect::<StdResult<Vec<_>>>()?;
+    // The pre-fix `remove_validator` dropped a validator from the whitelist but then added it to
+    // the active set. The whitelist reflects the owner's removal decision, so the repair drops
+    // active entries that are no longer whitelisted rather than re-whitelisting them.
     let mut validator_registry_repairs = 0u64;
     for validator in active_validators {
         if !VALIDATORS.contains(deps.storage, &validator) {
-            VALIDATORS.insert(deps.storage, &validator)?;
+            VALIDATORS_ACTIVE.remove(deps.storage, &validator)?;
             validator_registry_repairs += 1;
         }
     }

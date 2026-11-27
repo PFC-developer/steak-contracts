@@ -19,7 +19,9 @@ use super::{
     helpers::{mock_dependencies, mock_env_at_timestamp, query_helper},
 };
 use crate::{
-    contract::{REPLY_REGISTER_RECEIVED_COINS, execute, instantiate, migrate},
+    contract::{
+        REPLY_REGISTER_RECEIVED_COINS, REPLY_SUBMIT_BATCH, execute, instantiate, migrate, reply,
+    },
     helpers::{parse_coin, parse_received_fund},
     math::{
         compute_redelegations_for_rebalancing, compute_redelegations_for_removal,
@@ -79,12 +81,35 @@ fn migration_repairs_active_validator_registry() {
 
     let response = migrate(deps.as_mut(), mock_env(), Default::default()).unwrap();
 
-    assert!(VALIDATORS.contains(deps.as_ref().storage, "charlie"));
+    // A validator the owner removed must stay removed: the stale active entry is dropped.
+    assert!(!VALIDATORS.contains(deps.as_ref().storage, "charlie"));
+    assert!(!VALIDATORS_ACTIVE.contains(deps.as_ref().storage, "charlie"));
+    assert!(VALIDATORS_ACTIVE.contains(deps.as_ref().storage, "alice"));
+    assert!(VALIDATORS_ACTIVE.contains(deps.as_ref().storage, "bob"));
     assert!(
         response.attributes.iter().any(
             |attribute| attribute.key == "validator_registry_repairs" && attribute.value == "1"
         )
     );
+}
+
+#[test]
+fn failed_auto_submit_batch_does_not_revert_unbond() {
+    let mut deps = setup_test();
+
+    let res = reply(deps.as_mut(), mock_env(), cosmwasm_std::Reply {
+        id: REPLY_SUBMIT_BATCH,
+        result: cosmwasm_std::SubMsgResult::Err(
+            "unbond batch exceeds the derivative token supply".to_string(),
+        ),
+    })
+    .unwrap();
+
+    assert!(res.messages.is_empty());
+    assert_eq!(res.events, vec![
+        cosmwasm_std::Event::new("steakhub/submit_batch_deferred")
+            .add_attribute("reason", "unbond batch exceeds the derivative token supply")
+    ]);
 }
 
 fn setup_test_fee_split() -> OwnedDeps<MockStorage, MockApi, CustomQuerier> {
@@ -559,14 +584,14 @@ fn queuing_unbond() {
 
     assert_eq!(res.messages.len(), 1);
     assert_eq!(res.messages[0], SubMsg {
-        id: 0,
+        id: REPLY_SUBMIT_BATCH,
         msg: CosmosMsg::Wasm(WasmMsg::Execute {
             contract_addr: MOCK_CONTRACT_ADDR.to_string(),
             msg: to_json_binary(&ExecuteMsg::SubmitBatch {}).unwrap(),
             funds: vec![],
         }),
         gas_limit: None,
-        reply_on: ReplyOn::Never,
+        reply_on: ReplyOn::Error,
     });
 
     // The users' unbonding requests should have been saved
