@@ -24,6 +24,9 @@ pub const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const REPLY_INSTANTIATE_TOKEN: u64 = 1;
 pub const REPLY_REGISTER_RECEIVED_COINS: u64 = 2;
 pub const REPLY_SUBMIT_BATCH: u64 = 3;
+/// The reward harvest that follows `RedelegateInactive`; a failure there is reported rather than
+/// reverting the redelegations that went through.
+pub const REPLY_HARVEST_AFTER_REDELEGATION: u64 = 4;
 /// How long after a batch's estimated unbonding end `Reconcile` waits before treating missing
 /// funds as slashed. The staking module pays out matured unbondings at the end of a block, after
 /// that block's transactions, so without a margin a `Reconcile` in the first block past the
@@ -34,7 +37,7 @@ pub const RECONCILE_GRACE_SECONDS: u64 = 600;
 /// handler can say which redelegation the staking module refused.
 pub const REPLY_REDELEGATE_INACTIVE_BASE: u64 = 1_000;
 pub const REDELEGATE_INACTIVE_DEFAULT_LIMIT: u32 = 25;
-pub const REDELEGATE_INACTIVE_MAX_LIMIT: u32 = 100;
+pub const REDELEGATE_INACTIVE_MAX_LIMIT: u32 = 50;
 pub const SPECIAL_SEND_MESSAGE_TO_TRANSFER: &str = "PFC_TRANSFER_NOT_SEND";
 
 #[entry_point]
@@ -97,7 +100,10 @@ pub fn execute(deps: DepsMut, env: Env, info: MessageInfo, msg: ExecuteMsg) -> S
         } => execute::redelegate(deps, env, info.sender, validator_from, validator_to),
         ExecuteMsg::RedelegateInactive {
             limit,
-        } => execute::redelegate_inactive(deps, env, info.sender, limit),
+            exclude,
+        } => {
+            execute::redelegate_inactive(deps, env, info.sender, limit, exclude.unwrap_or_default())
+        },
 
         ExecuteMsg::TransferOwnership {
             new_owner,
@@ -180,6 +186,7 @@ pub fn reply(_deps: DepsMut, _env: Env, reply: Reply) -> StdResult<Response> {
     match reply.id {
         REPLY_REGISTER_RECEIVED_COINS => Ok(Response::default()),
         REPLY_SUBMIT_BATCH => Ok(execute::submit_batch_deferred(reply)),
+        REPLY_HARVEST_AFTER_REDELEGATION => Ok(execute::harvest_after_redelegation_deferred(reply)),
         id if is_redelegate_inactive_reply(id) => Ok(execute::redelegate_inactive_reply(reply)),
         _ => Err(StdError::generic_err(format!(
             "invalid reply id: {}  {:?}",

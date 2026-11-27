@@ -150,23 +150,27 @@ pub(crate) fn compute_redelegations_for_removal(
     new_redelegations
 }
 
-/// Plan redelegations that move stake off every validator outside `active_validators` and spread
-/// it over the active set, topping up the active delegations toward an even split.
+/// Plan redelegations that move stake off every validator that is not in `non_sources` and spread
+/// it over `destinations`, topping up the destination delegations toward an even split.
+///
+/// `non_sources` is the contract's active set plus anything the caller excluded; `destinations`
+/// is the subset of the active set that should receive stake (bonded on chain, not excluded).
 ///
 /// The plan is derived purely from the current on-chain delegations, so running it again after
 /// some redelegations were skipped (or after `limit` cut a run short) picks up exactly what is
 /// left. At most `limit` redelegations are returned.
 pub(crate) fn compute_redelegations_for_inactive(
-    active_validators: &[String],
+    non_sources: &[String],
+    destinations: &[String],
     current_delegations: &[Delegation],
     limit: usize,
     denom: &str,
 ) -> Vec<Redelegation> {
-    if active_validators.is_empty() || limit == 0 {
+    if destinations.is_empty() || limit == 0 {
         return vec![];
     }
 
-    let mut targets: Vec<Delegation> = active_validators
+    let mut targets: Vec<Delegation> = destinations
         .iter()
         .map(|v| {
             let amount =
@@ -176,9 +180,8 @@ pub(crate) fn compute_redelegations_for_inactive(
         .collect();
 
     let mut new_redelegations: Vec<Redelegation> = vec![];
-    for source in current_delegations
-        .iter()
-        .filter(|d| d.amount > 0 && !active_validators.contains(&d.validator))
+    for source in
+        current_delegations.iter().filter(|d| d.amount > 0 && !non_sources.contains(&d.validator))
     {
         for rd in compute_redelegations_for_removal(source, &targets, denom) {
             if new_redelegations.len() >= limit {
