@@ -11,6 +11,9 @@ use crate::types::Delegation;
 pub(super) struct CustomQuerier {
     pub bank_querier: BankQuerier,
     pub staking_querier: StakingQuerier,
+    /// Validators the mock chain reports as bonded (`AllValidators`); empty unless a test sets it.
+    pub bonded_validators: Vec<cosmwasm_std::Validator>,
+    pub full_delegations: Vec<FullDelegation>,
 }
 
 impl Querier for CustomQuerier {
@@ -46,7 +49,23 @@ impl CustomQuerier {
             })
             .collect::<Vec<_>>();
 
-        self.staking_querier = StakingQuerier::new("uluna", &[], &fds);
+        self.full_delegations = fds;
+        self.staking_querier =
+            StakingQuerier::new("uluna", &self.bonded_validators, &self.full_delegations);
+    }
+
+    pub fn set_bonded_validators(&mut self, validators: &[&str]) {
+        self.bonded_validators = validators
+            .iter()
+            .map(|v| cosmwasm_std::Validator {
+                address: v.to_string(),
+                commission: cosmwasm_std::Decimal::percent(5),
+                max_commission: cosmwasm_std::Decimal::percent(20),
+                max_change_rate: cosmwasm_std::Decimal::percent(1),
+            })
+            .collect();
+        self.staking_querier =
+            StakingQuerier::new("uluna", &self.bonded_validators, &self.full_delegations);
     }
 
     pub fn handle_query(&self, request: &QueryRequest<Empty>) -> QuerierResult {
