@@ -21,6 +21,11 @@ pub(crate) const NATIVE_RESERVED: Item<Uint128> = Item::new("native_reserved_001
 /// held by the hub and never redeemed; burning stray tokens must leave them alone.
 pub(crate) const DEAD_SHARES: Item<Uint128> = Item::new("dead_shares_001");
 
+/// Batches whose `est_unbond_end_time` came from the chain (the staking module's reported
+/// unbonding completion, see `register_undelegation`) rather than `submit time + unbond_period`.
+/// Only for those is "not yet past its end" proof that the funds have not arrived.
+pub(crate) const CHAIN_REPORTED_END: Map<u64, bool> = Map::new("chain_reported_end_001");
+
 /// Progress of the one-time, paginated initialisation of `NATIVE_RESERVED` (see
 /// `advance_reserve_initialization`). Removed once the reserve exists.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]

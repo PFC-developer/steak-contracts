@@ -345,7 +345,7 @@ fn bonding() {
             contract_addr: "steak_token".to_string(),
             msg: to_json_binary(&Cw20ExecuteMsg::Mint {
                 recipient: "cosmos2contract".to_string(),
-                amount: Uint128::new(1_000_000),
+                amount: Uint128::new(999_000),
             })
             .unwrap(),
             funds: vec![],
@@ -360,7 +360,7 @@ fn bonding() {
             contract_addr: "steak_token".to_string(),
             msg: to_json_binary(&Cw20ExecuteMsg::Transfer {
                 recipient: "user_1".to_string(),
-                amount: Uint128::new(1000000),
+                amount: Uint128::new(999_000),
             })
             .unwrap(),
             funds: vec![],
@@ -524,7 +524,7 @@ fn bond_ex() {
             contract_addr: "steak_token".to_string(),
             msg: to_json_binary(&Cw20ExecuteMsg::Mint {
                 recipient: "user_1".to_string(),
-                amount: Uint128::new(1_000_000),
+                amount: Uint128::new(999_000),
             })
             .unwrap(),
             funds: vec![],
@@ -651,8 +651,10 @@ fn harvesting_and_reinvesting_after_inactive_redelegation() {
     deps.querier.set_bank_balances(&[Coin::new(150, "uxyz")]);
     // The redelegations' and the harvest's withdrawals were registered as 50 uxyz of rewards.
     state.unlocked_coins.save(deps.as_mut().storage, &vec![Coin::new(50, "uxyz")]).unwrap();
+    // No active validator bonded: skip, keeping the 50 recorded for a later harvest, rather than
+    // revert the harvest (or the redelegations this follows).
     deps.querier.set_bonded_validators(&[]);
-    let err = execute(
+    let res = execute(
         deps.as_mut(),
         mock_env(),
         mock_info(MOCK_CONTRACT_ADDR, &[]),
@@ -660,8 +662,11 @@ fn harvesting_and_reinvesting_after_inactive_redelegation() {
             exclude: vec![],
         }),
     )
-    .unwrap_err();
-    assert_eq!(err, StdError::generic_err("cannot reinvest without a bonded active validator"));
+    .unwrap();
+    assert!(res.messages.is_empty());
+    assert!(
+        res.attributes.iter().any(|a| a.key == "reason" && a.value == "no bonded active validator")
+    );
 
     // alice has the smallest delegation but is no longer bonded, so reinvest with bob instead.
     deps.querier.set_bonded_validators(&["bob", "charlie"]);
@@ -2630,6 +2635,8 @@ fn querying_and_reinvesting_idle_funds() {
         est_unbond_end_time: 100,
     };
     state.previous_batches.save(deps.as_mut().storage, batch.id, &batch).unwrap();
+    // Batch 1's end was reported by the chain, so before it the funds certainly have not arrived.
+    crate::state::CHAIN_REPORTED_END.save(deps.as_mut().storage, 1, &true).unwrap();
     deps.querier.set_bank_balances(&[Coin::new(1000, "uxyz")]);
     state.unlocked_coins.save(deps.as_mut().storage, &vec![Coin::new(100, "uxyz")]).unwrap();
 
@@ -3672,14 +3679,85 @@ fn first_bond_after_zero_supply_locks_the_leftover_backing_in_dead_shares() {
 #[test]
 fn computing_the_first_mint() {
     use crate::math::{MIN_DEAD_SHARES, compute_first_mint};
-    // Nothing left: the minimum is locked.
+    // Nothing left: the minimum is locked, and its unbacked part comes out of the bonder's mint, so
+    // 2000 shares (1000 + 1000 dead) stand for exactly the 2000 deposited.
     assert_eq!(
-        compute_first_mint(Uint128::new(1000), Uint128::zero()),
-        (Uint128::new(1000), Uint128::new(MIN_DEAD_SHARES))
+        compute_first_mint(Uint128::new(2000), Uint128::zero()).unwrap(),
+        (Uint128::new(2000 - MIN_DEAD_SHARES), Uint128::new(MIN_DEAD_SHARES))
     );
-    // Leftover backing: locked 1:1 so the bonder cannot claim it.
+    // A deposit that cannot cover the unbacked minimum is refused.
     assert_eq!(
-        compute_first_mint(Uint128::new(1000), Uint128::new(5000)),
+        compute_first_mint(Uint128::new(1000), Uint128::zero()).unwrap_err(),
+        StdError::generic_err("the first bond into an empty hub must exceed 1000 base units")
+    );
+    // Leftover backing above the minimum: locked 1:1, the bonder pays nothing for it.
+    assert_eq!(
+        compute_first_mint(Uint128::new(1000), Uint128::new(5000)).unwrap(),
         (Uint128::new(1000), Uint128::new(5000))
     );
+    // Partly covered: 400 left, so 600 of the minimum is unbacked.
+    assert_eq!(
+        compute_first_mint(Uint128::new(1000), Uint128::new(400)).unwrap(),
+        (Uint128::new(400), Uint128::new(1000))
+    );
+}
+
+#[test]
+fn a_batch_without_a_chain_reported_end_is_never_idle() {
+    let mut deps = setup_test();
+    let state = State::default();
+    // A batch submitted before this version: its end is only the configured estimate, so its
+    // 1000 may already be here (the chain unbonds faster than configured).
+    let batch = Batch {
+        id: 1,
+        reconciled: false,
+        total_shares: Uint128::new(1000),
+        amount_unclaimed: Uint128::new(1000),
+        est_unbond_end_time: u64::MAX,
+    };
+    state.previous_batches.save(deps.as_mut().storage, batch.id, &batch).unwrap();
+    deps.querier.set_bank_balances(&[Coin::new(1000, "uxyz")]);
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![]).unwrap();
+
+    let idle: IdleFundsResponse = query_helper(deps.as_ref(), QueryMsg::IdleFunds {});
+    assert_eq!(idle.owed_to_batches, Uint128::new(1000));
+    assert_eq!(idle.idle, Uint128::zero());
+}
+
+#[test]
+fn recorded_rewards_count_in_bond_pricing_while_batches_are_owed_the_balance() {
+    let mut deps = setup_test();
+    let state = State::default();
+    deps.querier.set_staking_delegations(&[
+        Delegation::new("alice", 400, "uxyz"),
+        Delegation::new("bob", 300, "uxyz"),
+        Delegation::new("charlie", 300, "uxyz"),
+    ]);
+    deps.querier.set_cw20_total_supply("steak_token", 1000);
+    // 100 recorded rewards in a balance a matured, unpaid batch is owed more than.
+    let batch = Batch {
+        id: 1,
+        reconciled: false,
+        total_shares: Uint128::new(5000),
+        amount_unclaimed: Uint128::new(5000),
+        est_unbond_end_time: 100,
+    };
+    state.previous_batches.save(deps.as_mut().storage, batch.id, &batch).unwrap();
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![Coin::new(100, "uxyz")]).unwrap();
+    deps.querier.set_bank_balances(&[Coin::new(100 + 1090, "uxyz")]);
+
+    // They still belong to existing holders: 1090 buys 1000 shares (backing 1000 + 90 after fee).
+    let res = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info("user_1", &[Coin::new(1090, "uxyz")]),
+        ExecuteMsg::Bond {
+            receiver: None,
+            exec_msg: None,
+        },
+    )
+    .unwrap();
+    let bonded = res.events.iter().find(|e| e.ty == "steakhub/bonded").unwrap();
+    let minted = bonded.attributes.iter().find(|a| a.key == "usteak_minted").unwrap();
+    assert_eq!(minted.value, "1000");
 }

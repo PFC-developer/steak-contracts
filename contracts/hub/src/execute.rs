@@ -33,8 +33,8 @@ use crate::{
         total_delegated,
     },
     state::{
-        DEAD_SHARES, NATIVE_RESERVED, RECONCILE_OBSERVED_HEIGHTS, RESERVE_INIT, ReserveInit,
-        SUBMITTED_BATCH, State,
+        CHAIN_REPORTED_END, DEAD_SHARES, NATIVE_RESERVED, RECONCILE_OBSERVED_HEIGHTS, RESERVE_INIT,
+        ReserveInit, SUBMITTED_BATCH, State,
     },
     types::{Coins, Delegation, Redelegation},
 };
@@ -182,7 +182,7 @@ pub fn bond(
         let existing = Uint128::new(total_delegated(&all_delegations)?)
             .checked_add(pending)?
             .checked_add(idle_native_with_deposit(deps.as_ref(), &env, amount_to_bond)?.idle)?;
-        compute_first_mint(amount_to_bond, existing)
+        compute_first_mint(amount_to_bond, existing)?
     } else {
         (
             compute_mint_amount(usteak_supply, amount_to_bond, &all_delegations, pending)?,
@@ -374,6 +374,13 @@ pub fn reinvest_if_needed(deps: DepsMut, env: Env, exclude: Vec<String>) -> StdR
     if amount.is_zero() {
         return Ok(Response::new().add_attribute("action", "steakhub/reinvest_not_needed"));
     }
+    // Likewise when every active validator is jailed or unbonded: keep the rewards recorded for a
+    // later harvest rather than revert this one.
+    if bonded_active_targets(deps.as_ref(), &exclude).is_err() {
+        return Ok(Response::new()
+            .add_attribute("action", "steakhub/reinvest_not_needed")
+            .add_attribute("reason", "no bonded active validator"));
+    }
 
     reinvest_excluding(deps, env, &exclude)
 }
@@ -489,18 +496,14 @@ pub(crate) fn pending_rewards_net(
     deposit: Uint128,
 ) -> StdResult<Uint128> {
     let fee = State::default().fee_rate.load(deps.storage)?;
-    let (unlocked, reinvestable_now) = reinvestable(deps, env, denom, deposit)?;
-    // While the reserve initialisation is pending nothing is bondable yet, but the recorded rewards
-    // still belong to existing holders: count them up to what the balance holds, so a bond in that
-    // window does not buy into them cheaply.
-    let mut gross = if NATIVE_RESERVED.may_load(deps.storage)?.is_some() {
-        reinvestable_now
-    } else {
-        unlocked.min(
-            get_denom_balance(&deps.querier, env.contract.address.clone(), denom.into())?
-                .saturating_sub(deposit),
-        )
-    };
+    // Recorded rewards are in the balance and belong to existing holders, whatever batches are
+    // owed at the moment (e.g. a matured batch whose payout lands at the end of this block): count
+    // them up to what the balance holds. Only the actual reinvest needs the conservative cap.
+    let (unlocked, _) = reinvestable(deps, env, denom, deposit)?;
+    let mut gross = unlocked.min(
+        get_denom_balance(&deps.querier, env.contract.address.clone(), denom.into())?
+            .saturating_sub(deposit),
+    );
     for d in delegations {
         if let Some(full) = deps.querier.query_delegation(&env.contract.address, &d.validator)? {
             gross += full
@@ -521,10 +524,13 @@ pub(crate) fn pending_rewards_net(
 
 /// Native that unbonding batches are owed out of the balance. Reconciled batches come from the
 /// running `NATIVE_RESERVED` total; unreconciled ones (few: only those still unbonding or awaiting
-/// `Reconcile`) are summed. With `Some(now)`, only unreconciled batches whose funds can already be
-/// here count: those whose (chain-reported, see `register_undelegation`) unbonding end is at or
-/// before `now`. With `None`, every unreconciled batch counts. Returns `None` while the one-time
-/// reserve initialisation is pending, when what is owed is not known yet.
+/// `Reconcile`) are summed. With `Some(now)`, an unreconciled batch is left out only when its
+/// funds certainly have not arrived: its unbonding end was reported by the chain
+/// (`CHAIN_REPORTED_END`) and is still after `now`. A batch whose end is only the configured
+/// estimate (submitted before this version, or on a chain that reports no completion time) may
+/// have been paid early, so it counts until reconciled. With `None`, every unreconciled batch
+/// counts. Returns `None` while the one-time reserve initialisation is pending, when what is owed
+/// is not known yet.
 pub(crate) fn native_owed_to_batches(
     storage: &dyn cosmwasm_std::Storage,
     now: Option<u64>,
@@ -540,15 +546,21 @@ pub(crate) fn native_owed_to_batches(
         .prefix(false.into())
         .range(storage, None, None, Order::Ascending)
         .map(|item| item.map(|(_, b)| b))
-        .collect::<StdResult<Vec<Batch>>>()?
-        .into_iter()
-        .filter(|b| match now {
-            Some(now) => b.est_unbond_end_time <= now,
-            None => true,
-        })
-        .map(|b| b.amount_unclaimed)
-        .sum::<Uint128>();
-    Ok(Some(reserved.checked_add(unreconciled)?))
+        .collect::<StdResult<Vec<Batch>>>()?;
+    let mut owed = reserved;
+    for batch in unreconciled {
+        let certainly_unpaid = match now {
+            Some(now) => {
+                batch.est_unbond_end_time > now
+                    && CHAIN_REPORTED_END.may_load(storage, batch.id)?.unwrap_or(false)
+            },
+            None => false,
+        };
+        if !certainly_unpaid {
+            owed = owed.checked_add(batch.amount_unclaimed)?;
+        }
+    }
+    Ok(Some(owed))
 }
 
 /// The recorded native rewards, and how much of them may be bonded now: never funds that matured
@@ -809,6 +821,7 @@ pub fn register_undelegation(deps: DepsMut, env: Env, reply: Reply) -> StdResult
         let (batch_id, seen) = SUBMITTED_BATCH.load(deps.storage)?;
         let completion = seen.map_or(completion, |seen| seen.max(completion));
         SUBMITTED_BATCH.save(deps.storage, &(batch_id, Some(completion)))?;
+        CHAIN_REPORTED_END.save(deps.storage, batch_id, &true)?;
         let mut batch = State::default().previous_batches.load(deps.storage, batch_id)?;
         if batch.est_unbond_end_time != completion {
             response = response.add_event(
