@@ -517,8 +517,8 @@ fn reinvest_excluding(deps: DepsMut, env: Env, exclude: &[String]) -> StdResult<
 /// The validators new stake should go to: the active set, narrowed to those the chain currently
 /// has bonded (`StakingQuery::AllValidators` returns only the bonded set). Stake on a jailed or
 /// unbonded validator earns nothing, and the smallest delegation, which bonds and reinvests
-/// target, is often exactly such a slashed validator. Falls back to the whole active set if none
-/// of it is bonded, so bonding keeps working.
+/// target, is often exactly such a slashed validator. Refuse to move stake when none is bonded:
+/// falling back would silently send funds to validators that earn no rewards.
 pub(crate) fn bonded_targets(
     querier: &cosmwasm_std::QuerierWrapper,
     active: Vec<String>,
@@ -526,11 +526,10 @@ pub(crate) fn bonded_targets(
     let bonded: Vec<String> =
         querier.query_all_validators()?.into_iter().map(|v| v.address).collect();
     let targets: Vec<String> = active.iter().filter(|v| bonded.contains(v)).cloned().collect();
-    Ok(if targets.is_empty() {
-        active
-    } else {
-        targets
-    })
+    if targets.is_empty() {
+        return Err(StdError::generic_err("cannot send stake without a bonded active validator"));
+    }
+    Ok(targets)
 }
 
 /// Dispatch redelegations as isolated submessages (reply ids from `REPLY_REDELEGATE_INACTIVE_BASE`)

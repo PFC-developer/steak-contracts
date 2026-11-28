@@ -291,7 +291,10 @@ pub(crate) fn compute_redelegations_for_rebalancing(
         .filter(|d| d.amount > 0 && !targets.contains(&d.validator))
         .cloned()
         .collect();
+    let non_target_stake: u128 = src_delegations.iter().map(|d| d.amount).sum();
     let mut dst_delegations: Vec<Delegation> = vec![];
+    let mut small_dst_delegations: Vec<Delegation> = vec![];
+    let mut selected_destination_capacity = 0u128;
     for (i, validator) in targets.iter().enumerate() {
         let native_for_validator = native_per_validator + u128::from((i + 1) as u128 <= remainder);
         let current: u128 = current_delegations
@@ -307,15 +310,31 @@ pub(crate) fn compute_redelegations_for_rebalancing(
                     denom,
                 ));
             },
-            Ordering::Less if native_for_validator - current > min_difference.u128() => {
-                dst_delegations.push(Delegation::new(
-                    validator,
-                    native_for_validator - current,
-                    denom,
-                ));
+            Ordering::Less => {
+                let deficit = native_for_validator - current;
+                let destination = Delegation::new(validator, deficit, denom);
+                if deficit > min_difference.u128() {
+                    selected_destination_capacity += deficit;
+                    dst_delegations.push(destination);
+                } else {
+                    small_dst_delegations.push(destination);
+                }
             },
             _ => (),
         }
+    }
+
+    // Large destinations are enough in the usual case. If they cannot absorb all stake from
+    // non-target validators, admit only as many sub-threshold destinations as are needed to drain
+    // that mandatory source; the threshold still suppresses optional target-to-target dust.
+    for mut destination in small_dst_delegations {
+        if selected_destination_capacity >= non_target_stake {
+            break;
+        }
+        destination.amount =
+            destination.amount.min(non_target_stake - selected_destination_capacity);
+        selected_destination_capacity += destination.amount;
+        dst_delegations.push(destination);
     }
 
     let mut new_redelegations: Vec<Redelegation> = vec![];

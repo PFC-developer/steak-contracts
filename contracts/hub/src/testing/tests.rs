@@ -1998,6 +1998,22 @@ fn computing_redelegations_for_rebalancing() {
         ),
         vec![Redelegation::new("alice", "frank", 500, "uxyz")],
     );
+
+    // The threshold may suppress target-to-target dust, but it must not strand a non-target. The
+    // only destination is short by one, below the threshold of ten.
+    assert_eq!(
+        compute_redelegations_for_rebalancing(
+            vec!["alice".to_string(), "bob".to_string()],
+            &[
+                Delegation::new("alice", 100, "uxyz"),
+                Delegation::new("bob", 100, "uxyz"),
+                Delegation::new("charlie", 1, "uxyz"),
+            ],
+            Uint128::new(10),
+            "uxyz",
+        ),
+        vec![Redelegation::new("charlie", "alice", 1, "uxyz")],
+    );
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -4083,4 +4099,61 @@ fn removing_validator_redelegates_only_to_bonded_active_validators() {
         res.messages[0].msg,
         Redelegation::new("charlie", "alice", 300, "uxyz").to_cosmos_msg()
     );
+}
+
+#[test]
+fn staking_operations_fail_closed_when_no_active_validator_is_bonded() {
+    let mut deps = setup_test();
+    let state = State::default();
+    deps.querier.set_staking_delegations(&[
+        Delegation::new("alice", 300, "uxyz"),
+        Delegation::new("bob", 100, "uxyz"),
+        Delegation::new("charlie", 200, "uxyz"),
+    ]);
+    deps.querier.set_cw20_total_supply("steak_token", 600);
+    deps.querier.set_bonded_validators(&[]);
+    deps.querier.set_bank_balances(&[Coin::new(1000, "uxyz")]);
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![]).unwrap();
+    let expected = StdError::generic_err("cannot send stake without a bonded active validator");
+
+    let bond_err = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info("user_1", &[Coin::new(1000, "uxyz")]),
+        ExecuteMsg::Bond {
+            receiver: None,
+            exec_msg: None,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(bond_err, expected);
+
+    let idle_err =
+        execute(deps.as_mut(), mock_env(), mock_info("larry", &[]), ExecuteMsg::ReinvestIdle {
+            amount: Some(Uint128::new(1)),
+        })
+        .unwrap_err();
+    assert_eq!(idle_err, expected);
+
+    let rebalance_err =
+        execute(deps.as_mut(), mock_env(), mock_info("larry", &[]), ExecuteMsg::Rebalance {
+            minimum: Uint128::zero(),
+        })
+        .unwrap_err();
+    assert_eq!(rebalance_err, expected);
+
+    // Use fresh state because unit-test storage does not model transaction rollback after the
+    // removal mutates the validator sets and then discovers there is no safe destination.
+    let mut remove_deps = setup_test();
+    remove_deps.querier.set_bonded_validators(&[]);
+    let remove_err = execute(
+        remove_deps.as_mut(),
+        mock_env(),
+        mock_info("larry", &[]),
+        ExecuteMsg::RemoveValidator {
+            validator: "charlie".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(remove_err, expected);
 }
