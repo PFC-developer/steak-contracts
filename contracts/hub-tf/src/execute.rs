@@ -800,6 +800,7 @@ pub fn reconcile(mut deps: DepsMut, env: Env) -> StdResult<Response> {
     // set and guarantees that each has had an EndBlock opportunity to receive its unbonding.
     if !waiting.is_empty() {
         let ids = waiting.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+        let deferred = batches.iter().map(|b| b.id.to_string()).collect::<Vec<_>>().join(",");
         let native_reserved = NATIVE_RESERVED
             .may_load(deps.storage)?
             .map(|reserved| reserved.to_string())
@@ -808,7 +809,9 @@ pub fn reconcile(mut deps: DepsMut, env: Env) -> StdResult<Response> {
             .add_event(
                 Event::new("steakhub/reconcile_observed")
                     .add_attribute("ids", ids)
-                    .add_attribute("height", env.block.height.to_string()),
+                    .add_attribute("deferred_ids", deferred)
+                    .add_attribute("height", env.block.height.to_string())
+                    .add_attribute("retry_after_height", env.block.height.to_string()),
             )
             .add_attribute("native_reserved", native_reserved)
             .add_attribute("action", "steakhub/reconcile"));
@@ -820,8 +823,16 @@ pub fn reconcile(mut deps: DepsMut, env: Env) -> StdResult<Response> {
         Some(reserved) => reserved,
         None => {
             let step = advance_reserve_initialization(deps.branch(), &env)?;
+            let native_reserved = match &step {
+                ReserveInitStep::Done {
+                    reserved,
+                    ..
+                } => reserved.to_string(),
+                _ => "pending".to_string(),
+            };
             return Ok(Response::new()
                 .add_event(reserve_initialization_event(&step))
+                .add_attribute("native_reserved", native_reserved)
                 .add_attribute("action", "steakhub/reconcile"));
         },
     };
@@ -907,6 +918,7 @@ pub(crate) fn prepare_native_reserved_initialization(
         return Ok(ReserveInitStep::Done {
             reserved,
             written_down: Uint128::zero(),
+            unlocked: Uint128::zero(),
         });
     }
 
@@ -948,6 +960,8 @@ pub(crate) enum ReserveInitStep {
     Done {
         reserved: Uint128,
         written_down: Uint128,
+        /// Recorded rewards held out of the pool (zero if the reserve already existed).
+        unlocked: Uint128,
     },
 }
 
@@ -967,14 +981,17 @@ pub(crate) fn reserve_initialization_event(step: &ReserveInitStep) -> Event {
             )
             .add_attribute("owed", init.owed)
             .add_attribute("shortfall", init.shortfall)
+            .add_attribute("unlocked", init.unlocked)
             .add_attribute("written_down", init.applied),
         ReserveInitStep::Done {
             reserved,
             written_down,
+            unlocked,
         } => event
             .add_attribute("status", "done")
             .add_attribute("native_reserved", *reserved)
-            .add_attribute("legacy_reconciled_written_down", *written_down),
+            .add_attribute("pool_written_down", *written_down)
+            .add_attribute("unlocked", *unlocked),
     }
 }
 
@@ -1002,6 +1019,7 @@ pub(crate) fn advance_reserve_initialization(
         return Ok(ReserveInitStep::Done {
             reserved,
             written_down: Uint128::zero(),
+            unlocked: Uint128::zero(),
         });
     }
     let state = State::default();
@@ -1014,28 +1032,42 @@ pub(crate) fn advance_reserve_initialization(
         shortfall: Uint128::zero(),
         applied: Uint128::zero(),
         cumulative: Uint128::zero(),
+        joined: vec![],
+        unlocked: Uint128::zero(),
     });
-    let pool_time = init.pool_time;
-    let in_pool = |b: &Batch| b.reconciled || b.est_unbond_end_time < pool_time;
 
-    let page = previous_batches()
-        .range(deps.storage, init.cursor.map(Bound::exclusive), None, Order::Ascending)
-        .take(RESERVE_INIT_PAGE)
-        .map(|item| item.map(|(_, b)| b))
-        .collect::<StdResult<Vec<Batch>>>()?;
-    let pass_done = page.len() < RESERVE_INIT_PAGE;
-    init.cursor = page.last().map(|b| b.id).or(init.cursor);
-
-    if !init.applying {
-        for batch in page.iter().filter(|b| in_pool(b)) {
-            init.owed = init.owed.checked_add(batch.amount_unclaimed)?;
+    // Up to `RESERVE_INIT_PAGE` batches per call across both passes, so a short history (or none)
+    // finishes in the call that starts it, typically `migrate` itself.
+    let mut budget = RESERVE_INIT_PAGE;
+    loop {
+        if budget == 0 {
+            RESERVE_INIT.save(deps.storage, &init)?;
+            return Ok(ReserveInitStep::InProgress(init));
         }
-        if pass_done {
-            let denom = state.denom.load(deps.storage)?;
-            let unlocked = Coins(state.unlocked_coins.load(deps.storage)?).find(&denom).amount;
+        let pool_time = init.pool_time;
+        let joined = init.joined.clone();
+        let in_pool =
+            |b: &Batch| b.reconciled || b.est_unbond_end_time < pool_time || joined.contains(&b.id);
+
+        let page = previous_batches()
+            .range(deps.storage, init.cursor.map(Bound::exclusive), None, Order::Ascending)
+            .take(budget)
+            .map(|item| item.map(|(_, b)| b))
+            .collect::<StdResult<Vec<Batch>>>()?;
+        let pass_done = page.len() < budget;
+        budget -= page.len();
+        init.cursor = page.last().map(|b| b.id).or(init.cursor);
+
+        if !init.applying {
+            for batch in page.iter().filter(|b| in_pool(b)) {
+                init.owed = init.owed.checked_add(batch.amount_unclaimed)?;
+            }
+            if !pass_done {
+                continue;
+            }
             // A batch that matured after the pool was fixed may already have been paid, and if it
-            // was slashed that is just as unattributable: restart the sum with it in the pool
-            // rather than assume it was paid in full.
+            // was slashed that is just as unattributable: it joins the pool rather than being
+            // assumed paid in full. Unreconciled batches are few, so this stays bounded.
             let matured_since = previous_batches()
                 .idx
                 .reconciled
@@ -1044,56 +1076,55 @@ pub(crate) fn advance_reserve_initialization(
                 .map(|item| item.map(|(_, b)| b))
                 .collect::<StdResult<Vec<Batch>>>()?
                 .into_iter()
-                .any(|b| !in_pool(&b) && b.est_unbond_end_time < now);
-            if matured_since {
-                init = ReserveInit {
-                    pool_time: now,
-                    applying: false,
-                    cursor: None,
-                    owed: Uint128::zero(),
-                    shortfall: Uint128::zero(),
-                    applied: Uint128::zero(),
-                    cumulative: Uint128::zero(),
-                };
-                RESERVE_INIT.save(deps.storage, &init)?;
-                return Ok(ReserveInitStep::InProgress(init));
+                .filter(|b| !in_pool(b) && b.est_unbond_end_time < now)
+                .collect::<Vec<_>>();
+            for batch in &matured_since {
+                init.owed = init.owed.checked_add(batch.amount_unclaimed)?;
+                init.joined.push(batch.id);
             }
+            let denom = state.denom.load(deps.storage)?;
+            let unlocked = Coins(state.unlocked_coins.load(deps.storage)?).find(&denom).amount;
             let available = deps
                 .querier
                 .query_balance(&env.contract.address, &denom)?
                 .amount
                 .saturating_sub(unlocked);
             init.shortfall = init.owed.saturating_sub(available);
+            init.unlocked = unlocked;
             init.applying = true;
             init.cursor = None;
+            continue;
         }
-        RESERVE_INIT.save(deps.storage, &init)?;
-        return Ok(ReserveInitStep::InProgress(init));
-    }
 
-    for mut batch in page.into_iter().filter(|b| in_pool(b)) {
-        init.cumulative += batch.amount_unclaimed;
-        let target = cumulative_share(init.shortfall, init.cumulative, init.owed);
-        batch.amount_unclaimed -= target - init.applied;
-        init.applied = target;
-        if !batch.reconciled {
-            batch.reconciled = true;
-            RECONCILE_OBSERVED_HEIGHTS.remove(deps.storage, batch.id);
+        for mut batch in page.into_iter().filter(|b| in_pool(b)) {
+            // Nothing changes the pool between the passes (withdrawals wait, `Reconcile` only
+            // drives this); clamp anyway so a surprise cannot wedge the initialisation.
+            init.cumulative = init.cumulative.saturating_add(batch.amount_unclaimed).min(init.owed);
+            let target = cumulative_share(init.shortfall, init.cumulative, init.owed)
+                .min(init.shortfall)
+                .max(init.applied);
+            let share = (target - init.applied).min(batch.amount_unclaimed);
+            batch.amount_unclaimed -= share;
+            init.applied += share;
+            if !batch.reconciled {
+                batch.reconciled = true;
+                RECONCILE_OBSERVED_HEIGHTS.remove(deps.storage, batch.id);
+            }
+            previous_batches().save(deps.storage, batch.id, &batch)?;
         }
-        previous_batches().save(deps.storage, batch.id, &batch)?;
-    }
-    if !pass_done {
-        RESERVE_INIT.save(deps.storage, &init)?;
-        return Ok(ReserveInitStep::InProgress(init));
-    }
+        if !pass_done {
+            continue;
+        }
 
-    let reserved = init.owed - init.applied;
-    NATIVE_RESERVED.save(deps.storage, &reserved)?;
-    RESERVE_INIT.remove(deps.storage);
-    Ok(ReserveInitStep::Done {
-        reserved,
-        written_down: init.applied,
-    })
+        let reserved = init.owed.saturating_sub(init.applied);
+        NATIVE_RESERVED.save(deps.storage, &reserved)?;
+        RESERVE_INIT.remove(deps.storage);
+        return Ok(ReserveInitStep::Done {
+            reserved,
+            written_down: init.applied,
+            unlocked: init.unlocked,
+        });
+    }
 }
 
 pub fn withdraw_unbonded_admin(
@@ -1222,7 +1253,9 @@ pub fn withdraw_unbonded(
             .add_event(
                 Event::new("steakhub/withdraw_awaiting_reconcile")
                     .add_attribute("ids", awaiting)
-                    .add_attribute("height", env.block.height.to_string()),
+                    .add_attribute("amount_refunded", "0")
+                    .add_attribute("height", env.block.height.to_string())
+                    .add_attribute("retry_after_height", env.block.height.to_string()),
             )
             .add_attribute("action", "steakhub/withdraw_unbonded"));
     }
@@ -1260,6 +1293,9 @@ pub fn withdraw_unbonded(
         .add_attribute("amount_refunded", total_native_to_refund);
     if !zero_refund_ids.is_empty() {
         event = event.add_attribute("zero_refund_ids", zero_refund_ids.join(","));
+    }
+    if !dust_ids.is_empty() {
+        event = event.add_attribute("dust_ids", dust_ids.join(","));
     }
     let mut response =
         Response::new().add_event(event).add_attribute("action", "steakhub/withdraw_unbonded");
