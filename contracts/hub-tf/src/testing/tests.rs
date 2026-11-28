@@ -926,6 +926,11 @@ fn submitting_empty_batch_rolls_the_epoch_forward() {
     )
     .unwrap();
     assert!(res.messages.is_empty());
+    let skipped = res.events.iter().find(|e| e.ty == "steakhub/empty_batch_skipped").unwrap();
+    assert_eq!(skipped.attributes, vec![
+        cosmwasm_std::Attribute::new("id", "1"),
+        cosmwasm_std::Attribute::new("est_unbond_start_time", (269_201 + 259_200).to_string()),
+    ]);
 
     // Same batch id, nothing burned, next submission one epoch (259200s) from now.
     let pending = state.pending_batch.load(deps.as_ref().storage).unwrap();
