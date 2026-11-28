@@ -702,6 +702,7 @@ pub fn reconcile(mut deps: DepsMut, env: Env) -> StdResult<Response> {
     // set and guarantees that each has had an EndBlock opportunity to receive its unbonding.
     if !waiting.is_empty() {
         let ids = waiting.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+        let deferred = batches.iter().map(|b| b.id.to_string()).collect::<Vec<_>>().join(",");
         let native_reserved = NATIVE_RESERVED
             .may_load(deps.storage)?
             .map(|reserved| reserved.to_string())
@@ -710,7 +711,9 @@ pub fn reconcile(mut deps: DepsMut, env: Env) -> StdResult<Response> {
             .add_event(
                 Event::new("steakhub/reconcile_observed")
                     .add_attribute("ids", ids)
-                    .add_attribute("height", env.block.height.to_string()),
+                    .add_attribute("deferred_ids", deferred)
+                    .add_attribute("height", env.block.height.to_string())
+                    .add_attribute("retry_after_height", env.block.height.to_string()),
             )
             .add_attribute("native_reserved", native_reserved)
             .add_attribute("action", "steakhub/reconcile"));
@@ -722,8 +725,16 @@ pub fn reconcile(mut deps: DepsMut, env: Env) -> StdResult<Response> {
         Some(reserved) => reserved,
         None => {
             let step = advance_reserve_initialization(deps.branch(), &env)?;
+            let native_reserved = match &step {
+                ReserveInitStep::Done {
+                    reserved,
+                    ..
+                } => reserved.to_string(),
+                _ => "pending".to_string(),
+            };
             return Ok(Response::new()
                 .add_event(reserve_initialization_event(&step))
+                .add_attribute("native_reserved", native_reserved)
                 .add_attribute("action", "steakhub/reconcile"));
         },
     };
@@ -793,6 +804,7 @@ pub(crate) fn prepare_native_reserved_initialization(
         return Ok(ReserveInitStep::Done {
             reserved,
             written_down: Uint128::zero(),
+            unlocked: Uint128::zero(),
         });
     }
 
@@ -836,6 +848,8 @@ pub(crate) enum ReserveInitStep {
     Done {
         reserved: Uint128,
         written_down: Uint128,
+        /// Recorded rewards held out of the pool (zero if the reserve already existed).
+        unlocked: Uint128,
     },
 }
 
@@ -855,14 +869,17 @@ pub(crate) fn reserve_initialization_event(step: &ReserveInitStep) -> Event {
             )
             .add_attribute("owed", init.owed)
             .add_attribute("shortfall", init.shortfall)
+            .add_attribute("unlocked", init.unlocked)
             .add_attribute("written_down", init.applied),
         ReserveInitStep::Done {
             reserved,
             written_down,
+            unlocked,
         } => event
             .add_attribute("status", "done")
             .add_attribute("native_reserved", *reserved)
-            .add_attribute("pool_written_down", *written_down),
+            .add_attribute("pool_written_down", *written_down)
+            .add_attribute("unlocked", *unlocked),
     }
 }
 
@@ -890,6 +907,7 @@ pub(crate) fn advance_reserve_initialization(
         return Ok(ReserveInitStep::Done {
             reserved,
             written_down: Uint128::zero(),
+            unlocked: Uint128::zero(),
         });
     }
     let state = State::default();
@@ -903,6 +921,7 @@ pub(crate) fn advance_reserve_initialization(
         applied: Uint128::zero(),
         cumulative: Uint128::zero(),
         joined: vec![],
+        unlocked: Uint128::zero(),
     });
 
     // Up to `RESERVE_INIT_PAGE` batches per call across both passes, so a short history (or none)
@@ -961,6 +980,7 @@ pub(crate) fn advance_reserve_initialization(
                 .amount
                 .saturating_sub(unlocked);
             init.shortfall = init.owed.saturating_sub(available);
+            init.unlocked = unlocked;
             init.applying = true;
             init.cursor = None;
             continue;
@@ -992,6 +1012,7 @@ pub(crate) fn advance_reserve_initialization(
         return Ok(ReserveInitStep::Done {
             reserved,
             written_down: init.applied,
+            unlocked: init.unlocked,
         });
     }
 }
@@ -1123,7 +1144,9 @@ pub fn withdraw_unbonded(
             .add_event(
                 Event::new("steakhub/withdraw_awaiting_reconcile")
                     .add_attribute("ids", awaiting)
-                    .add_attribute("height", env.block.height.to_string()),
+                    .add_attribute("amount_refunded", "0")
+                    .add_attribute("height", env.block.height.to_string())
+                    .add_attribute("retry_after_height", env.block.height.to_string()),
             )
             .add_attribute("action", "steakhub/withdraw_unbonded"));
     }
@@ -1161,6 +1184,9 @@ pub fn withdraw_unbonded(
         .add_attribute("amount_refunded", total_native_to_refund);
     if !zero_refund_ids.is_empty() {
         event = event.add_attribute("zero_refund_ids", zero_refund_ids.join(","));
+    }
+    if !dust_ids.is_empty() {
+        event = event.add_attribute("dust_ids", dust_ids.join(","));
     }
     let mut response =
         Response::new().add_event(event).add_attribute("action", "steakhub/withdraw_unbonded");

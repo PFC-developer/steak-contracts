@@ -40,6 +40,10 @@ pub(crate) struct ReserveInit {
     /// Batches that matured after `pool_time` but before the sum finished; they join the pool.
     #[serde(default)]
     pub joined: Vec<u64>,
+    /// Recorded rewards (`unlocked_coins`) kept out of what the pool could draw on; reported so
+    /// operators can audit it, since an overstated figure deepens the pool's shortfall.
+    #[serde(default)]
+    pub unlocked: Uint128,
 }
 
 pub(crate) const RESERVE_INIT: Item<ReserveInit> = Item::new("reserve_init_001");

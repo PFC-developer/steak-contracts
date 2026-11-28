@@ -348,10 +348,12 @@ pub fn migrate(mut deps: DepsMut, env: Env, _msg: MigrateMsg) -> StdResult<Respo
         execute::ReserveInitStep::Done {
             reserved,
             written_down,
+            ..
         } => (reserved.to_string(), written_down.to_string()),
         _ => ("pending".to_string(), "pending".to_string()),
     };
 
+    let reserve_pending = native_reserved == "pending";
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
 
     Ok(Response::new()
@@ -362,5 +364,14 @@ pub fn migrate(mut deps: DepsMut, env: Env, _msg: MigrateMsg) -> StdResult<Respo
         .add_attribute("new_contract_version", CONTRACT_VERSION)
         .add_attribute("validator_registry_repairs", validator_registry_repairs.to_string())
         .add_attribute("native_reserved", native_reserved)
-        .add_attribute("pool_written_down", legacy_written_down))
+        .add_attribute("pool_written_down", legacy_written_down)
+        .add_attribute(
+            "next_step",
+            if reserve_pending {
+                "send Reconcile in later blocks until steakhub/reserve_initialization status=done; \
+                 withdrawals wait until then"
+            } else {
+                "none"
+            },
+        ))
 }
