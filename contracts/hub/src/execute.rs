@@ -283,7 +283,12 @@ pub fn harvest(deps: DepsMut, env: Env) -> StdResult<Response> {
         })
         .collect::<Vec<_>>();
 
-    let callback_msg = CallbackMsg::Reinvest {}.into_cosmos_msg(&env.contract.address)?;
+    // Skip, rather than revert the harvest, when nothing can be bonded (no rewards, or the
+    // reserve initialisation is pending, or matured batches are owed the balance).
+    let callback_msg = CallbackMsg::ReinvestIfNeeded {
+        exclude: vec![],
+    }
+    .into_cosmos_msg(&env.contract.address)?;
 
     Ok(Response::new()
         .add_submessages(withdraw_submsgs)
@@ -443,7 +448,18 @@ pub(crate) fn pending_rewards_net(
     deposit: Uint128,
 ) -> StdResult<Uint128> {
     let fee = State::default().fee_rate.load(deps.storage)?;
-    let (_, mut gross) = reinvestable(deps, env, denom, deposit)?;
+    let (unlocked, reinvestable_now) = reinvestable(deps, env, denom, deposit)?;
+    // While the reserve initialisation is pending nothing is bondable yet, but the recorded rewards
+    // still belong to existing holders: count them up to what the balance holds, so a bond in that
+    // window does not buy into them cheaply.
+    let mut gross = if NATIVE_RESERVED.may_load(deps.storage)?.is_some() {
+        reinvestable_now
+    } else {
+        unlocked.min(
+            get_denom_balance(&deps.querier, env.contract.address.clone(), denom.into())?
+                .saturating_sub(deposit),
+        )
+    };
     for d in delegations {
         if let Some(full) = deps.querier.query_delegation(&env.contract.address, &d.validator)? {
             gross += full
@@ -532,7 +548,8 @@ pub(crate) fn bonded_active_targets(
 }
 
 /// Native sitting in the contract that nothing accounts for: not delegated, not recorded as
-/// rewards waiting to be reinvested, and not owed to any unbonding batch. It comes from rewards
+/// rewards waiting to be reinvested, and not owed to a batch whose funds can already be here
+/// (reconciled, or matured). It comes from rewards
 /// withdrawn as a side effect of staking messages before they were recorded, and from unbonding
 /// funds that arrived after their batch was written down. Zero while the reserve initialisation is
 /// pending (what is owed is not known yet).
@@ -550,7 +567,10 @@ fn idle_native_with_deposit(
     let balance = get_denom_balance(&deps.querier, env.contract.address.clone(), denom.clone())?
         .saturating_sub(deposit);
     let unlocked = Coins(state.unlocked_coins.load(deps.storage)?).find(&denom).amount;
-    let owed_to_batches = native_owed_to_batches(deps.storage, None)?.unwrap_or(balance);
+    // Only batches whose funds can already be in the balance (reconciled, or matured by now):
+    // batches still unbonding have not been paid yet. This relies on accurate batch end times.
+    let owed_to_batches =
+        native_owed_to_batches(deps.storage, Some(env.block.time.seconds()))?.unwrap_or(balance);
     Ok(IdleFundsResponse {
         denom,
         balance,
@@ -614,9 +634,16 @@ pub fn register_received_coins(
         return Ok(Response::new());
     }
 
+    // An event this cannot parse is skipped and counted rather than failing the reply, which
+    // would revert the staking message (and, for `RedelegateInactive`, the whole run). Native it
+    // carried then shows up as idle and can be restaked with `ReinvestIdle`.
     let mut received_coins = Coins(vec![]);
+    let mut unparsed = 0u32;
     for event in &events {
-        received_coins.add_many(&parse_coin_receiving_event(&env, event)?)?;
+        match parse_coin_receiving_event(&env, event) {
+            Ok(coins) => received_coins.add_many(&coins)?,
+            Err(_) => unparsed += 1,
+        }
     }
 
     let state = State::default();
@@ -626,7 +653,11 @@ pub fn register_received_coins(
         Ok(coins.0)
     })?;
 
-    Ok(Response::new().add_attribute("action", "steakhub/register_received_coins"))
+    let mut response = Response::new().add_attribute("action", "steakhub/register_received_coins");
+    if unparsed > 0 {
+        response = response.add_attribute("unparsed_coin_received", unparsed.to_string());
+    }
+    Ok(response)
 }
 
 fn parse_coin_receiving_event(env: &Env, event: &Event) -> StdResult<Coins> {

@@ -553,7 +553,10 @@ fn harvesting() {
         id: 0,
         msg: CosmosMsg::Wasm(WasmMsg::Execute {
             contract_addr: MOCK_CONTRACT_ADDR.to_string(),
-            msg: to_json_binary(&ExecuteMsg::Callback(CallbackMsg::Reinvest {})).unwrap(),
+            msg: to_json_binary(&ExecuteMsg::Callback(CallbackMsg::ReinvestIfNeeded {
+                exclude: vec![],
+            }))
+            .unwrap(),
             funds: vec![],
         }),
         gas_limit: None,
@@ -2580,14 +2583,23 @@ fn querying_and_reinvesting_idle_funds() {
         Delegation::new("bob", 333333, "uxyz"),
         Delegation::new("charlie", 333333, "uxyz"),
     ]);
-    // Balance 1000: 100 recorded rewards, 300 owed to a batch still unbonding (its funds are not
-    // here yet, but they are reserved anyway), so 600 is idle.
+    // Balance 1000: 100 recorded rewards, 200 owed to a matured batch whose funds are here. A
+    // batch still unbonding (300) is not paid yet, so its claim is not on this balance: 700 is
+    // idle.
     let batch = Batch {
         id: 1,
         reconciled: false,
         total_shares: Uint128::new(300),
         amount_unclaimed: Uint128::new(300),
         est_unbond_end_time: u64::MAX,
+    };
+    state.previous_batches.save(deps.as_mut().storage, batch.id, &batch).unwrap();
+    let batch = Batch {
+        id: 2,
+        reconciled: false,
+        total_shares: Uint128::new(200),
+        amount_unclaimed: Uint128::new(200),
+        est_unbond_end_time: 100,
     };
     state.previous_batches.save(deps.as_mut().storage, batch.id, &batch).unwrap();
     deps.querier.set_bank_balances(&[Coin::new(1000, "uxyz")]);
@@ -2598,8 +2610,8 @@ fn querying_and_reinvesting_idle_funds() {
         denom: "uxyz".to_string(),
         balance: Uint128::new(1000),
         unlocked: Uint128::new(100),
-        owed_to_batches: Uint128::new(300),
-        idle: Uint128::new(600),
+        owed_to_batches: Uint128::new(200),
+        idle: Uint128::new(700),
     });
 
     let err =
@@ -2611,10 +2623,10 @@ fn querying_and_reinvesting_idle_funds() {
 
     let err =
         execute(deps.as_mut(), mock_env(), mock_info("larry", &[]), ExecuteMsg::ReinvestIdle {
-            amount: Some(Uint128::new(601)),
+            amount: Some(Uint128::new(701)),
         })
         .unwrap_err();
-    assert_eq!(err, StdError::generic_err("amount exceeds idle funds: 601 > 600"));
+    assert_eq!(err, StdError::generic_err("amount exceeds idle funds: 701 > 700"));
 
     let res =
         execute(deps.as_mut(), mock_env(), mock_info("larry", &[]), ExecuteMsg::ReinvestIdle {
@@ -2622,7 +2634,7 @@ fn querying_and_reinvesting_idle_funds() {
         })
         .unwrap();
     assert_eq!(res.messages, vec![SubMsg::reply_on_success(
-        Delegation::new("bob", 600, "uxyz").to_cosmos_msg(),
+        Delegation::new("bob", 700, "uxyz").to_cosmos_msg(),
         REPLY_REGISTER_RECEIVED_COINS,
     )]);
 }
@@ -3463,4 +3475,71 @@ fn reinvest_idle_only_stakes_to_bonded_active_validators() {
         })
         .unwrap();
     assert_eq!(res.messages[0].msg, Delegation::new("charlie", 50, "uxyz").to_cosmos_msg());
+}
+
+#[test]
+fn first_bond_mints_one_to_one_despite_stray_native() {
+    // No supply, no stake, but someone sent 1 unit to the hub: the first bond still mints 1:1
+    // instead of pricing against the stray unit (and minting 0).
+    assert_eq!(
+        crate::math::compute_mint_amount(Uint128::zero(), Uint128::new(1000), &[], Uint128::new(1))
+            .unwrap(),
+        Uint128::new(1000)
+    );
+}
+
+#[test]
+fn bonds_while_the_reserve_is_pending_still_price_in_recorded_rewards() {
+    let mut deps = setup_test();
+    let state = State::default();
+    deps.querier.set_staking_delegations(&[
+        Delegation::new("alice", 400, "uxyz"),
+        Delegation::new("bob", 300, "uxyz"),
+        Delegation::new("charlie", 300, "uxyz"),
+    ]);
+    deps.querier.set_cw20_total_supply("steak_token", 1000);
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![Coin::new(100, "uxyz")]).unwrap();
+    deps.querier.set_bank_balances(&[Coin::new(100 + 1090, "uxyz")]);
+    NATIVE_RESERVED.remove(deps.as_mut().storage);
+
+    // Nothing is bondable while the reserve is pending, but the 100 recorded (90 after fee) still
+    // belongs to existing holders: 1090 buys 1000 shares, as it would afterwards.
+    let res = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info("user_1", &[Coin::new(1090, "uxyz")]),
+        ExecuteMsg::Bond {
+            receiver: None,
+            exec_msg: None,
+        },
+    )
+    .unwrap();
+    let bonded = res.events.iter().find(|e| e.ty == "steakhub/bonded").unwrap();
+    let minted = bonded.attributes.iter().find(|a| a.key == "usteak_minted").unwrap();
+    assert_eq!(minted.value, "1000");
+}
+
+#[test]
+fn an_unparsable_coin_received_event_is_skipped_not_fatal() {
+    let mut deps = setup_test();
+    let state = State::default();
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![]).unwrap();
+
+    let res = reply(deps.as_mut(), mock_env(), Reply {
+        id: REPLY_REGISTER_RECEIVED_COINS,
+        result: cosmwasm_std::SubMsgResult::Ok(SubMsgResponse {
+            events: vec![
+                Event::new("coin_received").add_attribute("receiver", MOCK_CONTRACT_ADDR),
+                Event::new("coin_received")
+                    .add_attribute("receiver", MOCK_CONTRACT_ADDR)
+                    .add_attribute("amount", "12uxyz"),
+            ],
+            data: None,
+        }),
+    })
+    .unwrap();
+    assert!(res.attributes.iter().any(|a| a.key == "unparsed_coin_received" && a.value == "1"));
+    assert_eq!(state.unlocked_coins.load(deps.as_ref().storage).unwrap(), vec![Coin::new(
+        12, "uxyz"
+    )]);
 }

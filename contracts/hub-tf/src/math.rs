@@ -22,6 +22,11 @@ pub(crate) fn compute_mint_amount(
     all_delegations: &[Delegation],
     pending_rewards: Uint128,
 ) -> StdResult<Uint128> {
+    // With no supply there is nobody to price against: mint 1:1, whatever stake, rewards or idle
+    // native the contract holds (pricing against them would mint 0 for the first bonder).
+    if usteak_supply.is_zero() {
+        return Ok(native_to_bond);
+    }
     let native_bonded = total_delegated(all_delegations)?
         .checked_add(pending_rewards.u128())
         .ok_or_else(|| StdError::generic_err("delegation total overflow"))?;
