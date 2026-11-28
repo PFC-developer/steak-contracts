@@ -191,10 +191,10 @@ pub fn bond(
         usteak_supply
     };
     let (usteak_to_mint, dead_shares) = if usteak_supply.is_zero() {
-        let existing = Uint128::new(total_delegated(&all_delegations)?)
-            .checked_add(pending)?
-            .checked_add(idle_native_with_deposit(deps.as_ref(), &env, amount_to_bond)?.idle)?;
-        compute_first_mint(amount_to_bond, existing)?
+        // Untracked idle is deliberately absent here. It is excluded from public bond pricing
+        // and receives its own proportional dead shares if and when the owner delegates it.
+        // Counting it now as well would lock the same idle twice and dilute this first bonder.
+        compute_first_mint(amount_to_bond, tracked)?
     } else {
         (
             compute_mint_amount(usteak_supply, amount_to_bond, &all_delegations, pending)?,

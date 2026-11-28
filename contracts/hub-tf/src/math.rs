@@ -22,8 +22,8 @@ pub(crate) fn compute_mint_amount(
     all_delegations: &[Delegation],
     pending_rewards: Uint128,
 ) -> StdResult<Uint128> {
-    // With no supply there is nobody to price against: mint 1:1, whatever stake, rewards or idle
-    // native the contract holds (pricing against them would mint 0 for the first bonder).
+    // With no supply there is nobody to price against: mint 1:1 regardless of any native the
+    // contract already holds (pricing against it would mint 0 for the first bonder).
     if usteak_supply.is_zero() {
         return Ok(native_to_bond);
     }
@@ -68,12 +68,12 @@ pub(crate) const MIN_DEAD_SHARES: u128 = 1_000;
 
 /// The first mint at zero supply. There is no price to go by, so dead shares, minted to the hub
 /// itself and never redeemable, are locked alongside the bonder's: worth `existing_backing`
-/// (stake, rewards or idle native left from earlier holders or sent by anyone) so the bonder
-/// cannot claim what was already there, and at least `MIN_DEAD_SHARES`, so inflating the price by
-/// donating to an empty hub costs the donor almost all of the donation. Whatever part of that
-/// minimum no existing backing covers comes out of the bonder's own mint, so the exchange rate
-/// stays exactly 1:1 and the bonder's cost is at most `MIN_DEAD_SHARES`; a deposit too small to
-/// cover it is refused.
+/// (tracked stake or rewards left from earlier holders) so the bonder cannot claim what was
+/// already there, and at least `MIN_DEAD_SHARES`. Untracked idle is excluded: it receives
+/// proportional dead shares only if it is later swept into delegated backing. Whatever part of
+/// the minimum no existing backing covers comes out of the bonder's own mint, so the exchange
+/// rate stays exactly 1:1 and the bonder's cost is at most `MIN_DEAD_SHARES`; a deposit too small
+/// to cover it is refused.
 ///
 /// Returns (minted to the bonder, dead shares).
 pub(crate) fn compute_first_mint(

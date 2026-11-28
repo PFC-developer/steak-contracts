@@ -3556,14 +3556,35 @@ fn reinvest_idle_only_stakes_to_bonded_active_validators() {
 }
 
 #[test]
-fn first_bond_mints_one_to_one_despite_stray_native() {
-    // No supply, no stake, but someone sent 1 unit to the hub: the first bond still mints 1:1
-    // instead of pricing against the stray unit (and minting 0).
-    assert_eq!(
-        crate::math::compute_mint_amount(Uint128::zero(), Uint128::new(1000), &[], Uint128::new(1))
-            .unwrap(),
-        Uint128::new(1000)
-    );
+fn first_bond_does_not_lock_stray_native_before_it_is_swept() {
+    let mut deps = setup_test();
+    let state = State::default();
+    deps.querier.set_staking_delegations(&[]);
+    deps.querier.set_cw20_total_supply("steak_token", 0);
+    // 5000 was sent directly to the hub before this 2000 deposit arrived.
+    deps.querier.set_bank_balances(&[Coin::new(7000, "uxyz")]);
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![]).unwrap();
+
+    let res = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info("user_1", &[Coin::new(2000, "uxyz")]),
+        ExecuteMsg::Bond {
+            receiver: None,
+            exec_msg: None,
+        },
+    )
+    .unwrap();
+
+    let bonded = res.events.iter().find(|event| event.ty == "steakhub/bonded").unwrap();
+    let attr = |key: &str| {
+        bonded.attributes.iter().find(|attr| attr.key == key).map(|attr| attr.value.as_str())
+    };
+    // The idle 5000 is not part of the first mint. It will receive proportional dead shares only
+    // if ReinvestIdle delegates it, preventing the same backing from being locked twice.
+    assert_eq!(attr("usteak_minted"), Some("1000"));
+    assert_eq!(attr("dead_shares"), Some("1000"));
+    assert_eq!(DEAD_SHARES.load(deps.as_ref().storage).unwrap(), Uint128::new(1000));
 }
 
 #[test]
