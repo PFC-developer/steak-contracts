@@ -27,10 +27,10 @@ use crate::{
         query_cw20_total_supply, query_delegation, query_delegations,
     },
     math::{
-        compute_first_mint, compute_mint_amount, compute_redelegations_for_inactive,
-        compute_redelegations_for_rebalancing, compute_redelegations_for_removal,
-        compute_unbond_amount, compute_undelegations, cumulative_share, reconcile_batches,
-        total_delegated,
+        compute_first_mint, compute_idle_sweep_shares, compute_mint_amount,
+        compute_redelegations_for_inactive, compute_redelegations_for_rebalancing,
+        compute_redelegations_for_removal, compute_unbond_amount, compute_undelegations,
+        cumulative_share, reconcile_batches, total_delegated,
     },
     state::{
         CHAIN_REPORTED_END, DEAD_SHARES, NATIVE_RESERVED, RECONCILE_OBSERVED_HEIGHTS, RESERVE_INIT,
@@ -633,7 +633,9 @@ fn idle_native_with_deposit(
 }
 
 /// Owner only: delegate idle native (see `idle_native`) to the active validator with the smallest
-/// delegation, so it earns for current holders. No fee is taken: idle funds are not all rewards.
+/// delegation. Proportional shares are locked in the hub so moving previously unpriced idle into
+/// delegated backing cannot raise the exchange rate. No fee is taken: idle funds are not all
+/// rewards.
 pub fn reinvest_idle(
     deps: DepsMut,
     env: Env,
@@ -655,23 +657,52 @@ pub fn reinvest_idle(
         )));
     }
 
+    let all_delegations = query_all_delegations(&deps.querier, &env.contract.address)?;
+    let steak_token = state.steak_token.load(deps.storage)?;
+    let share_supply = query_cw20_total_supply(&deps.querier, &steak_token)?;
+    let pending =
+        pending_rewards_net(deps.as_ref(), &env, &all_delegations, &idle.denom, Uint128::zero())?;
+    let tracked_backing = Uint128::new(total_delegated(&all_delegations)?).checked_add(pending)?;
+    let dead_shares = compute_idle_sweep_shares(share_supply, amount, tracked_backing)?;
+
     let validators = bonded_active_targets(deps.as_ref(), &[])?;
-    let delegations =
+    let target_delegations =
         query_delegations(&deps.querier, &validators, &env.contract.address, &idle.denom)?;
-    let target = delegations.iter().min_by_key(|d| d.amount).map(|d| d.validator.clone()).unwrap();
+    let target =
+        target_delegations.iter().min_by_key(|d| d.amount).map(|d| d.validator.clone()).unwrap();
+
+    let dead_share_mint = if dead_shares.is_zero() {
+        None
+    } else {
+        Some(CosmosMsg::Wasm(WasmMsg::Execute {
+            contract_addr: steak_token.to_string(),
+            msg: to_json_binary(&Cw20ExecuteMsg::Mint {
+                recipient: env.contract.address.to_string(),
+                amount: dead_shares,
+            })?,
+            funds: vec![],
+        }))
+    };
+    if !dead_shares.is_zero() {
+        let dead = DEAD_SHARES.may_load(deps.storage)?.unwrap_or_default();
+        DEAD_SHARES.save(deps.storage, &dead.checked_add(dead_shares)?)?;
+    }
 
     let event = Event::new("steakhub/reinvested_idle")
         .add_attribute("validator", &target)
         .add_attribute("amount", amount)
-        .add_attribute("idle_before", idle.idle);
+        .add_attribute("idle_before", idle.idle)
+        .add_attribute("dead_shares", dead_shares);
 
-    Ok(Response::new()
-        .add_submessage(SubMsg::reply_on_success(
-            Delegation::new(&target, amount.u128(), &idle.denom).to_cosmos_msg(),
-            REPLY_REGISTER_RECEIVED_COINS,
-        ))
-        .add_event(event)
-        .add_attribute("action", "steakhub/reinvest_idle"))
+    let mut response = Response::new().add_submessage(SubMsg::reply_on_success(
+        Delegation::new(&target, amount.u128(), &idle.denom).to_cosmos_msg(),
+        REPLY_REGISTER_RECEIVED_COINS,
+    ));
+    if let Some(dead_share_mint) = dead_share_mint {
+        response = response.add_message(dead_share_mint);
+    }
+
+    Ok(response.add_event(event).add_attribute("action", "steakhub/reinvest_idle"))
 }
 
 /// NOTE: a `SubMsgResponse` may contain multiple coin-receiving events, must handle them

@@ -17,8 +17,8 @@ pub(crate) const RECONCILE_OBSERVED_HEIGHTS: Map<u64, u64> =
 /// unbond requests are never claimed. Initialised by `migrate`.
 pub(crate) const NATIVE_RESERVED: Item<Uint128> = Item::new("native_reserved_001");
 
-/// Derivative tokens the hub minted to itself at zero supply (see `compute_first_mint`). They are
-/// held by the hub and never redeemed; burning stray tokens must leave them alone.
+/// Derivative tokens the hub minted to itself at zero supply or while sweeping idle native. They
+/// are held by the hub and never redeemed; burning stray tokens must leave them alone.
 pub(crate) const DEAD_SHARES: Item<Uint128> = Item::new("dead_shares_001");
 
 /// Batches whose `est_unbond_end_time` came from the chain (the staking module's reported

@@ -25,10 +25,10 @@ use crate::{
     },
     injective, kujira,
     math::{
-        compute_first_mint, compute_mint_amount, compute_redelegations_for_inactive,
-        compute_redelegations_for_rebalancing, compute_redelegations_for_removal,
-        compute_unbond_amount, compute_undelegations, cumulative_share, reconcile_batches,
-        total_delegated,
+        compute_first_mint, compute_idle_sweep_shares, compute_mint_amount,
+        compute_redelegations_for_inactive, compute_redelegations_for_rebalancing,
+        compute_redelegations_for_removal, compute_unbond_amount, compute_undelegations,
+        cumulative_share, reconcile_batches, total_delegated,
     },
     osmosis,
     state::{
@@ -127,6 +127,54 @@ pub fn instantiate(deps: DepsMut, env: Env, msg: InstantiateMsg) -> StdResult<Re
     Ok(Response::new().add_message(c))
 }
 
+fn mint_steak_msg(
+    token_factory_type: &TokenFactoryType,
+    contract: &Addr,
+    denom: &str,
+    amount: Uint128,
+) -> CosmosMsg {
+    match token_factory_type {
+        TokenFactoryType::CosmWasm => <token_factory::denom::MsgMint as Into<CosmosMsg>>::into(
+            token_factory::denom::MsgMint {
+                sender: contract.to_string(),
+                amount: Some(token_factory::denom::Coin {
+                    denom: denom.to_string(),
+                    amount: amount.to_string(),
+                }),
+            },
+        ),
+        TokenFactoryType::Kujira => {
+            <kujira::denom::MsgMint as Into<CosmosMsg>>::into(kujira::denom::MsgMint {
+                sender: contract.to_string(),
+                recipient: contract.to_string(),
+                amount: Some(kujira::denom::Coin {
+                    denom: denom.to_string(),
+                    amount: amount.to_string(),
+                }),
+            })
+        },
+        TokenFactoryType::Injective => {
+            <injective::denom::MsgMint as Into<CosmosMsg>>::into(injective::denom::MsgMint {
+                sender: contract.to_string(),
+                amount: Some(injective::denom::Coin {
+                    denom: denom.to_string(),
+                    amount: amount.to_string(),
+                }),
+            })
+        },
+        TokenFactoryType::Osmosis => {
+            <osmosis::denom::MsgMint as Into<CosmosMsg>>::into(osmosis::denom::MsgMint {
+                sender: contract.to_string(),
+                amount: Some(osmosis::denom::Coin {
+                    denom: denom.to_string(),
+                    amount: amount.to_string(),
+                }),
+                mint_to_address: contract.to_string(),
+            })
+        },
+    }
+}
+
 //--------------------------------------------------------------------------------------------------
 // Bonding and harvesting logics
 //--------------------------------------------------------------------------------------------------
@@ -223,46 +271,8 @@ pub fn bond(
         }
         // TODO deal with multiple token returns
 
-        let mint_msg = match token_factory_type {
-            TokenFactoryType::CosmWasm => <token_factory::denom::MsgMint as Into<CosmosMsg>>::into(
-                token_factory::denom::MsgMint {
-                    sender: env.contract.address.to_string(),
-                    amount: Some(token_factory::denom::Coin {
-                        denom: steak_denom.clone(),
-                        amount: minted_total.to_string(),
-                    }),
-                },
-            ),
-            TokenFactoryType::Kujira => {
-                <kujira::denom::MsgMint as Into<CosmosMsg>>::into(kujira::denom::MsgMint {
-                    sender: env.contract.address.to_string(),
-                    recipient: env.contract.address.to_string(),
-                    amount: Some(kujira::denom::Coin {
-                        denom: steak_denom.clone(),
-                        amount: minted_total.to_string(),
-                    }),
-                })
-            },
-            TokenFactoryType::Injective => {
-                <injective::denom::MsgMint as Into<CosmosMsg>>::into(injective::denom::MsgMint {
-                    sender: env.contract.address.to_string(),
-                    amount: Some(injective::denom::Coin {
-                        denom: steak_denom.clone(),
-                        amount: minted_total.to_string(),
-                    }),
-                })
-            },
-            TokenFactoryType::Osmosis => {
-                <osmosis::denom::MsgMint as Into<CosmosMsg>>::into(osmosis::denom::MsgMint {
-                    sender: env.contract.address.to_string(),
-                    amount: Some(osmosis::denom::Coin {
-                        denom: steak_denom.clone(),
-                        amount: minted_total.to_string(),
-                    }),
-                    mint_to_address: env.contract.address.to_string(),
-                })
-            },
-        };
+        let mint_msg =
+            mint_steak_msg(&token_factory_type, &env.contract.address, &steak_denom, minted_total);
 
         let contract_info = deps.querier.query_wasm_contract_info(receiver.to_string());
 
@@ -670,7 +680,9 @@ fn idle_native_with_deposit(
 }
 
 /// Owner only: delegate idle native (see `idle_native`) to the active validator with the smallest
-/// delegation, so it earns for current holders. No fee is taken: idle funds are not all rewards.
+/// delegation. Proportional shares are locked in the hub so moving previously unpriced idle into
+/// delegated backing cannot raise the exchange rate. No fee is taken: idle funds are not all
+/// rewards.
 pub fn reinvest_idle(
     deps: DepsMut,
     env: Env,
@@ -692,23 +704,47 @@ pub fn reinvest_idle(
         )));
     }
 
+    let all_delegations = query_all_delegations(&deps.querier, &env.contract.address)?;
+    let share_supply = state.steak_minted.load(deps.storage)?;
+    let pending =
+        pending_rewards_net(deps.as_ref(), &env, &all_delegations, &idle.denom, Uint128::zero())?;
+    let tracked_backing = Uint128::new(total_delegated(&all_delegations)?).checked_add(pending)?;
+    let dead_shares = compute_idle_sweep_shares(share_supply, amount, tracked_backing)?;
+
     let validators = bonded_active_targets(deps.as_ref(), &[])?;
-    let delegations =
+    let target_delegations =
         query_delegations(&deps.querier, &validators, &env.contract.address, &idle.denom)?;
-    let target = delegations.iter().min_by_key(|d| d.amount).map(|d| d.validator.clone()).unwrap();
+    let target =
+        target_delegations.iter().min_by_key(|d| d.amount).map(|d| d.validator.clone()).unwrap();
+
+    let mint_msg = if dead_shares.is_zero() {
+        None
+    } else {
+        let token_factory_type = state.token_factory_type.load(deps.storage)?;
+        let steak_denom = state.steak_denom.load(deps.storage)?;
+        Some(mint_steak_msg(&token_factory_type, &env.contract.address, &steak_denom, dead_shares))
+    };
+    if !dead_shares.is_zero() {
+        state.steak_minted.save(deps.storage, &share_supply.checked_add(dead_shares)?)?;
+        let dead = DEAD_SHARES.may_load(deps.storage)?.unwrap_or_default();
+        DEAD_SHARES.save(deps.storage, &dead.checked_add(dead_shares)?)?;
+    }
 
     let event = Event::new("steakhub/reinvested_idle")
         .add_attribute("validator", &target)
         .add_attribute("amount", amount)
-        .add_attribute("idle_before", idle.idle);
+        .add_attribute("idle_before", idle.idle)
+        .add_attribute("dead_shares", dead_shares);
 
-    Ok(Response::new()
-        .add_submessage(SubMsg::reply_on_success(
-            Delegation::new(&target, amount.u128(), &idle.denom).to_cosmos_msg(),
-            REPLY_REGISTER_RECEIVED_COINS,
-        ))
-        .add_event(event)
-        .add_attribute("action", "steakhub/reinvest_idle"))
+    let mut response = Response::new().add_submessage(SubMsg::reply_on_success(
+        Delegation::new(&target, amount.u128(), &idle.denom).to_cosmos_msg(),
+        REPLY_REGISTER_RECEIVED_COINS,
+    ));
+    if let Some(mint_msg) = mint_msg {
+        response = response.add_message(mint_msg);
+    }
+
+    Ok(response.add_event(event).add_attribute("action", "steakhub/reinvest_idle"))
 }
 
 /// NOTE: a `SubMsgResponse` may contain multiple coin-receiving events, must handle them

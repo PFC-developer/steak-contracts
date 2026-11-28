@@ -26,8 +26,9 @@ use crate::{
     },
     helpers::{parse_coin, parse_received_fund},
     math::{
-        compute_redelegations_for_inactive, compute_redelegations_for_rebalancing,
-        compute_redelegations_for_removal, compute_undelegations, reconcile_batches,
+        compute_idle_sweep_shares, compute_redelegations_for_inactive,
+        compute_redelegations_for_rebalancing, compute_redelegations_for_removal,
+        compute_undelegations, reconcile_batches,
     },
     state::{DEAD_SHARES, NATIVE_RESERVED, State},
     types::{Coins, Delegation, Redelegation, Undelegation},
@@ -3487,6 +3488,49 @@ fn idle_funds_do_not_count_in_bond_pricing() {
     let bonded = res.events.iter().find(|e| e.ty == "steakhub/bonded").unwrap();
     let minted = bonded.attributes.iter().find(|a| a.key == "usteak_minted").unwrap();
     assert_eq!(minted.value, "1100");
+}
+
+#[test]
+fn reinvest_idle_locks_shares_instead_of_raising_the_exchange_rate() {
+    let mut deps = setup_test();
+    let state = State::default();
+    deps.querier.set_staking_delegations(&[
+        Delegation::new("alice", 800, "uxyz"),
+        Delegation::new("bob", 600, "uxyz"),
+        Delegation::new("charlie", 600, "uxyz"),
+    ]);
+    deps.querier.set_cw20_total_supply("steak_token", 2000);
+    deps.querier.set_bank_balances(&[Coin::new(2000, "uxyz")]);
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![]).unwrap();
+
+    let res =
+        execute(deps.as_mut(), mock_env(), mock_info("larry", &[]), ExecuteMsg::ReinvestIdle {
+            amount: None,
+        })
+        .unwrap();
+
+    assert_eq!(res.messages[0].msg, Delegation::new("bob", 2000, "uxyz").to_cosmos_msg());
+    assert_eq!(
+        res.messages[1],
+        SubMsg::new(CosmosMsg::Wasm(WasmMsg::Execute {
+            contract_addr: "steak_token".to_string(),
+            msg: to_json_binary(&Cw20ExecuteMsg::Mint {
+                recipient: MOCK_CONTRACT_ADDR.to_string(),
+                amount: Uint128::new(2000),
+            })
+            .unwrap(),
+            funds: vec![],
+        }))
+    );
+    assert_eq!(DEAD_SHARES.load(deps.as_ref().storage).unwrap(), Uint128::new(2000));
+    let event = res.events.iter().find(|e| e.ty == "steakhub/reinvested_idle").unwrap();
+    assert!(event.attributes.iter().any(|a| a.key == "dead_shares" && a.value == "2000"));
+
+    // Division rounds up: a sweep may never leave a one-unit exchange-rate increase to capture.
+    assert_eq!(
+        compute_idle_sweep_shares(Uint128::new(3), Uint128::new(1), Uint128::new(2)).unwrap(),
+        Uint128::new(2)
+    );
 }
 
 #[test]

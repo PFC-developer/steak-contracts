@@ -91,6 +91,33 @@ pub(crate) fn compute_first_mint(
     Ok((native_to_bond - unbacked, dead))
 }
 
+/// Shares to lock when idle native becomes delegated backing.
+///
+/// Idle is deliberately excluded from bond pricing because anyone can increase it with a plain
+/// transfer. Delegating it without increasing supply would nevertheless raise the exchange rate,
+/// letting a bonder immediately before the sweep capture some of it. Minting these shares to the
+/// hub keeps the priced backing per share from increasing. Round up so integer truncation cannot
+/// leave even a one-unit upward jump.
+pub(crate) fn compute_idle_sweep_shares(
+    share_supply: Uint128,
+    idle_to_delegate: Uint128,
+    tracked_backing: Uint128,
+) -> StdResult<Uint128> {
+    // With no supply there is nobody to front-run. With no tracked backing, public bonds are
+    // already refused, so the owner may use the sweep to restore backing without a cheap mint.
+    if share_supply.is_zero() || idle_to_delegate.is_zero() || tracked_backing.is_zero() {
+        return Ok(Uint128::zero());
+    }
+
+    let numerator = Uint256::from(share_supply).checked_mul(Uint256::from(idle_to_delegate))?;
+    let denominator = Uint256::from(tracked_backing);
+    let rounded_up = numerator
+        .checked_add(denominator.checked_sub(Uint256::from(1u128))?)?
+        .checked_div(denominator)?;
+    Uint128::try_from(rounded_up)
+        .map_err(|err| StdError::generic_err(format!("idle sweep share amount overflow: {err}")))
+}
+
 pub(crate) fn total_delegated(delegations: &[Delegation]) -> StdResult<u128> {
     delegations.iter().try_fold(0u128, |total, delegation| {
         total
