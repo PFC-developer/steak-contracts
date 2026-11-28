@@ -525,7 +525,12 @@ fn reinvest_excluding(deps: DepsMut, env: Env, exclude: &[String]) -> StdResult<
         Response::new().add_event(event).add_attribute("action", "steakhub/reinvest");
 
     if let Some(new_delegation) = new_delegation {
-        response = response.add_message(new_delegation.to_cosmos_msg());
+        // Delegating withdraws the target's pending rewards; register them like every other
+        // staking message does.
+        response = response.add_submessage(SubMsg::reply_on_success(
+            new_delegation.to_cosmos_msg(),
+            REPLY_REGISTER_RECEIVED_COINS,
+        ));
     }
 
     if !fee_amount.is_zero() {
@@ -567,7 +572,7 @@ pub(crate) fn pending_rewards_net(
     // Recorded rewards are in the balance and belong to existing holders, whatever batches are
     // owed at the moment (e.g. a matured batch whose payout lands at the end of this block): count
     // them up to what the balance holds. Only the actual reinvest needs the conservative cap.
-    let (unlocked, _) = reinvestable(deps, env, denom, deposit)?;
+    let unlocked = Coins(State::default().unlocked_coins.load(deps.storage)?).find(denom).amount;
     let mut gross = unlocked.min(
         get_denom_balance(&deps.querier, env.contract.address.clone(), denom.into())?
             .saturating_sub(deposit),

@@ -533,7 +533,13 @@ fn harvesting_and_reinvesting_after_inactive_redelegation() {
         }),
     )
     .unwrap();
-    assert_eq!(res.messages[0], SubMsg::new(Delegation::new("bob", 45, "uxyz").to_cosmos_msg()));
+    assert_eq!(
+        res.messages[0],
+        SubMsg::reply_on_success(
+            Delegation::new("bob", 45, "uxyz").to_cosmos_msg(),
+            REPLY_REGISTER_RECEIVED_COINS
+        )
+    );
 
     state.unlocked_coins.save(deps.as_mut().storage, &vec![]).unwrap();
     let res = execute(
@@ -588,10 +594,10 @@ fn reinvesting() {
 
     assert_eq!(res.messages.len(), 2);
     assert_eq!(res.messages[0], SubMsg {
-        id: 0,
+        id: REPLY_REGISTER_RECEIVED_COINS,
         msg: Delegation::new("bob", 234 - 23, "uxyz").to_cosmos_msg(),
         gas_limit: None,
-        reply_on: ReplyOn::Never,
+        reply_on: ReplyOn::Success,
     });
     let send_msg = BankMsg::Send {
         to_address: "the_fee_man".into(),
@@ -648,10 +654,10 @@ fn reinvesting_fee_split() {
 
     assert_eq!(res.messages.len(), 2);
     assert_eq!(res.messages[0], SubMsg {
-        id: 0,
+        id: REPLY_REGISTER_RECEIVED_COINS,
         msg: Delegation::new("bob", 234 - 23, "uxyz").to_cosmos_msg(),
         gas_limit: None,
-        reply_on: ReplyOn::Never,
+        reply_on: ReplyOn::Success,
     });
     let send_msg = pfc_fee_split::fee_split_msg::ExecuteMsg::Deposit {
         flush: false,
@@ -2461,7 +2467,13 @@ fn reinvest_restakes_recorded_side_effect_rewards() {
         ExecuteMsg::Callback(CallbackMsg::Reinvest {}),
     )
     .unwrap();
-    assert_eq!(res.messages[0], SubMsg::new(Delegation::new("bob", 270, "uxyz").to_cosmos_msg()));
+    assert_eq!(
+        res.messages[0],
+        SubMsg::reply_on_success(
+            Delegation::new("bob", 270, "uxyz").to_cosmos_msg(),
+            REPLY_REGISTER_RECEIVED_COINS
+        )
+    );
     assert_eq!(
         res.messages[1],
         SubMsg::new(CosmosMsg::Bank(BankMsg::Send {
@@ -2501,7 +2513,13 @@ fn reinvest_never_bonds_funds_owed_to_batches() {
         ExecuteMsg::Callback(CallbackMsg::Reinvest {}),
     )
     .unwrap();
-    assert_eq!(res.messages[0], SubMsg::new(Delegation::new("bob", 90, "uxyz").to_cosmos_msg()));
+    assert_eq!(
+        res.messages[0],
+        SubMsg::reply_on_success(
+            Delegation::new("bob", 90, "uxyz").to_cosmos_msg(),
+            REPLY_REGISTER_RECEIVED_COINS
+        )
+    );
     // The rest stays recorded for a later reinvest.
     assert_eq!(state.unlocked_coins.load(deps.as_ref().storage).unwrap(), vec![Coin::new(
         200, "uxyz"
@@ -2789,7 +2807,13 @@ fn reinvest_after_redelegation_skips_excluded_validators() {
         }),
     )
     .unwrap();
-    assert_eq!(res.messages[0], SubMsg::new(Delegation::new("bob", 45, "uxyz").to_cosmos_msg()));
+    assert_eq!(
+        res.messages[0],
+        SubMsg::reply_on_success(
+            Delegation::new("bob", 45, "uxyz").to_cosmos_msg(),
+            REPLY_REGISTER_RECEIVED_COINS
+        )
+    );
 
     // Older callback messages without the field still parse.
     let legacy: CallbackMsg = cosmwasm_std::from_json(br#"{"reinvest_if_needed":{}}"#).unwrap();
@@ -3843,4 +3867,20 @@ fn burn_steak_msg_for_test(amount: u128) -> CosmosMsg {
             amount: amount.to_string(),
         }),
     })
+}
+
+#[test]
+fn reinvest_idle_refuses_attached_funds() {
+    let mut deps = setup_test();
+    // Attached native would count as idle and be swept (and locked) with it.
+    let err = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info("larry", &[Coin::new(1000, "uxyz")]),
+        ExecuteMsg::ReinvestIdle {
+            amount: None,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(err, StdError::generic_err("ReinvestIdle does not accept funds"));
 }

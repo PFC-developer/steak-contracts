@@ -93,7 +93,13 @@ pub fn execute(deps: DepsMut, env: Env, info: MessageInfo, msg: ExecuteMsg) -> S
         } => execute::redelegate(deps, env, info.sender, validator_from, validator_to),
         ExecuteMsg::ReinvestIdle {
             amount,
-        } => execute::reinvest_idle(deps, env, info.sender, amount),
+        } => {
+            // Attached funds would count as idle and be swept (and locked) with it.
+            if !info.funds.is_empty() {
+                return Err(StdError::generic_err("ReinvestIdle does not accept funds"));
+            }
+            execute::reinvest_idle(deps, env, info.sender, amount)
+        },
         ExecuteMsg::RedelegateInactive {
             limit,
             exclude,

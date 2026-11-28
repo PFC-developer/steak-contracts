@@ -127,8 +127,10 @@ pub enum ExecuteMsg {
         validator_to: String,
     },
     /// Owner only. Delegate native that sits in the contract unaccounted for (see
-    /// `QueryMsg::IdleFunds`) so it earns for current holders. `amount` defaults to all of it and
-    /// may not exceed it. No fee is taken.
+    /// `QueryMsg::IdleFunds`). Proportional dead shares are locked in the hub at the same time, so
+    /// the sweep does not move the exchange rate: the swept value does not go to current holders
+    /// (nor back to a written-down batch); it is staked and locked. `amount` defaults to all of it
+    /// and may not exceed it. No fee is taken. Attached funds are refused.
     ReinvestIdle {
         amount: Option<Uint128>,
     },
