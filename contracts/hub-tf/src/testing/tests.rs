@@ -855,18 +855,39 @@ fn submitting_batch() {
 }
 
 #[test]
-fn submitting_empty_batch_is_rejected() {
+fn submitting_empty_batch_rolls_the_epoch_forward() {
     let mut deps = setup_test();
+    let state = State::default();
 
+    // Before the epoch ends it is still refused, as for any batch.
     let err = execute(
+        deps.as_mut(),
+        mock_env_at_timestamp(269_199),
+        mock_info("worker", &[]),
+        ExecuteMsg::SubmitBatch {},
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        StdError::generic_err("batch can only be submitted for unbonding after 269200")
+    );
+
+    let res = execute(
         deps.as_mut(),
         mock_env_at_timestamp(269_201),
         mock_info("worker", &[]),
         ExecuteMsg::SubmitBatch {},
     )
-    .unwrap_err();
+    .unwrap();
+    assert!(res.messages.is_empty());
 
-    assert_eq!(err, StdError::generic_err("cannot submit an empty unbond batch"));
+    // Same batch id, nothing burned, next submission one epoch (259200s) from now.
+    let pending = state.pending_batch.load(deps.as_ref().storage).unwrap();
+    assert_eq!(pending, PendingBatch {
+        id: 1,
+        usteak_to_burn: Uint128::zero(),
+        est_unbond_start_time: 269_201 + 259_200,
+    });
 }
 
 #[test]

@@ -1,6 +1,7 @@
 # changelog
 
 ## 3.0.22
+* `SubmitBatch` on an empty batch rolls the epoch forward and succeeds instead of erroring, so keepers that call it every epoch keep working and the first request after a quiet period still waits a full epoch
 * `SubmitBatch` defers (with a retry time) while 7 earlier batches are still unbonding, instead of failing the whole batch on the staking module's per-validator unbonding-entry limit
 * bonding with zero derivative supply mints 1:1 even if dust is still delegated; a bond too small to mint any token is refused instead of being swallowed
 * new owner-only `BurnStraySteak {}`: burns derivative tokens the hub holds beyond those queued for unbonding (sent to it directly, otherwise unredeemable)
