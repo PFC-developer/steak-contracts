@@ -2751,11 +2751,7 @@ fn migration_shares_an_unattributable_shortfall_pro_rata() {
 
     // The migration block only records the newly matured batch: its payout may arrive at EndBlock.
     let res = migrate(deps.as_mut(), env.clone(), Default::default()).unwrap();
-    assert!(
-        res.attributes
-            .iter()
-            .any(|a| a.key == "legacy_reconciled_written_down" && a.value == "pending")
-    );
+    assert!(res.attributes.iter().any(|a| a.key == "pool_written_down" && a.value == "pending"));
     assert!(NATIVE_RESERVED.may_load(deps.as_ref().storage).unwrap().is_none());
 
     // Reconciled funds cannot leave while the reserve is unknown.
@@ -2775,12 +2771,10 @@ fn migration_shares_an_unattributable_shortfall_pro_rata() {
         )
     );
 
-    // In a later block, Reconcile drives the initialisation: one call sums, one applies.
+    // In a later block, one Reconcile finishes the initialisation (a short history fits in one
+    // call).
     let mut later = env;
     later.block.height += 1;
-    execute(deps.as_mut(), later.clone(), mock_info("anyone", &[]), ExecuteMsg::Reconcile {})
-        .unwrap();
-    assert!(NATIVE_RESERVED.may_load(deps.as_ref().storage).unwrap().is_none());
     let res =
         execute(deps.as_mut(), later.clone(), mock_info("anyone", &[]), ExecuteMsg::Reconcile {})
             .unwrap();
@@ -2788,7 +2782,7 @@ fn migration_shares_an_unattributable_shortfall_pro_rata() {
         Event::new("steakhub/reserve_initialization")
             .add_attribute("status", "done")
             .add_attribute("native_reserved", "2200")
-            .add_attribute("legacy_reconciled_written_down", "500")
+            .add_attribute("pool_written_down", "500")
     ]);
 
     // 500 shared over 1000 / 1000 / 700: floor(500 * 1000 / 2700) = 185, then 370 - 185 = 185,
@@ -2808,9 +2802,7 @@ fn migration_shares_an_unattributable_shortfall_pro_rata() {
 
     // Running the migration again changes nothing.
     let res = migrate(deps.as_mut(), later.clone(), Default::default()).unwrap();
-    assert!(
-        res.attributes.iter().any(|a| a.key == "legacy_reconciled_written_down" && a.value == "0")
-    );
+    assert!(res.attributes.iter().any(|a| a.key == "pool_written_down" && a.value == "0"));
     assert_eq!(
         state.previous_batches.load(deps.as_ref().storage, 1u64).unwrap().amount_unclaimed,
         Uint128::new(815)
@@ -3094,4 +3086,15 @@ fn withdrawing_a_batch_observed_earlier_asks_for_reconcile() {
             "batch(es) 1 matured and await Reconcile; call Reconcile, then withdraw"
         )
     );
+}
+
+#[test]
+fn migration_initializes_the_reserve_in_one_call_for_a_short_history() {
+    let mut deps = setup_test();
+    // A deployed hub with no batches (or a handful) must not be left with withdrawals blocked
+    // until someone sends a separate Reconcile.
+    NATIVE_RESERVED.remove(deps.as_mut().storage);
+    let res = migrate(deps.as_mut(), mock_env(), Default::default()).unwrap();
+    assert!(res.attributes.iter().any(|a| a.key == "pool_written_down" && a.value == "0"));
+    assert_eq!(NATIVE_RESERVED.load(deps.as_ref().storage).unwrap(), Uint128::zero());
 }

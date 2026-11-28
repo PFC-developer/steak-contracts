@@ -37,6 +37,9 @@ pub(crate) struct ReserveInit {
     /// rounding).
     #[serde(default)]
     pub cumulative: Uint128,
+    /// Batches that matured after `pool_time` but before the sum finished; they join the pool.
+    #[serde(default)]
+    pub joined: Vec<u64>,
 }
 
 pub(crate) const RESERVE_INIT: Item<ReserveInit> = Item::new("reserve_init_001");
