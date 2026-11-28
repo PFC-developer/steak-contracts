@@ -152,7 +152,10 @@ pub enum ExecuteMsg {
     /// migration that finds an already-matured batch, a later-block `Reconcile` also finalises the
     /// one-time reserve initialisation before withdrawals resume.
     Reconcile {},
-    /// Submit the current pending batch of unbonding requests to be unbonded
+    /// Submit the current pending batch of unbonding requests to be unbonded. Refused before the
+    /// batch's `est_unbond_start_time`. After it, an empty batch is not submitted: its start time
+    /// moves one `epoch_period` past now (same batch id, event `steakhub/empty_batch_skipped`), so
+    /// a keeper calling this every epoch never fails and the next request still waits for others.
     SubmitBatch {},
     /// Set unbond period
     SetUnbondPeriod {
