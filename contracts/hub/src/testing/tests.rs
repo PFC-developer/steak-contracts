@@ -1508,20 +1508,18 @@ fn removing_validator() {
         .unwrap();
 
     assert_eq!(res.messages.len(), 2);
-    assert_eq!(
-        res.messages[0],
-        SubMsg::reply_on_success(
-            Redelegation::new("charlie", "alice", 170833, "uxyz").to_cosmos_msg(),
-            REPLY_REGISTER_RECEIVED_COINS,
-        ),
-    );
-    assert_eq!(
-        res.messages[1],
-        SubMsg::reply_on_success(
-            Redelegation::new("charlie", "bob", 170833, "uxyz").to_cosmos_msg(),
-            REPLY_REGISTER_RECEIVED_COINS,
-        ),
-    );
+    assert_eq!(res.messages[0], SubMsg {
+        id: REPLY_REDELEGATE_INACTIVE_BASE,
+        msg: Redelegation::new("charlie", "alice", 170833, "uxyz").to_cosmos_msg(),
+        gas_limit: None,
+        reply_on: ReplyOn::Always,
+    },);
+    assert_eq!(res.messages[1], SubMsg {
+        id: REPLY_REDELEGATE_INACTIVE_BASE + 1,
+        msg: Redelegation::new("charlie", "bob", 170833, "uxyz").to_cosmos_msg(),
+        gas_limit: None,
+        reply_on: ReplyOn::Always,
+    },);
 
     let validators = state.validators.load(deps.as_ref().storage).unwrap();
     assert_eq!(validators, vec![String::from("alice"), String::from("bob")],);
@@ -4146,6 +4144,8 @@ fn staking_operations_fail_closed_when_no_active_validator_is_bonded() {
     // removal mutates the validator sets and then discovers there is no safe destination.
     let mut remove_deps = setup_test();
     remove_deps.querier.set_bonded_validators(&[]);
+    // charlie holds stake that would need a destination.
+    remove_deps.querier.set_staking_delegations(&[Delegation::new("charlie", 200, "uxyz")]);
     let remove_err = execute(
         remove_deps.as_mut(),
         mock_env(),
@@ -4156,4 +4156,19 @@ fn staking_operations_fail_closed_when_no_active_validator_is_bonded() {
     )
     .unwrap_err();
     assert_eq!(remove_err, expected);
+}
+
+#[test]
+fn removing_a_validator_without_stake_needs_no_bonded_destination() {
+    let mut deps = setup_test();
+    // Nothing bonded on chain, and charlie holds nothing: there is nothing to move, so the
+    // removal goes through.
+    deps.querier.set_bonded_validators(&[]);
+    deps.querier.set_staking_delegations(&[]);
+    let res =
+        execute(deps.as_mut(), mock_env(), mock_info("larry", &[]), ExecuteMsg::RemoveValidator {
+            validator: "charlie".to_string(),
+        })
+        .unwrap();
+    assert!(res.messages.is_empty());
 }

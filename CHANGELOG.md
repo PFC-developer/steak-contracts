@@ -1,6 +1,7 @@
 # changelog
 
 ## 3.0.22
+* `RemoveValidator` needs a bonded destination only when the removed validator holds stake, and sends its moves as isolated submessages (a refused move is skipped and reported; what stays on the removed validator can be moved with `RedelegateInactive`); hub-tf `ReturnDenom` with no bonded validator records the returned dust for the next harvest instead of reverting; `Rebalance` reports `amount_planned`
 * bond, `ReinvestIdle` and `RemoveValidator` only send stake to active validators the chain currently has bonded, and refuse cleanly when none is available, instead of falling back to the smallest delegation, which was often a slashed, jailed validator; `RemoveValidator` no longer redelegates onto paused validators
 * `Rebalance` is owner only (anyone could lock validators against redelegation for an unbonding period), drains every validator outside the bonded active set in full even when each destination's deficit is below `minimum`, tops up active validators that hold nothing, refuses when no bonded active target exists, and sends each move as an isolated submessage (max 50 per call)
 * `pfc-steak` 3.0.22: new `ExecuteMsg::ReinvestIdle`, `QueryMsg::IdleFunds` and `IdleFundsResponse`; `ReinvestIdle` refuses attached funds; the reinvest delegation registers the rewards it withdraws like every other staking message

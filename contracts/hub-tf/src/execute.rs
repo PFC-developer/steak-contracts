@@ -216,7 +216,28 @@ pub fn bond(
     // The code for linear search is a bit uglier than using `sort_by` but cheaper: O(n) vs O(n *
     // log(n))
     let delegations_all = query_all_delegations(&deps.querier, &env.contract.address)?;
-    let validators = bonded_targets(&deps.querier, validators)?;
+    let validators = match bonded_targets(&deps.querier, validators, &[]) {
+        Ok(validators) => validators,
+        // `ReturnDenom` (the dust collector handing back swapped dust) mints nothing; with no
+        // bonded validator to stake it on, record it as rewards for the next harvest instead of
+        // reverting the dust return.
+        Err(_) if !mint_steak => {
+            state.unlocked_coins.update(deps.storage, |coins| -> StdResult<_> {
+                let mut coins = Coins(coins);
+                coins.add(&Coin::new(amount_to_bond.u128(), &denom))?;
+                Ok(coins.0)
+            })?;
+            return Ok(Response::new()
+                .add_event(
+                    Event::new("steakhub/bonded-nomint-recorded")
+                        .add_attribute("from", receiver)
+                        .add_attribute("denom", &denom)
+                        .add_attribute("amount", amount_to_bond),
+                )
+                .add_attribute("action", "steakhub/bond-nomint"));
+        },
+        Err(err) => return Err(err),
+    };
     let delegations = query_delegations(&deps.querier, &validators, &env.contract.address, &denom)?;
 
     // Dead shares (see `compute_first_mint`) are nobody's; only other supply needs backing.
@@ -569,10 +590,12 @@ fn reinvest_excluding(deps: DepsMut, env: Env, exclude: &[String]) -> StdResult<
 pub(crate) fn bonded_targets(
     querier: &cosmwasm_std::QuerierWrapper,
     active: Vec<String>,
+    exclude: &[String],
 ) -> StdResult<Vec<String>> {
-    let bonded: Vec<String> =
+    let bonded: std::collections::HashSet<String> =
         querier.query_all_validators()?.into_iter().map(|v| v.address).collect();
-    let targets: Vec<String> = active.iter().filter(|v| bonded.contains(v)).cloned().collect();
+    let targets: Vec<String> =
+        active.into_iter().filter(|v| bonded.contains(v) && !exclude.contains(v)).collect();
     if targets.is_empty() {
         return Err(StdError::generic_err("cannot send stake without a bonded active validator"));
     }
@@ -723,14 +746,7 @@ pub(crate) fn bonded_active_targets(
     for v in VALIDATORS_ACTIVE.items(deps.storage, None, None, Order::Ascending) {
         active.push(v?);
     }
-    let bonded: Vec<String> =
-        deps.querier.query_all_validators()?.into_iter().map(|v| v.address).collect();
-    let targets: Vec<String> =
-        active.into_iter().filter(|v| bonded.contains(v) && !exclude.contains(v)).collect();
-    if targets.is_empty() {
-        return Err(StdError::generic_err("cannot reinvest without a bonded active validator"));
-    }
-    Ok(targets)
+    bonded_targets(&deps.querier, active, exclude)
 }
 
 /// Native sitting in the contract that nothing accounts for: not delegated, not recorded as
@@ -803,7 +819,7 @@ pub fn reinvest_idle(
     if validators.is_empty() {
         return Err(StdError::generic_err("cannot reinvest without an active validator"));
     }
-    let validators = bonded_targets(&deps.querier, validators)?;
+    let validators = bonded_targets(&deps.querier, validators, &[])?;
     let target_delegations =
         query_delegations(&deps.querier, &validators, &env.contract.address, &idle.denom)?;
     let target =
@@ -1722,7 +1738,7 @@ pub fn rebalance(deps: DepsMut, env: Env, sender: Addr, minimum: Uint128) -> Std
     if validators_active.is_empty() {
         return Err(StdError::generic_err("cannot rebalance without an active validator"));
     }
-    let targets = bonded_targets(&deps.querier, validators_active)?;
+    let targets = bonded_targets(&deps.querier, validators_active, &[])?;
 
     let denom = state.denom.load(deps.storage)?;
     let delegations = query_all_delegations(&deps.querier, &env.contract.address)?;
@@ -1734,7 +1750,7 @@ pub fn rebalance(deps: DepsMut, env: Env, sender: Addr, minimum: Uint128) -> Std
     let amount: u128 = new_redelegations.iter().map(|rd| rd.amount).sum();
     events.push(
         Event::new("steakhub/rebalanced")
-            .add_attribute("amount_moved", amount.to_string())
+            .add_attribute("amount_planned", amount.to_string())
             .add_attribute("redelegations", new_redelegations.len().to_string()),
     );
 
@@ -1934,34 +1950,30 @@ pub fn remove_validator(
     }
     VALIDATORS.remove(deps.storage, &validator)?;
     VALIDATORS_ACTIVE.remove(deps.storage, &validator)?;
-    // Spread the removed stake over the active validators the chain has bonded, never onto a
-    // paused or jailed one.
-    let validators = bonded_targets(&deps.querier, active_validator_list(deps.storage)?)?;
-    if validators.is_empty() {
-        return Err(StdError::generic_err("no active validator to redelegate to"));
-    }
-
-    let delegations = query_delegations(&deps.querier, &validators, &env.contract.address, &denom)?;
+    // Only stake that is actually there needs a destination: a validator holding nothing is
+    // removed even when no active validator is bonded right now.
     let delegation_to_remove =
         query_delegation(&deps.querier, &validator, &env.contract.address, &denom)?;
-    let new_redelegations =
-        compute_redelegations_for_removal(&delegation_to_remove, &delegations, &denom);
-
-    let redelegate_submsgs = new_redelegations
-        .iter()
-        .map(|d| SubMsg {
-            id: REPLY_REGISTER_RECEIVED_COINS,
-            msg: d.to_cosmos_msg(),
-            gas_limit: None,
-            reply_on: ReplyOn::Success,
-        })
-        .collect::<Vec<_>>();
-
-    let event = Event::new("steak/validator_removed").add_attribute("validator", validator);
+    let (submsgs, mut events) = if delegation_to_remove.amount == 0 {
+        (vec![], vec![])
+    } else {
+        // Spread the removed stake over the active validators the chain has bonded, never onto a
+        // paused or jailed one. Each move is isolated (see `RedelegateInactive`): one the staking
+        // module refuses is skipped and reported, and what stays on the removed (now inactive)
+        // validator can be moved later with `RedelegateInactive`.
+        let validators = bonded_targets(&deps.querier, active_validator_list(deps.storage)?, &[])?;
+        let delegations =
+            query_delegations(&deps.querier, &validators, &env.contract.address, &denom)?;
+        let mut new_redelegations =
+            compute_redelegations_for_removal(&delegation_to_remove, &delegations, &denom);
+        new_redelegations.truncate(REDELEGATE_INACTIVE_MAX_LIMIT as usize);
+        isolated_redelegations(&new_redelegations)
+    };
+    events.push(Event::new("steak/validator_removed").add_attribute("validator", validator));
 
     Ok(Response::new()
-        .add_submessages(redelegate_submsgs)
-        .add_event(event)
+        .add_submessages(submsgs)
+        .add_events(events)
         .add_attribute("action", "steakhub/remove_validator"))
 }
 
