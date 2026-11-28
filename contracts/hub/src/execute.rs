@@ -171,13 +171,25 @@ pub fn bond(
 
     // Query the current supply of Steak and compute the amount to mint
     let usteak_supply = query_cw20_total_supply(&deps.querier, &steak_token)?;
-    if !usteak_supply.is_zero() && all_delegations.iter().all(|d| d.amount == 0) {
+    // Dead shares (see `compute_first_mint`) are nobody's; only other supply needs backing.
+    let dead_now = DEAD_SHARES.may_load(deps.storage)?.unwrap_or_default();
+    if usteak_supply > dead_now && all_delegations.iter().all(|d| d.amount == 0) {
         return Err(StdError::generic_err(
             "cannot bond while derivative supply exists without delegated backing",
         ));
     }
     let pending =
         pending_rewards_net(deps.as_ref(), &env, &all_delegations, &denom, amount_to_bond)?;
+    // Only dead shares left and nothing tracked behind them (e.g. their stake was slashed away):
+    // they are worthless, so burn them and bond into an empty hub.
+    let tracked = Uint128::new(total_delegated(&all_delegations)?).checked_add(pending)?;
+    let burn_dead = !dead_now.is_zero() && usteak_supply <= dead_now && tracked.is_zero();
+    let usteak_supply = if burn_dead {
+        DEAD_SHARES.save(deps.storage, &Uint128::zero())?;
+        usteak_supply.checked_sub(dead_now)?
+    } else {
+        usteak_supply
+    };
     let (usteak_to_mint, dead_shares) = if usteak_supply.is_zero() {
         let existing = Uint128::new(total_delegated(&all_delegations)?)
             .checked_add(pending)?
@@ -283,6 +295,18 @@ pub fn bond(
         .add_attribute("dead_shares", dead_shares);
 
     let mut mint_msgs = mint_msgs;
+    if burn_dead {
+        mint_msgs.insert(
+            0,
+            CosmosMsg::Wasm(WasmMsg::Execute {
+                contract_addr: steak_token.to_string(),
+                msg: to_json_binary(&Cw20ExecuteMsg::Burn {
+                    amount: dead_now,
+                })?,
+                funds: vec![],
+            }),
+        );
+    }
     if !dead_shares.is_zero() {
         // Dead shares are minted to the hub itself and never redeemed.
         mint_msgs.push(CosmosMsg::Wasm(WasmMsg::Execute {
@@ -376,7 +400,8 @@ pub fn reinvest_if_needed(deps: DepsMut, env: Env, exclude: Vec<String>) -> StdR
     }
     // Likewise when every active validator is jailed or unbonded: keep the rewards recorded for a
     // later harvest rather than revert this one.
-    if bonded_active_targets(deps.as_ref(), &exclude).is_err() {
+    let fee = State::default().fee_rate.load(deps.storage)?;
+    if fee < Decimal::one() && bonded_active_targets(deps.as_ref(), &exclude).is_err() {
         return Ok(Response::new()
             .add_attribute("action", "steakhub/reinvest_not_needed")
             .add_attribute("reason", "no bonded active validator"));
@@ -522,18 +547,27 @@ pub(crate) fn pending_rewards_net(
     Ok(gross.saturating_sub(fee_amount))
 }
 
-/// Native that unbonding batches are owed out of the balance. Reconciled batches come from the
-/// running `NATIVE_RESERVED` total; unreconciled ones (few: only those still unbonding or awaiting
-/// `Reconcile`) are summed. With `Some(now)`, an unreconciled batch is left out only when its
-/// funds certainly have not arrived: its unbonding end was reported by the chain
-/// (`CHAIN_REPORTED_END`) and is still after `now`. A batch whose end is only the configured
-/// estimate (submitted before this version, or on a chain that reports no completion time) may
-/// have been paid early, so it counts until reconciled. With `None`, every unreconciled batch
-/// counts. Returns `None` while the one-time reserve initialisation is pending, when what is owed
-/// is not known yet.
+/// Which unbonding batches count as owed out of the current balance.
+#[derive(Clone, Copy)]
+pub(crate) enum Owed {
+    /// Batches whose payout is due by `now` (reconciled, or unreconciled with their end at or
+    /// before `now`). Used to cap bonding recorded rewards: those are tracked and really in the
+    /// balance, so only funds a due batch needs must be left alone.
+    DueBy(u64),
+    /// Every batch whose funds could already be in the balance: all unreconciled batches except
+    /// one whose end was reported by the chain (`CHAIN_REPORTED_END`) and is still after `now`. A
+    /// batch whose end is only the configured estimate may have been paid early. Used before
+    /// treating any untracked balance as idle.
+    PossiblyPaid(u64),
+}
+
+/// Native that unbonding batches are owed out of the balance (see `Owed`). Reconciled batches
+/// come from the running `NATIVE_RESERVED` total; unreconciled ones (few: only those still
+/// unbonding or awaiting `Reconcile`) are summed. Returns `None` while the one-time reserve
+/// initialisation is pending, when what is owed is not known yet.
 pub(crate) fn native_owed_to_batches(
     storage: &dyn cosmwasm_std::Storage,
-    now: Option<u64>,
+    mode: Owed,
 ) -> StdResult<Option<Uint128>> {
     let reserved = match NATIVE_RESERVED.may_load(storage)? {
         Some(reserved) => reserved,
@@ -549,14 +583,14 @@ pub(crate) fn native_owed_to_batches(
         .collect::<StdResult<Vec<Batch>>>()?;
     let mut owed = reserved;
     for batch in unreconciled {
-        let certainly_unpaid = match now {
-            Some(now) => {
-                batch.est_unbond_end_time > now
-                    && CHAIN_REPORTED_END.may_load(storage, batch.id)?.unwrap_or(false)
+        let counts = match mode {
+            Owed::DueBy(now) => batch.est_unbond_end_time <= now,
+            Owed::PossiblyPaid(now) => {
+                batch.est_unbond_end_time <= now
+                    || !CHAIN_REPORTED_END.may_load(storage, batch.id)?.unwrap_or(false)
             },
-            None => false,
         };
-        if !certainly_unpaid {
+        if counts {
             owed = owed.checked_add(batch.amount_unclaimed)?;
         }
     }
@@ -573,12 +607,15 @@ pub(crate) fn reinvestable(
     deposit: Uint128,
 ) -> StdResult<(Uint128, Uint128)> {
     let unlocked = Coins(State::default().unlocked_coins.load(deps.storage)?).find(denom).amount;
-    let available = match native_owed_to_batches(deps.storage, Some(env.block.time.seconds()))? {
-        Some(owed) => get_denom_balance(&deps.querier, env.contract.address.clone(), denom.into())?
-            .saturating_sub(deposit)
-            .saturating_sub(owed),
-        None => Uint128::zero(),
-    };
+    let available =
+        match native_owed_to_batches(deps.storage, Owed::DueBy(env.block.time.seconds()))? {
+            Some(owed) => {
+                get_denom_balance(&deps.querier, env.contract.address.clone(), denom.into())?
+                    .saturating_sub(deposit)
+                    .saturating_sub(owed)
+            },
+            None => Uint128::zero(),
+        };
     Ok((unlocked, unlocked.min(available)))
 }
 
@@ -622,7 +659,8 @@ fn idle_native_with_deposit(
     // Only batches whose funds can already be in the balance (reconciled, or matured by now):
     // batches still unbonding have not been paid yet. This relies on accurate batch end times.
     let owed_to_batches =
-        native_owed_to_batches(deps.storage, Some(env.block.time.seconds()))?.unwrap_or(balance);
+        native_owed_to_batches(deps.storage, Owed::PossiblyPaid(env.block.time.seconds()))?
+            .unwrap_or(balance);
     Ok(IdleFundsResponse {
         denom,
         balance,
@@ -758,8 +796,26 @@ fn parse_coin_receiving_event(env: &Env, event: &Event) -> StdResult<Coins> {
         .ok_or_else(|| StdError::generic_err("cannot find `amount` attribute"))?
         .value;
 
+    // Parse coin by coin: an amount like `12uxyz,3<denom the parser rejects>` must still record
+    // the native 12 rather than drop the whole event.
     let amount = if *receiver == env.contract.address {
-        Coins::from_str(amount_str)?
+        match Coins::from_str(amount_str) {
+            Ok(coins) => coins,
+            Err(err) => {
+                let mut coins = Coins(vec![]);
+                let mut parsed_any = false;
+                for part in amount_str.split(',') {
+                    if let Ok(coin) = Coins::from_str(part.trim()) {
+                        coins.add_many(&coin)?;
+                        parsed_any = true;
+                    }
+                }
+                if !parsed_any {
+                    return Err(err);
+                }
+                coins
+            },
+        }
     } else {
         Coins(vec![])
     };
@@ -1069,6 +1125,7 @@ pub fn reconcile(mut deps: DepsMut, env: Env) -> StdResult<Response> {
         batch.reconciled = true;
         state.previous_batches.save(deps.storage, batch.id, batch)?;
         RECONCILE_OBSERVED_HEIGHTS.remove(deps.storage, batch.id);
+        CHAIN_REPORTED_END.remove(deps.storage, batch.id);
     }
     let newly_reserved: Uint128 = batches.iter().map(|b| b.amount_unclaimed).sum();
     let native_reserved = native_reserved.checked_add(newly_reserved)?;
@@ -1293,6 +1350,7 @@ pub(crate) fn advance_reserve_initialization(
             if !batch.reconciled {
                 batch.reconciled = true;
                 RECONCILE_OBSERVED_HEIGHTS.remove(deps.storage, batch.id);
+                CHAIN_REPORTED_END.remove(deps.storage, batch.id);
             }
             state.previous_batches.save(deps.storage, batch.id, &batch)?;
         }

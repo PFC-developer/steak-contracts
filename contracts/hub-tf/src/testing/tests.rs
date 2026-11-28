@@ -3718,3 +3718,108 @@ fn recorded_rewards_count_in_bond_pricing_while_batches_are_owed_the_balance() {
     let minted = bonded.attributes.iter().find(|a| a.key == "usteak_minted").unwrap();
     assert_eq!(minted.value, "1000");
 }
+
+#[test]
+fn an_in_flight_legacy_batch_does_not_stop_harvest_compounding() {
+    let mut deps = setup_test();
+    let state = State::default();
+    deps.querier.set_staking_delegations(&[
+        Delegation::new("alice", 100, "uxyz"),
+        Delegation::new("bob", 200, "uxyz"),
+    ]);
+    // charlie (bonded, no delegation yet) is the smallest. A batch submitted before the upgrade,
+    // still unbonding (no chain-reported end): its 5000 is not here yet. Recorded rewards (50)
+    // are, and can be bonded.
+    let batch = Batch {
+        id: 1,
+        reconciled: false,
+        total_shares: Uint128::new(5000),
+        amount_unclaimed: Uint128::new(5000),
+        est_unbond_end_time: u64::MAX,
+    };
+    previous_batches().save(deps.as_mut().storage, batch.id, &batch).unwrap();
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![Coin::new(50, "uxyz")]).unwrap();
+    deps.querier.set_bank_balances(&[Coin::new(50, "uxyz")]);
+
+    let res = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info(MOCK_CONTRACT_ADDR, &[]),
+        ExecuteMsg::Callback(CallbackMsg::ReinvestIfNeeded {
+            exclude: vec![],
+        }),
+    )
+    .unwrap();
+    assert_eq!(res.messages[0].msg, Delegation::new("charlie", 45, "uxyz").to_cosmos_msg());
+    // ...while for sweeping untracked native the same batch still counts as possibly paid.
+    let idle: IdleFundsResponse = query_helper(deps.as_ref(), QueryMsg::IdleFunds {});
+    assert_eq!(idle.owed_to_batches, Uint128::new(5000));
+}
+
+#[test]
+fn worthless_dead_shares_are_burned_so_bonding_can_restart() {
+    let mut deps = setup_test();
+    let state = State::default();
+    // Everyone left; the dead shares' stake was then slashed away: supply is dead shares only and
+    // nothing tracked backs them.
+    deps.querier.set_staking_delegations(&[]);
+    state.steak_minted.save(deps.as_mut().storage, &Uint128::new(1000)).unwrap();
+    DEAD_SHARES.save(deps.as_mut().storage, &Uint128::new(1000)).unwrap();
+    deps.querier.set_bank_balances(&[Coin::new(2000, "uxyz")]);
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![]).unwrap();
+
+    let res = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info("user_1", &[Coin::new(2000, "uxyz")]),
+        ExecuteMsg::Bond {
+            receiver: None,
+            exec_msg: None,
+        },
+    )
+    .unwrap();
+    let bonded = res.events.iter().find(|e| e.ty == "steakhub/bonded").unwrap();
+    let attr = |key: &str| {
+        bonded.attributes.iter().find(|a| a.key == key).map(|a| a.value.clone()).unwrap()
+    };
+    assert_eq!(attr("usteak_minted"), "1000");
+    assert_eq!(attr("dead_shares"), "1000");
+    assert_eq!(DEAD_SHARES.load(deps.as_ref().storage).unwrap(), Uint128::new(1000));
+    // The 1000 worthless dead shares are burned, then 2000 is minted to the hub: 1000 for the
+    // bonder (the rest of the deposit after the new unbacked minimum) and 1000 new dead shares.
+    assert_eq!(res.messages[1].msg, burn_steak_msg_for_test(1000));
+    assert_eq!(state.steak_minted.load(deps.as_ref().storage).unwrap(), Uint128::new(2000));
+}
+
+#[test]
+fn a_partly_unparsable_coin_received_amount_still_records_the_native() {
+    let mut deps = setup_test();
+    let state = State::default();
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![]).unwrap();
+
+    reply(deps.as_mut(), mock_env(), cosmwasm_std::Reply {
+        id: REPLY_REGISTER_RECEIVED_COINS,
+        result: cosmwasm_std::SubMsgResult::Ok(cosmwasm_std::SubMsgResponse {
+            events: vec![
+                cosmwasm_std::Event::new("coin_received")
+                    .add_attribute("receiver", MOCK_CONTRACT_ADDR)
+                    .add_attribute("amount", "12uxyz,3"),
+            ],
+            data: None,
+        }),
+    })
+    .unwrap();
+    assert_eq!(state.unlocked_coins.load(deps.as_ref().storage).unwrap(), vec![Coin::new(
+        12, "uxyz"
+    )]);
+}
+
+fn burn_steak_msg_for_test(amount: u128) -> CosmosMsg {
+    <MsgBurn as Into<CosmosMsg>>::into(MsgBurn {
+        sender: "cosmos2contract".to_string(),
+        amount: Some(denom::Coin {
+            denom: "factory/cosmos2contract/boneXYZ".to_string(),
+            amount: amount.to_string(),
+        }),
+    })
+}

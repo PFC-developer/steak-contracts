@@ -299,8 +299,9 @@ pub struct IdleFundsResponse {
     pub balance: Uint128,
     /// Rewards recorded and waiting for the next reinvest
     pub unlocked: Uint128,
-    /// Owed to reconciled batches plus unreconciled batches whose estimated end time has passed.
-    /// While reserve initialization is pending this equals `balance`, making `idle` zero.
+    /// Owed to batches whose funds could already be in the balance: reconciled ones, and every
+    /// unreconciled one except a batch whose chain-reported unbonding end is still ahead. While
+    /// reserve initialization is pending this equals `balance`, making `idle` zero.
     pub owed_to_batches: Uint128,
     /// `balance - unlocked - owed_to_batches`, floored at zero
     pub idle: Uint128,
