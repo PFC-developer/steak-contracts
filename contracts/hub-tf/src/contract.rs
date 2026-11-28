@@ -24,6 +24,8 @@ pub const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const REPLY_INSTANTIATE_TOKEN: u64 = 1;
 pub const REPLY_REGISTER_RECEIVED_COINS: u64 = 2;
 pub const REPLY_SUBMIT_BATCH: u64 = 3;
+/// Each undelegation `SubmitBatch` sends; its reply carries the real unbonding completion time.
+pub const REPLY_UNDELEGATE: u64 = 5;
 /// `RedelegateInactive` uses one reply id per planned redelegation, starting here, so the reply
 /// handler can say which redelegation the staking module refused.
 pub const REPLY_REDELEGATE_INACTIVE_BASE: u64 = 1_000;
@@ -186,6 +188,7 @@ pub fn reply(deps: DepsMut, env: Env, reply: Reply) -> StdResult<Response> {
             execute::register_received_coins(deps, env, unwrap_reply(reply)?.events)
         },
         REPLY_SUBMIT_BATCH => Ok(execute::submit_batch_deferred(reply)),
+        REPLY_UNDELEGATE => execute::register_undelegation(deps, env, reply),
         id if is_redelegate_inactive_reply(id) => {
             execute::redelegate_inactive_reply(deps, env, reply)
         },

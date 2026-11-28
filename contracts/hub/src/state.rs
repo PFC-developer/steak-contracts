@@ -48,6 +48,10 @@ pub(crate) struct ReserveInit {
 
 pub(crate) const RESERVE_INIT: Item<ReserveInit> = Item::new("reserve_init_001");
 
+/// The batch `SubmitBatch` is undelegating, and the latest unbonding completion time the staking
+/// module reported for it so far (see `register_undelegation`).
+pub(crate) const SUBMITTED_BATCH: Item<(u64, Option<u64>)> = Item::new("submitted_batch_001");
+
 pub(crate) struct State<'a> {
     /// Account who can call certain privileged functions
     pub owner: Item<'a, Addr>,

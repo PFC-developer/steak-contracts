@@ -21,7 +21,8 @@ use super::{
 use crate::{
     contract::{
         REDELEGATE_INACTIVE_MAX_LIMIT, REPLY_INSTANTIATE_TOKEN, REPLY_REDELEGATE_INACTIVE_BASE,
-        REPLY_REGISTER_RECEIVED_COINS, REPLY_SUBMIT_BATCH, execute, instantiate, migrate, reply,
+        REPLY_REGISTER_RECEIVED_COINS, REPLY_SUBMIT_BATCH, REPLY_UNDELEGATE, execute, instantiate,
+        migrate, reply,
     },
     helpers::{parse_coin, parse_received_fund},
     math::{
@@ -1005,21 +1006,21 @@ fn submitting_batch() {
         res.messages[0],
         SubMsg::reply_on_success(
             Undelegation::new("alice", 31732, "uxyz").to_cosmos_msg(),
-            REPLY_REGISTER_RECEIVED_COINS
+            REPLY_UNDELEGATE
         )
     );
     assert_eq!(
         res.messages[1],
         SubMsg::reply_on_success(
             Undelegation::new("bob", 31733, "uxyz").to_cosmos_msg(),
-            REPLY_REGISTER_RECEIVED_COINS
+            REPLY_UNDELEGATE
         )
     );
     assert_eq!(
         res.messages[2],
         SubMsg::reply_on_success(
             Undelegation::new("charlie", 31732, "uxyz").to_cosmos_msg(),
-            REPLY_REGISTER_RECEIVED_COINS,
+            REPLY_UNDELEGATE,
         )
     );
     assert_eq!(res.messages[3], SubMsg {
