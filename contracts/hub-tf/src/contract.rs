@@ -215,7 +215,7 @@ pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
 }
 
 #[entry_point]
-pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> StdResult<Response> {
+pub fn migrate(mut deps: DepsMut, env: Env, _msg: MigrateMsg) -> StdResult<Response> {
     let contract_version = get_contract_version(deps.storage).unwrap_or_else(|_| ContractVersion {
         contract: "steak-hub-tf".to_string(),
         version: "0".to_string(),
@@ -261,12 +261,36 @@ pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> StdResult<Response
         }
     }
 
+    let reserve_initialization =
+        execute::prepare_native_reserved_initialization(deps.branch(), &env)?;
+    let (native_reserved, legacy_written_down) = match &reserve_initialization {
+        execute::ReserveInitStep::Done {
+            reserved,
+            written_down,
+            ..
+        } => (reserved.to_string(), written_down.to_string()),
+        _ => ("pending".to_string(), "pending".to_string()),
+    };
+
+    let reserve_pending = native_reserved == "pending";
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
 
     Ok(Response::new()
+        .add_event(execute::reserve_initialization_event(&reserve_initialization))
         .add_attribute("previous_contract_name", &contract_version.contract)
         .add_attribute("previous_contract_version", &contract_version.version)
         .add_attribute("new_contract_name", CONTRACT_NAME)
         .add_attribute("new_contract_version", CONTRACT_VERSION)
-        .add_attribute("validator_registry_repairs", validator_registry_repairs.to_string()))
+        .add_attribute("validator_registry_repairs", validator_registry_repairs.to_string())
+        .add_attribute("native_reserved", native_reserved)
+        .add_attribute("pool_written_down", legacy_written_down)
+        .add_attribute(
+            "next_step",
+            if reserve_pending {
+                "send Reconcile in later blocks until steakhub/reserve_initialization status=done; \
+                 withdrawals wait until then"
+            } else {
+                "none"
+            },
+        ))
 }
