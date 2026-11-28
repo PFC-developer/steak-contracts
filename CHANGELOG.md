@@ -1,6 +1,7 @@
 # changelog
 
 ## 3.0.22
+* `SubmitBatch` on an empty batch rolls the epoch forward and succeeds instead of erroring, so keepers that call it every epoch keep working and the first request after a quiet period still waits a full epoch
 * `pfc-steak` 3.0.22: new `ExecuteMsg::ReinvestIdle`, `QueryMsg::IdleFunds` and `IdleFundsResponse`; `ReinvestIdle` refuses attached funds; the reinvest delegation registers the rewards it withdraws like every other staking message
 * reinvest bonds recorded rewards past batches that are not due yet (only due batches are set aside), so in-flight batches from before the upgrade no longer stop compounding; idle stays conservative and treats a batch as possibly paid unless its chain-reported end is still ahead; a hub whose supply is only dead shares with nothing tracked behind them burns them on the next bond and starts over as an empty hub; a `coin_received` amount with an unparsable coin still records the coins it can parse
 * idle and reinvest treat an unreconciled batch as not yet paid only when its unbonding end came from the chain (`CHAIN_REPORTED_END`) and is still ahead; a batch whose end is only the configured estimate counts as owed until reconciled, so its early-arriving funds are never swept; bond pricing counts recorded rewards up to the balance whatever batches are owed; `ReinvestIfNeeded` also skips (keeping rewards recorded) when no active validator is bonded
