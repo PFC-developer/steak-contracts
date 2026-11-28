@@ -16,11 +16,11 @@ use crate::{
     contract::{
         REDELEGATE_INACTIVE_DEFAULT_LIMIT, REDELEGATE_INACTIVE_MAX_LIMIT,
         REPLY_REDELEGATE_INACTIVE_BASE, REPLY_REGISTER_RECEIVED_COINS, REPLY_SUBMIT_BATCH,
-        SPECIAL_SEND_MESSAGE_TO_TRANSFER,
+        REPLY_UNDELEGATE, SPECIAL_SEND_MESSAGE_TO_TRANSFER,
     },
     helpers::{
-        get_denom_balance, parse_received_fund, query_all_delegations, query_delegation,
-        query_delegations,
+        get_denom_balance, latest_unbond_completion, parse_received_fund, query_all_delegations,
+        query_delegation, query_delegations,
     },
     injective, kujira,
     math::{
@@ -29,7 +29,9 @@ use crate::{
         compute_unbond_amount, compute_undelegations, reconcile_batches,
     },
     osmosis,
-    state::{State, VALIDATORS, VALIDATORS_ACTIVE, previous_batches, unbond_requests},
+    state::{
+        SUBMITTED_BATCH, State, VALIDATORS, VALIDATORS_ACTIVE, previous_batches, unbond_requests,
+    },
     token_factory,
 };
 
@@ -630,6 +632,38 @@ pub fn submit_batch_deferred(reply: cosmwasm_std::Reply) -> Response {
         .add_event(Event::new("steakhub/submit_batch_deferred").add_attribute("reason", reason))
 }
 
+/// Reply for each undelegation `SubmitBatch` sends. The staking module reports when the unbonding
+/// actually completes (`unbond` event, `completion_time`); that, not `submit time +
+/// unbond_period`, is when the funds arrive. Set the batch's `est_unbond_end_time` to the latest
+/// completion among its undelegations, so a configured `unbond_period` that differs from the
+/// chain's cannot make `Reconcile` write the batch down before its funds are paid (or keep them
+/// waiting longer than needed). If the chain reports no completion time, the estimate stays.
+pub fn register_undelegation(deps: DepsMut, env: Env, reply: Reply) -> StdResult<Response> {
+    let events = match reply.result {
+        SubMsgResult::Ok(response) => response.events,
+        SubMsgResult::Err(err) => return Err(StdError::generic_err(err)),
+    };
+    let mut response = Response::new();
+    if let Some(completion) = latest_unbond_completion(&events) {
+        let (batch_id, seen) = SUBMITTED_BATCH.load(deps.storage)?;
+        let completion = seen.map_or(completion, |seen| seen.max(completion));
+        SUBMITTED_BATCH.save(deps.storage, &(batch_id, Some(completion)))?;
+        let mut batch = previous_batches().load(deps.storage, batch_id)?;
+        if batch.est_unbond_end_time != completion {
+            response = response.add_event(
+                Event::new("steakhub/unbond_completion_time")
+                    .add_attribute("id", batch_id.to_string())
+                    .add_attribute("estimated", batch.est_unbond_end_time.to_string())
+                    .add_attribute("completion_time", completion.to_string()),
+            );
+            batch.est_unbond_end_time = completion;
+            previous_batches().save(deps.storage, batch_id, &batch)?;
+        }
+    }
+    let _ = env;
+    Ok(response)
+}
+
 pub fn submit_batch(deps: DepsMut, env: Env) -> StdResult<Response> {
     let state = State::default();
     let denom = state.denom.load(deps.storage)?;
@@ -692,14 +726,10 @@ pub fn submit_batch(deps: DepsMut, env: Env) -> StdResult<Response> {
         &get_denom_balance(&deps.querier, env.contract.address.clone(), denom)?,
     )?;
 
+    SUBMITTED_BATCH.save(deps.storage, &(pending_batch.id, None))?;
     let undelegate_submsgs = new_undelegations
         .iter()
-        .map(|d| SubMsg {
-            id: REPLY_REGISTER_RECEIVED_COINS,
-            msg: d.to_cosmos_msg(),
-            gas_limit: None,
-            reply_on: ReplyOn::Never,
-        })
+        .map(|d| SubMsg::reply_on_success(d.to_cosmos_msg(), REPLY_UNDELEGATE))
         .collect::<Vec<_>>();
 
     let mut msgs = vec![];

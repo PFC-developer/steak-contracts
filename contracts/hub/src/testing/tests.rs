@@ -21,7 +21,8 @@ use super::{
 use crate::{
     contract::{
         REDELEGATE_INACTIVE_MAX_LIMIT, REPLY_INSTANTIATE_TOKEN, REPLY_REDELEGATE_INACTIVE_BASE,
-        REPLY_REGISTER_RECEIVED_COINS, REPLY_SUBMIT_BATCH, execute, instantiate, migrate, reply,
+        REPLY_REGISTER_RECEIVED_COINS, REPLY_SUBMIT_BATCH, REPLY_UNDELEGATE, execute, instantiate,
+        migrate, reply,
     },
     helpers::{parse_coin, parse_received_fund},
     math::{
@@ -991,21 +992,21 @@ fn submitting_batch() {
         res.messages[0],
         SubMsg::reply_on_success(
             Undelegation::new("alice", 31732, "uxyz").to_cosmos_msg(),
-            REPLY_REGISTER_RECEIVED_COINS
+            REPLY_UNDELEGATE
         )
     );
     assert_eq!(
         res.messages[1],
         SubMsg::reply_on_success(
             Undelegation::new("bob", 31733, "uxyz").to_cosmos_msg(),
-            REPLY_REGISTER_RECEIVED_COINS
+            REPLY_UNDELEGATE
         )
     );
     assert_eq!(
         res.messages[2],
         SubMsg::reply_on_success(
             Undelegation::new("charlie", 31732, "uxyz").to_cosmos_msg(),
-            REPLY_REGISTER_RECEIVED_COINS,
+            REPLY_UNDELEGATE,
         )
     );
     assert_eq!(res.messages[3], SubMsg {
@@ -2472,4 +2473,100 @@ fn reinvest_after_redelegation_skips_excluded_validators() {
     assert_eq!(legacy, CallbackMsg::ReinvestIfNeeded {
         exclude: vec![],
     });
+}
+
+#[test]
+fn parsing_unbond_completion_times() {
+    // Expected values computed independently (Python datetime).
+    for (value, expected) in [
+        ("1970-01-01T00:00:00Z", Some(0)),
+        ("2026-12-18T21:00:00Z", Some(1_797_627_600)),
+        ("2024-02-29T23:59:59Z", Some(1_709_251_199)),
+        ("2000-03-01T00:00:00+02:00", Some(951_861_600)),
+        ("2026-12-18T21:00:00-05:30", Some(1_797_647_400)),
+        ("2100-01-01T00:00:00Z", Some(4_102_444_800)),
+        // fractional seconds round up, never earlier than the real time
+        ("2026-12-18T21:00:00.000000001Z", Some(1_797_627_601)),
+        ("2026-12-18T21:00:00.000Z", Some(1_797_627_600)),
+        ("2026-13-18T21:00:00Z", None),
+        ("2026-12-18 21:00:00Z", None),
+        ("2026-12-18T21:00:00", None),
+        ("1969-12-31T23:59:59Z", None),
+        ("not a time", None),
+    ] {
+        assert_eq!(crate::helpers::parse_rfc3339_seconds(value), expected, "{}", value);
+    }
+}
+
+#[test]
+fn undelegation_replies_set_the_batch_end_to_the_chain_completion_time() {
+    let mut deps = setup_test();
+    let state = State::default();
+    // The configured unbond_period said 1_000_000; the chain completes later.
+    let batch = Batch {
+        id: 7,
+        reconciled: false,
+        total_shares: Uint128::new(100),
+        amount_unclaimed: Uint128::new(100),
+        est_unbond_end_time: 1_000_000,
+    };
+    state.previous_batches.save(deps.as_mut().storage, batch.id, &batch).unwrap();
+    crate::state::SUBMITTED_BATCH.save(deps.as_mut().storage, &(7, None)).unwrap();
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![]).unwrap();
+
+    let undelegated = |completion: &str| Reply {
+        id: REPLY_UNDELEGATE,
+        result: cosmwasm_std::SubMsgResult::Ok(SubMsgResponse {
+            events: vec![
+                Event::new("unbond")
+                    .add_attribute("validator", "alice")
+                    .add_attribute("amount", "50uxyz")
+                    .add_attribute("completion_time", completion),
+                Event::new("coin_received")
+                    .add_attribute("receiver", MOCK_CONTRACT_ADDR)
+                    .add_attribute("amount", "7uxyz"),
+            ],
+            data: None,
+        }),
+    };
+
+    // 1970-01-12T13:46:41Z = 1_000_001: one second later than estimated.
+    let res = reply(deps.as_mut(), mock_env(), undelegated("1970-01-12T13:46:41Z")).unwrap();
+    assert_eq!(
+        state.previous_batches.load(deps.as_ref().storage, 7u64).unwrap().est_unbond_end_time,
+        1_000_001
+    );
+    assert!(res.events.iter().any(|e| e.ty == "steakhub/unbond_completion_time"));
+
+    // Undelegating also withdraws rewards: still registered.
+    let unlocked = state.unlocked_coins.load(deps.as_ref().storage).unwrap();
+    assert!(unlocked.contains(&Coin::new(7, "uxyz")), "{:?}", unlocked);
+
+    // Another validator's undelegation completes later still (1_000_100): the batch waits for it.
+    reply(deps.as_mut(), mock_env(), undelegated("1970-01-12T13:48:20Z")).unwrap();
+    assert_eq!(
+        state.previous_batches.load(deps.as_ref().storage, 7u64).unwrap().est_unbond_end_time,
+        1_000_100
+    );
+    // An earlier one never pulls the end back.
+    reply(deps.as_mut(), mock_env(), undelegated("1970-01-12T13:46:41Z")).unwrap();
+    assert_eq!(
+        state.previous_batches.load(deps.as_ref().storage, 7u64).unwrap().est_unbond_end_time,
+        1_000_100
+    );
+
+    // No completion time reported (another chain's event shape): the estimate stays.
+    let res = reply(deps.as_mut(), mock_env(), Reply {
+        id: REPLY_UNDELEGATE,
+        result: cosmwasm_std::SubMsgResult::Ok(SubMsgResponse {
+            events: vec![],
+            data: None,
+        }),
+    })
+    .unwrap();
+    assert!(res.events.is_empty());
+    assert_eq!(
+        state.previous_batches.load(deps.as_ref().storage, 7u64).unwrap().est_unbond_end_time,
+        1_000_100
+    );
 }

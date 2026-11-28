@@ -20,6 +20,10 @@ pub(crate) const VALIDATORS_ACTIVE: Set<&str> =
 
 // pub(crate) const BATCH_KEY_RECONCILED_V101: &str = "previous_batches__reconciled_101";
 
+/// The batch `SubmitBatch` is undelegating, and the latest unbonding completion time the staking
+/// module reported for it so far (see `register_undelegation`).
+pub(crate) const SUBMITTED_BATCH: Item<(u64, Option<u64>)> = Item::new("submitted_batch_001");
+
 pub(crate) struct State<'a> {
     /// Account who can call certain privileged functions
     pub owner: Item<'a, Addr>,
