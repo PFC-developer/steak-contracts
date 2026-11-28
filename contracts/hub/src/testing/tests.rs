@@ -3543,3 +3543,55 @@ fn an_unparsable_coin_received_event_is_skipped_not_fatal() {
         12, "uxyz"
     )]);
 }
+
+#[test]
+fn a_full_fee_reinvest_sends_the_fee_without_a_zero_delegation() {
+    let mut deps = setup_test();
+    let state = State::default();
+    state.fee_rate.save(deps.as_mut().storage, &Decimal::one()).unwrap();
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![Coin::new(300, "uxyz")]).unwrap();
+    deps.querier.set_bank_balances(&[Coin::new(300, "uxyz")]);
+
+    let res = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info(MOCK_CONTRACT_ADDR, &[]),
+        ExecuteMsg::Callback(CallbackMsg::Reinvest {}),
+    )
+    .unwrap();
+
+    assert_eq!(res.messages, vec![SubMsg::new(CosmosMsg::Bank(BankMsg::Send {
+        to_address: "the_fee_man".into(),
+        amount: vec![Coin::new(300, "uxyz")],
+    }))]);
+    assert!(state.unlocked_coins.load(deps.as_ref().storage).unwrap().is_empty());
+    let harvested = res.events.iter().find(|event| event.ty == "steakhub/harvested").unwrap();
+    assert!(
+        harvested.attributes.iter().any(|attr| { attr.key == "denom_bonded" && attr.value == "0" })
+    );
+}
+
+#[test]
+fn bonding_rejects_a_deposit_that_would_mint_zero_shares() {
+    let mut deps = setup_test();
+    let state = State::default();
+    deps.querier.set_staking_delegations(&[Delegation::new("alice", 1, "uxyz")]);
+    deps.querier.set_cw20_total_supply("steak_token", 1);
+    // The current holder has one delegated unit and one idle unit. A one-unit deposit would mint
+    // floor(1 share * 1 deposit / 2 backing) = 0 and must not be accepted.
+    deps.querier.set_bank_balances(&[Coin::new(2, "uxyz")]);
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![]).unwrap();
+
+    let err = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info("user_2", &[Coin::new(1, "uxyz")]),
+        ExecuteMsg::Bond {
+            receiver: None,
+            exec_msg: None,
+        },
+    )
+    .unwrap_err();
+
+    assert_eq!(err, StdError::generic_err("bond amount is too small to mint derivative tokens"));
+}

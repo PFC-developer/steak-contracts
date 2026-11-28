@@ -175,6 +175,9 @@ pub fn bond(
         pending_rewards_net(deps.as_ref(), &env, &all_delegations, &denom, amount_to_bond)?;
     let usteak_to_mint =
         compute_mint_amount(usteak_supply, amount_to_bond, &all_delegations, pending)?;
+    if usteak_to_mint.is_zero() {
+        return Err(StdError::generic_err("bond amount is too small to mint derivative tokens"));
+    }
 
     let delegate_submsg =
         SubMsg::reply_on_success(new_delegation.to_cosmos_msg(), REPLY_REGISTER_RECEIVED_COINS);
@@ -362,7 +365,6 @@ fn reinvest_excluding(deps: DepsMut, env: Env, exclude: &[String]) -> StdResult<
     let denom = state.denom.load(deps.storage)?;
     let fee = state.fee_rate.load(deps.storage)?;
 
-    let validators = bonded_active_targets(deps.as_ref(), exclude)?;
     // Every staking message registers the rewards it withdraws (harvest's withdrawals, and the
     // automatic withdrawals of delegate / undelegate / redelegate) in `unlocked_coins`; bond all of
     // them. Never bond funds that matured unbonding batches are owed.
@@ -372,15 +374,6 @@ fn reinvest_excluding(deps: DepsMut, env: Env, exclude: &[String]) -> StdResult<
     if amount_to_bond.is_zero() {
         return Err(StdError::generic_err("no rewards"));
     }
-    let delegations = query_delegations(&deps.querier, &validators, &env.contract.address, &denom)?;
-    let mut validator = &delegations[0].validator;
-    let mut amount = delegations[0].amount;
-    for d in &delegations[1..] {
-        if d.amount < amount {
-            validator = &d.validator;
-            amount = d.amount;
-        }
-    }
     let fee_amount = if fee.is_zero() {
         Uint128::zero()
     } else {
@@ -388,7 +381,24 @@ fn reinvest_excluding(deps: DepsMut, env: Env, exclude: &[String]) -> StdResult<
     };
     let amount_to_bond_minus_fees = amount_to_bond.saturating_sub(fee_amount);
 
-    let new_delegation = Delegation::new(validator, amount_to_bond_minus_fees.u128(), &denom);
+    // A 100% fee is valid configuration. In that case there is nothing to delegate, and emitting
+    // a zero-amount staking message would make the chain reject and roll back the whole harvest.
+    let new_delegation = if amount_to_bond_minus_fees.is_zero() {
+        None
+    } else {
+        let validators = bonded_active_targets(deps.as_ref(), exclude)?;
+        let delegations =
+            query_delegations(&deps.querier, &validators, &env.contract.address, &denom)?;
+        let mut validator = &delegations[0].validator;
+        let mut amount = delegations[0].amount;
+        for d in &delegations[1..] {
+            if d.amount < amount {
+                validator = &d.validator;
+                amount = d.amount;
+            }
+        }
+        Some(Delegation::new(validator, amount_to_bond_minus_fees.u128(), &denom))
+    };
 
     unlocked_coins.retain(|coin| coin.denom != denom);
     let native_left = unlocked_native - amount_to_bond;
@@ -404,7 +414,14 @@ fn reinvest_excluding(deps: DepsMut, env: Env, exclude: &[String]) -> StdResult<
         .add_attribute("fees_deducted", fee_amount)
         .add_attribute("denom_bonded", amount_to_bond_minus_fees);
 
-    if fee_amount > Uint128::zero() {
+    let mut response =
+        Response::new().add_event(event).add_attribute("action", "steakhub/reinvest");
+
+    if let Some(new_delegation) = new_delegation {
+        response = response.add_message(new_delegation.to_cosmos_msg());
+    }
+
+    if !fee_amount.is_zero() {
         let fee_account = state.fee_account.load(deps.storage)?;
         let fee_type = state.fee_account_type.load(deps.storage)?;
 
@@ -421,17 +438,10 @@ fn reinvest_excluding(deps: DepsMut, env: Env, exclude: &[String]) -> StdResult<
                 vec![msg.into_cosmos_msg(fee_account, vec![Coin::new(fee_amount.into(), &denom)])?]
             },
         };
-        Ok(Response::new()
-            .add_message(new_delegation.to_cosmos_msg())
-            .add_messages(send_msgs)
-            .add_event(event)
-            .add_attribute("action", "steakhub/reinvest"))
-    } else {
-        Ok(Response::new()
-            .add_message(new_delegation.to_cosmos_msg())
-            .add_event(event)
-            .add_attribute("action", "steakhub/reinvest"))
+        response = response.add_messages(send_msgs);
     }
+
+    Ok(response)
 }
 
 /// What the backing that bonds are priced against holds beyond delegated stake: the holders'
