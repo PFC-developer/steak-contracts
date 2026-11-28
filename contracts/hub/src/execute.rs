@@ -27,13 +27,14 @@ use crate::{
         query_cw20_total_supply, query_delegation, query_delegations,
     },
     math::{
-        compute_mint_amount, compute_redelegations_for_inactive,
+        compute_first_mint, compute_mint_amount, compute_redelegations_for_inactive,
         compute_redelegations_for_rebalancing, compute_redelegations_for_removal,
         compute_unbond_amount, compute_undelegations, cumulative_share, reconcile_batches,
+        total_delegated,
     },
     state::{
-        NATIVE_RESERVED, RECONCILE_OBSERVED_HEIGHTS, RESERVE_INIT, ReserveInit, SUBMITTED_BATCH,
-        State,
+        DEAD_SHARES, NATIVE_RESERVED, RECONCILE_OBSERVED_HEIGHTS, RESERVE_INIT, ReserveInit,
+        SUBMITTED_BATCH, State,
     },
     types::{Coins, Delegation, Redelegation},
 };
@@ -177,8 +178,21 @@ pub fn bond(
     }
     let pending =
         pending_rewards_net(deps.as_ref(), &env, &all_delegations, &denom, amount_to_bond)?;
-    let usteak_to_mint =
-        compute_mint_amount(usteak_supply, amount_to_bond, &all_delegations, pending)?;
+    let (usteak_to_mint, dead_shares) = if usteak_supply.is_zero() {
+        let existing = Uint128::new(total_delegated(&all_delegations)?)
+            .checked_add(pending)?
+            .checked_add(idle_native_with_deposit(deps.as_ref(), &env, amount_to_bond)?.idle)?;
+        compute_first_mint(amount_to_bond, existing)
+    } else {
+        (
+            compute_mint_amount(usteak_supply, amount_to_bond, &all_delegations, pending)?,
+            Uint128::zero(),
+        )
+    };
+    if !dead_shares.is_zero() {
+        let dead = DEAD_SHARES.may_load(deps.storage)?.unwrap_or_default();
+        DEAD_SHARES.save(deps.storage, &dead.checked_add(dead_shares)?)?;
+    }
     if usteak_to_mint.is_zero() {
         return Err(StdError::generic_err("bond amount is too small to mint derivative tokens"));
     }
@@ -265,7 +279,21 @@ pub fn bond(
         .add_attribute("steak_receiver", receiver)
         .add_attribute("denom_bonded", denom)
         .add_attribute("denom_amount", amount_to_bond)
-        .add_attribute("usteak_minted", usteak_to_mint);
+        .add_attribute("usteak_minted", usteak_to_mint)
+        .add_attribute("dead_shares", dead_shares);
+
+    let mut mint_msgs = mint_msgs;
+    if !dead_shares.is_zero() {
+        // Dead shares are minted to the hub itself and never redeemed.
+        mint_msgs.push(CosmosMsg::Wasm(WasmMsg::Execute {
+            contract_addr: steak_token.to_string(),
+            msg: to_json_binary(&Cw20ExecuteMsg::Mint {
+                recipient: env.contract.address.to_string(),
+                amount: dead_shares,
+            })?,
+            funds: vec![],
+        }));
+    }
 
     Ok(Response::new()
         .add_submessage(delegate_submsg)
@@ -450,10 +478,9 @@ fn reinvest_excluding(deps: DepsMut, env: Env, exclude: &[String]) -> StdResult<
 
 /// What the backing that bonds are priced against holds beyond delegated stake: the holders'
 /// after-fee share of rewards not yet restaked (recorded ones, as far as the balance backs them,
-/// plus those still accruing on each delegation) and idle native (see `idle_native`), which
-/// `ReinvestIdle` restakes fee-free. Counting idle here means restaking it does not move the
-/// exchange rate, so nobody can bond just before a sweep to take part of it. `deposit` is the
-/// native that arrived with the current message.
+/// plus those still accruing on each delegation). Only what the contract tracks counts: untracked
+/// native (see `idle_native`) is left out, since anyone could raise it with a plain transfer to
+/// inflate the price bonders pay. `deposit` is the native that arrived with the current message.
 pub(crate) fn pending_rewards_net(
     deps: cosmwasm_std::Deps,
     env: &Env,
@@ -489,16 +516,15 @@ pub(crate) fn pending_rewards_net(
     } else {
         fee.checked_mul_uint(gross)?
     };
-    let idle = idle_native_with_deposit(deps, env, deposit)?.idle;
-    Ok(gross.saturating_sub(fee_amount).checked_add(idle)?)
+    Ok(gross.saturating_sub(fee_amount))
 }
 
 /// Native that unbonding batches are owed out of the balance. Reconciled batches come from the
 /// running `NATIVE_RESERVED` total; unreconciled ones (few: only those still unbonding or awaiting
-/// `Reconcile`) are summed. With `Some(now)`, only unreconciled batches whose funds should already
-/// be here (matured by `now`) count; with `None`, all of them do, the conservative figure used
-/// before treating any balance as idle. Returns `None` while the one-time reserve initialisation is
-/// pending, when what is owed is not known yet.
+/// `Reconcile`) are summed. With `Some(now)`, only unreconciled batches whose funds can already be
+/// here count: those whose (chain-reported, see `register_undelegation`) unbonding end is at or
+/// before `now`. With `None`, every unreconciled batch counts. Returns `None` while the one-time
+/// reserve initialisation is pending, when what is owed is not known yet.
 pub(crate) fn native_owed_to_batches(
     storage: &dyn cosmwasm_std::Storage,
     now: Option<u64>,

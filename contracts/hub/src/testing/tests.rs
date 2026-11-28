@@ -29,7 +29,7 @@ use crate::{
         compute_redelegations_for_inactive, compute_redelegations_for_rebalancing,
         compute_redelegations_for_removal, compute_undelegations, reconcile_batches,
     },
-    state::{NATIVE_RESERVED, State},
+    state::{DEAD_SHARES, NATIVE_RESERVED, State},
     types::{Coins, Delegation, Redelegation, Undelegation},
 };
 
@@ -331,7 +331,7 @@ fn bonding() {
     // will know about it 1 - delegate
     // 2 - mint token (to ourselves)
     // 3 - send/transfer it
-    assert_eq!(res.messages.len(), 3);
+    assert_eq!(res.messages.len(), 4);
     assert_eq!(
         res.messages[0],
         SubMsg::reply_on_success(
@@ -368,6 +368,20 @@ fn bonding() {
         gas_limit: None,
         reply_on: ReplyOn::Never,
     });
+
+    // First bond at zero supply: 1000 dead shares (MIN_DEAD_SHARES) are minted to the hub itself.
+    assert_eq!(
+        res.messages.last().unwrap(),
+        &SubMsg::new(CosmosMsg::Wasm(WasmMsg::Execute {
+            contract_addr: "steak_token".to_string(),
+            msg: to_json_binary(&Cw20ExecuteMsg::Mint {
+                recipient: MOCK_CONTRACT_ADDR.to_string(),
+                amount: Uint128::new(1_000),
+            })
+            .unwrap(),
+            funds: vec![],
+        }))
+    );
 
     // Bond when there are existing delegations, and Luna:Steak exchange rate is >1
     // Previously user 1 delegated 1,000,000 uluna. We assume we have accumulated 2.5% yield at
@@ -483,7 +497,20 @@ fn bond_ex() {
     // will know about it 1 - delegate
     // 2 - mint token (to ourselves)
     // 3 - send/transfer it
-    assert_eq!(res.messages.len(), 2);
+    assert_eq!(res.messages.len(), 3);
+    // First bond at zero supply: 1000 dead shares (MIN_DEAD_SHARES) are minted to the hub itself.
+    assert_eq!(
+        res.messages.last().unwrap(),
+        &SubMsg::new(CosmosMsg::Wasm(WasmMsg::Execute {
+            contract_addr: "steak_token".to_string(),
+            msg: to_json_binary(&Cw20ExecuteMsg::Mint {
+                recipient: MOCK_CONTRACT_ADDR.to_string(),
+                amount: Uint128::new(1_000),
+            })
+            .unwrap(),
+            funds: vec![],
+        }))
+    );
     assert_eq!(
         res.messages[0],
         SubMsg::reply_on_success(
@@ -3426,7 +3453,7 @@ fn reinvest_if_needed_skips_rewards_that_cannot_be_bonded_yet() {
 }
 
 #[test]
-fn idle_funds_count_in_bond_pricing_so_a_sweep_does_not_move_the_rate() {
+fn idle_funds_do_not_count_in_bond_pricing() {
     let mut deps = setup_test();
     let state = State::default();
     deps.querier.set_staking_delegations(&[
@@ -3435,7 +3462,8 @@ fn idle_funds_count_in_bond_pricing_so_a_sweep_does_not_move_the_rate() {
         Delegation::new("charlie", 300, "uxyz"),
     ]);
     deps.querier.set_cw20_total_supply("steak_token", 1000);
-    // 100 idle (not recorded, not owed): backing is 1000 + 100 = 1100 per 1000 shares.
+    // 100 idle (not recorded, not owed). Anyone could raise idle with a plain transfer, so it is
+    // not part of the backing bonds are priced against: 1000 per 1000 shares.
     deps.querier.set_bank_balances(&[Coin::new(100 + 1100, "uxyz")]);
     state.unlocked_coins.save(deps.as_mut().storage, &vec![]).unwrap();
 
@@ -3451,9 +3479,7 @@ fn idle_funds_count_in_bond_pricing_so_a_sweep_does_not_move_the_rate() {
     .unwrap();
     let bonded = res.events.iter().find(|e| e.ty == "steakhub/bonded").unwrap();
     let minted = bonded.attributes.iter().find(|a| a.key == "usteak_minted").unwrap();
-    // Without idle in the backing this would mint 1100, and the bonder would take a share of the
-    // 100 when the owner sweeps it.
-    assert_eq!(minted.value, "1000");
+    assert_eq!(minted.value, "1100");
 }
 
 #[test]
@@ -3578,10 +3604,12 @@ fn bonding_rejects_a_deposit_that_would_mint_zero_shares() {
     let state = State::default();
     deps.querier.set_staking_delegations(&[Delegation::new("alice", 1, "uxyz")]);
     deps.querier.set_cw20_total_supply("steak_token", 1);
-    // The current holder has one delegated unit and one idle unit. A one-unit deposit would mint
-    // floor(1 share * 1 deposit / 2 backing) = 0 and must not be accepted.
-    deps.querier.set_bank_balances(&[Coin::new(2, "uxyz")]);
-    state.unlocked_coins.save(deps.as_mut().storage, &vec![]).unwrap();
+    // The current holder has one delegated unit and two recorded reward units (the 10% fee on 2
+    // rounds to 0), so the backing is 3. A one-unit deposit would mint floor(1 * 1 / 3) = 0 and
+    // must not be accepted. (Idle native no longer counts in pricing, so recorded rewards are
+    // used to reach a zero mint.)
+    deps.querier.set_bank_balances(&[Coin::new(2 + 1, "uxyz")]);
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![Coin::new(2, "uxyz")]).unwrap();
 
     let err = execute(
         deps.as_mut(),
@@ -3595,4 +3623,63 @@ fn bonding_rejects_a_deposit_that_would_mint_zero_shares() {
     .unwrap_err();
 
     assert_eq!(err, StdError::generic_err("bond amount is too small to mint derivative tokens"));
+}
+
+#[test]
+fn first_bond_after_zero_supply_locks_the_leftover_backing_in_dead_shares() {
+    let mut deps = setup_test();
+    let state = State::default();
+    // Every holder unbonded, but 5000 stays delegated (donations, rounding).
+    deps.querier.set_staking_delegations(&[Delegation::new("alice", 5000, "uxyz")]);
+    deps.querier.set_cw20_total_supply("steak_token", 0);
+    deps.querier.set_bank_balances(&[Coin::new(1000, "uxyz")]);
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![]).unwrap();
+
+    let res = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info("user_1", &[Coin::new(1000, "uxyz")]),
+        ExecuteMsg::Bond {
+            receiver: None,
+            exec_msg: None,
+        },
+    )
+    .unwrap();
+    // The bonder gets 1000 shares for 1000; the 5000 left over is locked behind 5000 dead shares,
+    // so redeeming 1000 of 6000 shares returns 1000 of 6000, not the leftover too.
+    let bonded = res.events.iter().find(|e| e.ty == "steakhub/bonded").unwrap();
+    let attr = |key: &str| {
+        bonded.attributes.iter().find(|a| a.key == key).map(|a| a.value.clone()).unwrap()
+    };
+    assert_eq!(attr("usteak_minted"), "1000");
+    assert_eq!(attr("dead_shares"), "5000");
+    assert_eq!(DEAD_SHARES.load(deps.as_ref().storage).unwrap(), Uint128::new(5000));
+    // The bonder's 1000, plus 5000 dead shares minted to the hub itself.
+    assert_eq!(
+        res.messages.last().unwrap().msg,
+        CosmosMsg::Wasm(WasmMsg::Execute {
+            contract_addr: "steak_token".to_string(),
+            msg: to_json_binary(&Cw20ExecuteMsg::Mint {
+                recipient: MOCK_CONTRACT_ADDR.to_string(),
+                amount: Uint128::new(5000),
+            })
+            .unwrap(),
+            funds: vec![],
+        })
+    );
+}
+
+#[test]
+fn computing_the_first_mint() {
+    use crate::math::{MIN_DEAD_SHARES, compute_first_mint};
+    // Nothing left: the minimum is locked.
+    assert_eq!(
+        compute_first_mint(Uint128::new(1000), Uint128::zero()),
+        (Uint128::new(1000), Uint128::new(MIN_DEAD_SHARES))
+    );
+    // Leftover backing: locked 1:1 so the bonder cannot claim it.
+    assert_eq!(
+        compute_first_mint(Uint128::new(1000), Uint128::new(5000)),
+        (Uint128::new(1000), Uint128::new(5000))
+    );
 }

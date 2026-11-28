@@ -63,7 +63,24 @@ pub(crate) fn compute_unbond_amount(
         .map_err(|err| StdError::generic_err(format!("failed to compute unbond amount: {err}")))
 }
 
-fn total_delegated(delegations: &[Delegation]) -> StdResult<u128> {
+/// Derivative tokens locked in the hub, at least, when it mints at zero supply.
+pub(crate) const MIN_DEAD_SHARES: u128 = 1_000;
+
+/// The first mint at zero supply. There is no price to go by, so the bonder gets `native_to_bond`
+/// 1:1, and dead shares, minted to the hub itself and never redeemable, are locked alongside:
+/// worth `existing_backing` (stake, rewards or idle native left from earlier holders or sent by
+/// anyone) so the bonder cannot claim what was already there, and at least `MIN_DEAD_SHARES`, so
+/// inflating the price by donating to an empty hub costs the donor almost all of the donation.
+///
+/// Returns (minted to the bonder, dead shares).
+pub(crate) fn compute_first_mint(
+    native_to_bond: Uint128,
+    existing_backing: Uint128,
+) -> (Uint128, Uint128) {
+    (native_to_bond, existing_backing.max(Uint128::new(MIN_DEAD_SHARES)))
+}
+
+pub(crate) fn total_delegated(delegations: &[Delegation]) -> StdResult<u128> {
     delegations.iter().try_fold(0u128, |total, delegation| {
         total
             .checked_add(delegation.amount)

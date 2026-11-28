@@ -25,14 +25,15 @@ use crate::{
     },
     injective, kujira,
     math::{
-        compute_mint_amount, compute_redelegations_for_inactive,
+        compute_first_mint, compute_mint_amount, compute_redelegations_for_inactive,
         compute_redelegations_for_rebalancing, compute_redelegations_for_removal,
         compute_unbond_amount, compute_undelegations, cumulative_share, reconcile_batches,
+        total_delegated,
     },
     osmosis,
     state::{
-        NATIVE_RESERVED, RECONCILE_OBSERVED_HEIGHTS, RESERVE_INIT, ReserveInit, SUBMITTED_BATCH,
-        State, VALIDATORS, VALIDATORS_ACTIVE, previous_batches, unbond_requests,
+        DEAD_SHARES, NATIVE_RESERVED, RECONCILE_OBSERVED_HEIGHTS, RESERVE_INIT, ReserveInit,
+        SUBMITTED_BATCH, State, VALIDATORS, VALIDATORS_ACTIVE, previous_batches, unbond_requests,
     },
     token_factory,
 };
@@ -195,14 +196,30 @@ pub fn bond(
         //   let usteak_supply = steak_minted;
         let pending =
             pending_rewards_net(deps.as_ref(), &env, &delegations_all, &denom, amount_to_bond)?;
-        let usteak_to_mint =
-            compute_mint_amount(steak_minted, amount_to_bond, &delegations_all, pending)?;
+        let (usteak_to_mint, dead_shares) = if steak_minted.is_zero() {
+            let existing = Uint128::new(total_delegated(&delegations_all)?)
+                .checked_add(pending)?
+                .checked_add(
+                idle_native_with_deposit(deps.as_ref(), &env, amount_to_bond)?.idle,
+            )?;
+            compute_first_mint(amount_to_bond, existing)
+        } else {
+            (
+                compute_mint_amount(steak_minted, amount_to_bond, &delegations_all, pending)?,
+                Uint128::zero(),
+            )
+        };
+        let minted_total = usteak_to_mint.checked_add(dead_shares)?;
         if usteak_to_mint.is_zero() {
             return Err(StdError::generic_err(
                 "bond amount is too small to mint derivative tokens",
             ));
         }
-        state.steak_minted.save(deps.storage, &(steak_minted + usteak_to_mint))?;
+        state.steak_minted.save(deps.storage, &steak_minted.checked_add(minted_total)?)?;
+        if !dead_shares.is_zero() {
+            let dead = DEAD_SHARES.may_load(deps.storage)?.unwrap_or_default();
+            DEAD_SHARES.save(deps.storage, &dead.checked_add(dead_shares)?)?;
+        }
         // TODO deal with multiple token returns
 
         let mint_msg = match token_factory_type {
@@ -211,7 +228,7 @@ pub fn bond(
                     sender: env.contract.address.to_string(),
                     amount: Some(token_factory::denom::Coin {
                         denom: steak_denom.clone(),
-                        amount: usteak_to_mint.to_string(),
+                        amount: minted_total.to_string(),
                     }),
                 },
             ),
@@ -221,7 +238,7 @@ pub fn bond(
                     recipient: env.contract.address.to_string(),
                     amount: Some(kujira::denom::Coin {
                         denom: steak_denom.clone(),
-                        amount: usteak_to_mint.to_string(),
+                        amount: minted_total.to_string(),
                     }),
                 })
             },
@@ -230,7 +247,7 @@ pub fn bond(
                     sender: env.contract.address.to_string(),
                     amount: Some(injective::denom::Coin {
                         denom: steak_denom.clone(),
-                        amount: usteak_to_mint.to_string(),
+                        amount: minted_total.to_string(),
                     }),
                 })
             },
@@ -239,7 +256,7 @@ pub fn bond(
                     sender: env.contract.address.to_string(),
                     amount: Some(osmosis::denom::Coin {
                         denom: steak_denom.clone(),
-                        amount: usteak_to_mint.to_string(),
+                        amount: minted_total.to_string(),
                     }),
                     mint_to_address: env.contract.address.to_string(),
                 })
@@ -296,7 +313,8 @@ pub fn bond(
             .add_attribute("steak_receiver", receiver)
             .add_attribute("denom_bonded", denom)
             .add_attribute("denom_amount", amount_to_bond)
-            .add_attribute("usteak_minted", usteak_to_mint);
+            .add_attribute("usteak_minted", usteak_to_mint)
+            .add_attribute("dead_shares", dead_shares);
 
         Ok(Response::new()
             .add_submessage(delegate_submsg)
@@ -494,10 +512,9 @@ fn reinvest_excluding(deps: DepsMut, env: Env, exclude: &[String]) -> StdResult<
 
 /// What the backing that bonds are priced against holds beyond delegated stake: the holders'
 /// after-fee share of rewards not yet restaked (recorded ones, as far as the balance backs them,
-/// plus those still accruing on each delegation) and idle native (see `idle_native`), which
-/// `ReinvestIdle` restakes fee-free. Counting idle here means restaking it does not move the
-/// exchange rate, so nobody can bond just before a sweep to take part of it. `deposit` is the
-/// native that arrived with the current message.
+/// plus those still accruing on each delegation). Only what the contract tracks counts: untracked
+/// native (see `idle_native`) is left out, since anyone could raise it with a plain transfer to
+/// inflate the price bonders pay. `deposit` is the native that arrived with the current message.
 pub(crate) fn pending_rewards_net(
     deps: cosmwasm_std::Deps,
     env: &Env,
@@ -533,16 +550,15 @@ pub(crate) fn pending_rewards_net(
     } else {
         fee.checked_mul_uint(gross)?
     };
-    let idle = idle_native_with_deposit(deps, env, deposit)?.idle;
-    Ok(gross.saturating_sub(fee_amount).checked_add(idle)?)
+    Ok(gross.saturating_sub(fee_amount))
 }
 
 /// Native that unbonding batches are owed out of the balance. Reconciled batches come from the
 /// running `NATIVE_RESERVED` total; unreconciled ones (few: only those still unbonding or awaiting
-/// `Reconcile`) are summed. With `Some(now)`, only unreconciled batches whose funds should already
-/// be here (matured by `now`) count; with `None`, all of them do, the conservative figure used
-/// before treating any balance as idle. Returns `None` while the one-time reserve initialisation is
-/// pending, when what is owed is not known yet.
+/// `Reconcile`) are summed. With `Some(now)`, only unreconciled batches whose funds can already be
+/// here count: those whose (chain-reported, see `register_undelegation`) unbonding end is at or
+/// before `now`. With `None`, every unreconciled batch counts. Returns `None` while the one-time
+/// reserve initialisation is pending, when what is owed is not known yet.
 pub(crate) fn native_owed_to_batches(
     storage: &dyn cosmwasm_std::Storage,
     now: Option<u64>,
