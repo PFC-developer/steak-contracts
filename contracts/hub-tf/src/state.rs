@@ -1,6 +1,6 @@
 use cosmwasm_std::{Addr, Coin, Decimal, StdError, StdResult, Storage, Uint128};
 use cw_item_set::Set;
-use cw_storage_plus::{Index, IndexList, IndexedMap, Item, MultiIndex};
+use cw_storage_plus::{Index, IndexList, IndexedMap, Item, Map, MultiIndex};
 use pfc_steak::{
     hub::{Batch, FeeType, PendingBatch, UnbondRequest},
     hub_tf::TokenFactoryType,
@@ -10,6 +10,57 @@ pub(crate) const BATCH_KEY_V101: &str = "previous_batches_101";
 pub(crate) const BATCH_KEY_OWNER_V101: &str = "previous_batches_owner_101";
 pub(crate) const UNBOND_KEY_V101: &str = "unbond_101";
 pub(crate) const UNBOND_KEY_USER_V101: &str = "unbond_owner_101";
+/// First block height at which an unreconciled batch was observed past its estimated maturity.
+/// Reconciliation is allowed only in a later block, after the staking module had an EndBlock in
+/// which to pay the matured unbonding.
+pub(crate) const RECONCILE_OBSERVED_HEIGHTS: Map<u64, u64> =
+    Map::new("reconcile_observed_heights_001");
+
+/// Native the contract owes to reconciled batches that are not yet fully withdrawn: the sum of
+/// their `amount_unclaimed`. Kept as a running total (added on reconcile, subtracted on withdraw)
+/// so `Reconcile` does not have to scan every reconciled batch, which grows without bound when
+/// unbond requests are never claimed. Initialised by `migrate`.
+pub(crate) const NATIVE_RESERVED: Item<Uint128> = Item::new("native_reserved_001");
+
+/// Derivative tokens the hub minted to itself at zero supply or while sweeping idle native. They
+/// are held by the hub and never redeemed; burning stray tokens must leave them alone.
+pub(crate) const DEAD_SHARES: Item<Uint128> = Item::new("dead_shares_001");
+
+/// Batches whose `est_unbond_end_time` came from the chain (the staking module's reported
+/// unbonding completion, see `register_undelegation`) rather than `submit time + unbond_period`.
+/// Only for those is "not yet past its end" proof that the funds have not arrived.
+pub(crate) const CHAIN_REPORTED_END: Map<u64, bool> = Map::new("chain_reported_end_001");
+
+/// Progress of the one-time, paginated initialisation of `NATIVE_RESERVED` (see
+/// `advance_reserve_initialization`). Removed once the reserve exists.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReserveInit {
+    /// Batches reconciled, or matured before this time, form the pool that shares any shortfall.
+    pub pool_time: u64,
+    /// `false` while summing what the pool is owed, `true` while applying the write-down.
+    pub applying: bool,
+    /// Last batch id processed in the current pass.
+    pub cursor: Option<u64>,
+    /// What the pool is owed, before any write-down.
+    pub owed: Uint128,
+    /// What the pool is short of, shared pro rata.
+    pub shortfall: Uint128,
+    /// How much of `shortfall` has been written down so far.
+    pub applied: Uint128,
+    /// What the pool batches processed so far in the applying pass are owed (for pro-rata
+    /// rounding).
+    #[serde(default)]
+    pub cumulative: Uint128,
+    /// Batches that matured after `pool_time` but before the sum finished; they join the pool.
+    #[serde(default)]
+    pub joined: Vec<u64>,
+    /// Recorded rewards (`unlocked_coins`) kept out of what the pool could draw on; reported so
+    /// operators can audit it, since an overstated figure deepens the pool's shortfall.
+    #[serde(default)]
+    pub unlocked: Uint128,
+}
+
+pub(crate) const RESERVE_INIT: Item<ReserveInit> = Item::new("reserve_init_001");
 
 /// Validators who currently have delegations. This can be different due to being
 /// paused/re-delegations
@@ -19,6 +70,10 @@ pub(crate) const VALIDATORS_ACTIVE: Set<&str> =
     Set::new("validators_active_001", "validator_active_counter_001");
 
 // pub(crate) const BATCH_KEY_RECONCILED_V101: &str = "previous_batches__reconciled_101";
+
+/// The batch `SubmitBatch` is undelegating, and the latest unbonding completion time the staking
+/// module reported for it so far (see `register_undelegation`).
+pub(crate) const SUBMITTED_BATCH: Item<(u64, Option<u64>)> = Item::new("submitted_batch_001");
 
 pub(crate) struct State<'a> {
     /// Account who can call certain privileged functions

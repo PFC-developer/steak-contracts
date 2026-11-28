@@ -1,6 +1,6 @@
-use std::{cmp, cmp::Ordering, collections::HashMap};
+use std::{cmp, cmp::Ordering, convert::TryFrom};
 
-use cosmwasm_std::{StdError, StdResult, Uint128};
+use cosmwasm_std::{StdError, StdResult, Uint128, Uint256};
 use pfc_steak::hub::Batch;
 
 use crate::types::{Delegation, Redelegation, Undelegation};
@@ -22,6 +22,11 @@ pub(crate) fn compute_mint_amount(
     all_delegations: &[Delegation],
     pending_rewards: Uint128,
 ) -> StdResult<Uint128> {
+    // With no supply there is nobody to price against: mint 1:1 regardless of any native the
+    // contract already holds (pricing against it would mint 0 for the first bonder).
+    if usteak_supply.is_zero() {
+        return Ok(native_to_bond);
+    }
     let native_bonded = total_delegated(all_delegations)?
         .checked_add(pending_rewards.u128())
         .ok_or_else(|| StdError::generic_err("delegation total overflow"))?;
@@ -58,7 +63,62 @@ pub(crate) fn compute_unbond_amount(
         .map_err(|err| StdError::generic_err(format!("failed to compute unbond amount: {err}")))
 }
 
-fn total_delegated(delegations: &[Delegation]) -> StdResult<u128> {
+/// Derivative tokens locked in the hub, at least, when it mints at zero supply.
+pub(crate) const MIN_DEAD_SHARES: u128 = 1_000;
+
+/// The first mint at zero supply. There is no price to go by, so dead shares, minted to the hub
+/// itself and never redeemable, are locked alongside the bonder's: worth `existing_backing`
+/// (tracked stake or rewards left from earlier holders) so the bonder cannot claim what was
+/// already there, and at least `MIN_DEAD_SHARES`. Untracked idle is excluded: it receives
+/// proportional dead shares only if it is later swept into delegated backing. Whatever part of
+/// the minimum no existing backing covers comes out of the bonder's own mint, so the exchange
+/// rate stays exactly 1:1 and the bonder's cost is at most `MIN_DEAD_SHARES`; a deposit too small
+/// to cover it is refused.
+///
+/// Returns (minted to the bonder, dead shares).
+pub(crate) fn compute_first_mint(
+    native_to_bond: Uint128,
+    existing_backing: Uint128,
+) -> StdResult<(Uint128, Uint128)> {
+    let dead = existing_backing.max(Uint128::new(MIN_DEAD_SHARES));
+    let unbacked = dead - existing_backing;
+    if native_to_bond <= unbacked {
+        return Err(StdError::generic_err(format!(
+            "the first bond into an empty hub must exceed {} base units",
+            unbacked
+        )));
+    }
+    Ok((native_to_bond - unbacked, dead))
+}
+
+/// Shares to lock when idle native becomes delegated backing.
+///
+/// Idle is deliberately excluded from bond pricing because anyone can increase it with a plain
+/// transfer. Delegating it without increasing supply would nevertheless raise the exchange rate,
+/// letting a bonder immediately before the sweep capture some of it. Minting these shares to the
+/// hub keeps the priced backing per share from increasing. Round up so integer truncation cannot
+/// leave even a one-unit upward jump.
+pub(crate) fn compute_idle_sweep_shares(
+    share_supply: Uint128,
+    idle_to_delegate: Uint128,
+    tracked_backing: Uint128,
+) -> StdResult<Uint128> {
+    // With no supply there is nobody to front-run. With no tracked backing, public bonds are
+    // already refused, so the owner may use the sweep to restore backing without a cheap mint.
+    if share_supply.is_zero() || idle_to_delegate.is_zero() || tracked_backing.is_zero() {
+        return Ok(Uint128::zero());
+    }
+
+    let numerator = Uint256::from(share_supply).checked_mul(Uint256::from(idle_to_delegate))?;
+    let denominator = Uint256::from(tracked_backing);
+    let rounded_up = numerator
+        .checked_add(denominator.checked_sub(Uint256::from(1u128))?)?
+        .checked_div(denominator)?;
+    Uint128::try_from(rounded_up)
+        .map_err(|err| StdError::generic_err(format!("idle sweep share amount overflow: {err}")))
+}
+
+pub(crate) fn total_delegated(delegations: &[Delegation]) -> StdResult<u128> {
     delegations.iter().try_fold(0u128, |total, delegation| {
         total
             .checked_add(delegation.amount)
@@ -286,74 +346,31 @@ pub(crate) fn compute_redelegations_for_rebalancing(
 // Batch logics
 //--------------------------------------------------------------------------------------------------
 
-/// If the received native amount after the unbonding period is less than expected, e.g. due to
-/// rounding error or the validator(s) being slashed, then deduct the difference in amount evenly
-/// from each unreconciled batch.
-///
-/// The idea of "reconciling" is based on Stader's implementation:
-/// https://github.com/stader-labs/stader-liquid-token/blob/v0.2.1/contracts/staking/src/contract.rs#L968-L1048
+/// `floor(deduct * cumulative / total)`: how much of `deduct` the batches holding the first
+/// `cumulative` of `total` bear together. Charging each batch the step between consecutive
+/// cumulative values shares `deduct` pro rata, keeps every batch within one unit of its exact
+/// share, and adds up to exactly `deduct` once `cumulative` reaches `total`.
+pub(crate) fn cumulative_share(deduct: Uint128, cumulative: Uint128, total: Uint128) -> Uint128 {
+    if total.is_zero() {
+        return Uint128::zero();
+    }
+    let share = deduct.full_mul(cumulative) / Uint256::from(total);
+    Uint128::try_from(share).unwrap_or(Uint128::MAX)
+}
+
+/// Write `native_to_deduct` (capped at what the batches hold) down across `batches` in proportion
+/// to what each holds, and mark them reconciled. The batches share one balance, so a missing
+/// amount cannot be attributed to any one of them. Exactly the capped amount is applied.
 pub(crate) fn reconcile_batches(batches: &mut [Batch], native_to_deduct: Uint128) {
-    let batch_count = batches.len() as u128;
-    if batch_count == 0 {
-        return;
-    }
-    let native_per_batch = native_to_deduct.u128() / batch_count;
-    let remainder = native_to_deduct.u128() % batch_count;
-    //let mut remaining_underflow = Uint128::zero();
-    let mut underflows: HashMap<usize, Uint128> = HashMap::default();
-
-    // distribute the underflows uniformly accross non-underflowing batches
-    for (i, batch) in batches.iter_mut().enumerate() {
-        let remainder_for_batch: u128 = u128::from((i + 1) as u128 <= remainder);
-        let native_for_batch = Uint128::new(native_per_batch + remainder_for_batch);
-
-        if batch.amount_unclaimed < native_for_batch && batch_count > 1 {
-            //    remaining_underflow += native_for_batch - batch.amount_unclaimed;
-            underflows.insert(i, native_for_batch - batch.amount_unclaimed);
-        }
-        batch.amount_unclaimed = batch.amount_unclaimed.saturating_sub(native_for_batch);
-
+    let total: Uint128 = batches.iter().map(|b| b.amount_unclaimed).sum();
+    let deduct = native_to_deduct.min(total);
+    let mut cumulative = Uint128::zero();
+    let mut taken = Uint128::zero();
+    for batch in batches.iter_mut() {
+        cumulative += batch.amount_unclaimed;
+        let target = cumulative_share(deduct, cumulative, total);
+        batch.amount_unclaimed -= target - taken;
+        taken = target;
         batch.reconciled = true;
-    }
-    if !underflows.is_empty() {
-        let batch_count: u128 = batch_count - (underflows.len() as u128);
-        if batch_count == 0 {
-            return;
-        }
-        let to_deduct: Uint128 = underflows.iter().map(|v| v.1).sum();
-        let native_per_batch = to_deduct.u128() / batch_count;
-        let remainder = to_deduct.u128() % batch_count;
-        let mut remaining_underflow = Uint128::zero();
-        // the remaining underflow will be applied by oldest batch first.
-        for (i, batch) in batches.iter_mut().enumerate() {
-            if !batch.amount_unclaimed.is_zero() {
-                let remainder_for_batch: u128 = u128::from((i + 1) as u128 <= remainder);
-                let native_for_batch = Uint128::new(native_per_batch + remainder_for_batch);
-                if batch.amount_unclaimed < native_for_batch && batch_count > 1 {
-                    remaining_underflow += native_for_batch - batch.amount_unclaimed;
-                }
-                batch.amount_unclaimed = batch.amount_unclaimed.saturating_sub(native_for_batch);
-            }
-        }
-
-        if !remaining_underflow.is_zero() {
-            // the remaining underflow will be applied by oldest batch first.
-            for batch in batches.iter_mut() {
-                //.enumerate() {
-                if !batch.amount_unclaimed.is_zero() && !remaining_underflow.is_zero() {
-                    if batch.amount_unclaimed >= remaining_underflow {
-                        batch.amount_unclaimed -= remaining_underflow;
-                        remaining_underflow = Uint128::zero()
-                    } else {
-                        remaining_underflow -= batch.amount_unclaimed;
-                        batch.amount_unclaimed = Uint128::zero();
-                    }
-                }
-            }
-
-            if !remaining_underflow.is_zero() {
-                // no way to reconcile right now, need to top up some funds.
-            }
-        }
     }
 }

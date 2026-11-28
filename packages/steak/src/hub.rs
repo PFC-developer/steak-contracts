@@ -118,6 +118,14 @@ pub enum ExecuteMsg {
         validator_from: String,
         validator_to: String,
     },
+    /// Owner only. Delegate native that sits in the contract unaccounted for (see
+    /// `QueryMsg::IdleFunds`). Proportional dead shares are locked in the hub at the same time, so
+    /// the sweep does not move the exchange rate: the swept value does not go to current holders
+    /// (nor back to a written-down batch); it is staked and locked. `amount` defaults to all of it
+    /// and may not exceed it. No fee is taken. Attached funds are refused.
+    ReinvestIdle {
+        amount: Option<Uint128>,
+    },
     /// Owner only. Redelegate all stake held on validators that are not in the active set (paused,
     /// or removed without redelegation) onto the active validators the chain currently has bonded,
     /// evening them out.
@@ -133,17 +141,18 @@ pub enum ExecuteMsg {
     /// redelegations mature. A source that is blocked is planned again on every run; pass it in
     /// `exclude` (which skips a validator as both source and destination) so it does not use up
     /// `limit`. `limit` caps the number of redelegations sent in one call (default 25, max 50).
-    /// Owner only. Delegate native that sits in the contract unaccounted for (see
-    /// `QueryMsg::IdleFunds`) so it earns for current holders. `amount` defaults to all of it and
-    /// may not exceed it. No fee is taken.
-    ReinvestIdle {
-        amount: Option<Uint128>,
-    },
     RedelegateInactive {
         limit: Option<u32>,
         exclude: Option<Vec<String>>,
     },
-    /// Update Luna amounts in unbonding batches to reflect any slashing or rounding errors
+    /// Update Luna amounts in unbonding batches to reflect any slashing or rounding errors.
+    ///
+    /// A batch is reconciled only by a call in a later block than the one in which it was first
+    /// observed past its estimated unbonding end (the staking module pays out at the end of a
+    /// block). So `Reconcile` followed by `WithdrawUnbonded` in the same transaction cannot
+    /// withdraw a batch that has only just matured: send the withdrawal in a later block. After a
+    /// migration that finds an already-matured batch, a later-block `Reconcile` also finalises the
+    /// one-time reserve initialisation before withdrawals resume.
     Reconcile {},
     /// Submit the current pending batch of unbonding requests to be unbonded
     SubmitBatch {},
@@ -195,10 +204,18 @@ pub enum CallbackMsg {
     /// Following the swaps, stake the Luna acquired to the whitelisted validators
     Reinvest {},
     /// Following inactive-validator redelegations, withdraw the remaining validator rewards
-    /// without replacing the balance baseline captured before those redelegations.
-    HarvestAfterRedelegation {},
+    /// without replacing the balance baseline captured before those redelegations. `exclude` is
+    /// the caller's `RedelegateInactive` exclude list, passed on to the reinvest.
+    HarvestAfterRedelegation {
+        #[serde(default)]
+        exclude: Vec<String>,
+    },
     /// Reinvest rewards if the preceding operations produced any; otherwise succeed as a no-op.
-    ReinvestIfNeeded {},
+    /// Validators in `exclude` are not chosen for the reinvest delegation.
+    ReinvestIfNeeded {
+        #[serde(default)]
+        exclude: Vec<String>,
+    },
 }
 
 impl CallbackMsg {
@@ -286,7 +303,9 @@ pub struct IdleFundsResponse {
     pub balance: Uint128,
     /// Rewards recorded and waiting for the next reinvest
     pub unlocked: Uint128,
-    /// Owed to every unbonding batch that still has claims, whether or not its funds arrived yet
+    /// Owed to batches whose funds could already be in the balance: reconciled ones, and every
+    /// unreconciled one except a batch whose chain-reported unbonding end is still ahead. While
+    /// reserve initialization is pending this equals `balance`, making `idle` zero.
     pub owed_to_batches: Uint128,
     /// `balance - unlocked - owed_to_batches`, floored at zero
     pub idle: Uint128,

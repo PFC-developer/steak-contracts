@@ -24,12 +24,8 @@ pub const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const REPLY_INSTANTIATE_TOKEN: u64 = 1;
 pub const REPLY_REGISTER_RECEIVED_COINS: u64 = 2;
 pub const REPLY_SUBMIT_BATCH: u64 = 3;
-/// How long after a batch's estimated unbonding end `Reconcile` waits before treating missing
-/// funds as slashed. The staking module pays out matured unbondings at the end of a block, after
-/// that block's transactions, so without a margin a `Reconcile` in the first block past the
-/// estimated end sees the funds as missing and writes the batch down permanently. Ten minutes
-/// covers well over ten blocks on every chain the hub is deployed on, plus small clock skew.
-pub const RECONCILE_GRACE_SECONDS: u64 = 600;
+/// Each undelegation `SubmitBatch` sends; its reply carries the real unbonding completion time.
+pub const REPLY_UNDELEGATE: u64 = 5;
 /// `RedelegateInactive` uses one reply id per planned redelegation, starting here, so the reply
 /// handler can say which redelegation the staking module refused.
 pub const REPLY_REDELEGATE_INACTIVE_BASE: u64 = 1_000;
@@ -97,7 +93,13 @@ pub fn execute(deps: DepsMut, env: Env, info: MessageInfo, msg: ExecuteMsg) -> S
         } => execute::redelegate(deps, env, info.sender, validator_from, validator_to),
         ExecuteMsg::ReinvestIdle {
             amount,
-        } => execute::reinvest_idle(deps, env, info.sender, amount),
+        } => {
+            // Attached funds would count as idle and be swept (and locked) with it.
+            if !info.funds.is_empty() {
+                return Err(StdError::generic_err("ReinvestIdle does not accept funds"));
+            }
+            execute::reinvest_idle(deps, env, info.sender, amount)
+        },
         ExecuteMsg::RedelegateInactive {
             limit,
             exclude,
@@ -170,8 +172,12 @@ fn callback(
 
     match callback_msg {
         CallbackMsg::Reinvest {} => execute::reinvest(deps, env),
-        CallbackMsg::HarvestAfterRedelegation {} => execute::harvest_after_redelegation(deps, env),
-        CallbackMsg::ReinvestIfNeeded {} => execute::reinvest_if_needed(deps, env),
+        CallbackMsg::HarvestAfterRedelegation {
+            exclude,
+        } => execute::harvest_after_redelegation(deps, env, exclude),
+        CallbackMsg::ReinvestIfNeeded {
+            exclude,
+        } => execute::reinvest_if_needed(deps, env, exclude),
     }
 }
 
@@ -188,6 +194,7 @@ pub fn reply(deps: DepsMut, env: Env, reply: Reply) -> StdResult<Response> {
             execute::register_received_coins(deps, env, unwrap_reply(reply)?.events)
         },
         REPLY_SUBMIT_BATCH => Ok(execute::submit_batch_deferred(reply)),
+        REPLY_UNDELEGATE => execute::register_undelegation(deps, env, reply),
         id if is_redelegate_inactive_reply(id) => {
             execute::redelegate_inactive_reply(deps, env, reply)
         },
@@ -225,7 +232,7 @@ pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
 }
 
 #[entry_point]
-pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> StdResult<Response> {
+pub fn migrate(mut deps: DepsMut, env: Env, _msg: MigrateMsg) -> StdResult<Response> {
     let contract_version = get_contract_version(deps.storage).unwrap_or_else(|_| ContractVersion {
         contract: "steak-hub-tf".to_string(),
         version: "0".to_string(),
@@ -271,12 +278,36 @@ pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> StdResult<Response
         }
     }
 
+    let reserve_initialization =
+        execute::prepare_native_reserved_initialization(deps.branch(), &env)?;
+    let (native_reserved, legacy_written_down) = match &reserve_initialization {
+        execute::ReserveInitStep::Done {
+            reserved,
+            written_down,
+            ..
+        } => (reserved.to_string(), written_down.to_string()),
+        _ => ("pending".to_string(), "pending".to_string()),
+    };
+
+    let reserve_pending = native_reserved == "pending";
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
 
     Ok(Response::new()
+        .add_event(execute::reserve_initialization_event(&reserve_initialization))
         .add_attribute("previous_contract_name", &contract_version.contract)
         .add_attribute("previous_contract_version", &contract_version.version)
         .add_attribute("new_contract_name", CONTRACT_NAME)
         .add_attribute("new_contract_version", CONTRACT_VERSION)
-        .add_attribute("validator_registry_repairs", validator_registry_repairs.to_string()))
+        .add_attribute("validator_registry_repairs", validator_registry_repairs.to_string())
+        .add_attribute("native_reserved", native_reserved)
+        .add_attribute("pool_written_down", legacy_written_down)
+        .add_attribute(
+            "next_step",
+            if reserve_pending {
+                "send Reconcile in later blocks until steakhub/reserve_initialization status=done; \
+                 withdrawals wait until then"
+            } else {
+                "none"
+            },
+        ))
 }
