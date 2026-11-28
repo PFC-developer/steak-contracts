@@ -116,6 +116,14 @@ pub enum ExecuteMsg {
         validator_from: String,
         validator_to: String,
     },
+    /// Owner only. Delegate native that sits in the contract unaccounted for (see
+    /// `QueryMsg::IdleFunds`). Proportional dead shares are locked in the hub at the same time, so
+    /// the sweep does not move the exchange rate: the swept value does not go to current holders
+    /// (nor back to a written-down batch); it is staked and locked. `amount` defaults to all of it
+    /// and may not exceed it. No fee is taken. Attached funds are refused.
+    ReinvestIdle {
+        amount: Option<Uint128>,
+    },
     /// Owner only. Redelegate all stake held on validators that are not in the active set (paused,
     /// or removed without redelegation) onto the active validators the chain currently has bonded,
     /// evening them out.
@@ -223,6 +231,9 @@ impl CallbackMsg {
 pub enum QueryMsg {
     /// The contract's configurations. Response: `ConfigResponse`
     Config {},
+    /// Native held by the contract that nothing accounts for (not delegated, not recorded as
+    /// rewards to reinvest, not owed to an unbonding batch). Response: `IdleFundsResponse`
+    IdleFunds {},
     /// The contract's current state. Response: `StateResponse`
     State {},
     /// The current batch on unbonding requests pending submission. Response: `PendingBatch`
@@ -281,6 +292,21 @@ pub struct ConfigResponse {
     pub paused_validators: Vec<String>,
     pub dust_collector: Option<String>,
     pub token_factory: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, JsonSchema)]
+pub struct IdleFundsResponse {
+    pub denom: String,
+    /// The contract's native balance
+    pub balance: Uint128,
+    /// Rewards recorded and waiting for the next reinvest
+    pub unlocked: Uint128,
+    /// Owed to batches whose funds could already be in the balance: reconciled ones, and every
+    /// unreconciled one except a batch whose chain-reported unbonding end is still ahead. While
+    /// reserve initialization is pending this equals `balance`, making `idle` zero.
+    pub owed_to_batches: Uint128,
+    /// `balance - unlocked - owed_to_batches`, floored at zero
+    pub idle: Uint128,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, JsonSchema)]

@@ -11,8 +11,8 @@ use cw20_base::msg::InstantiateMsg as Cw20InstantiateMsg;
 use pfc_steak::{
     DecimalCheckedOps,
     hub::{
-        Batch, CallbackMsg, Cw20HookMsg, ExecuteMsg, FeeType, InstantiateMsg, PendingBatch,
-        UnbondRequest,
+        Batch, CallbackMsg, Cw20HookMsg, ExecuteMsg, FeeType, IdleFundsResponse, InstantiateMsg,
+        PendingBatch, UnbondRequest,
     },
 };
 
@@ -20,17 +20,22 @@ use crate::{
     contract::{
         REDELEGATE_INACTIVE_DEFAULT_LIMIT, REDELEGATE_INACTIVE_MAX_LIMIT, REPLY_INSTANTIATE_TOKEN,
         REPLY_REDELEGATE_INACTIVE_BASE, REPLY_REGISTER_RECEIVED_COINS, REPLY_SUBMIT_BATCH,
+        REPLY_UNDELEGATE,
     },
     helpers::{
-        get_denom_balance, parse_received_fund, query_all_delegations, query_cw20_total_supply,
-        query_delegation, query_delegations,
+        get_denom_balance, latest_unbond_completion, parse_received_fund, query_all_delegations,
+        query_cw20_total_supply, query_delegation, query_delegations,
     },
     math::{
-        compute_mint_amount, compute_redelegations_for_inactive,
-        compute_redelegations_for_rebalancing, compute_redelegations_for_removal,
-        compute_unbond_amount, compute_undelegations, cumulative_share, reconcile_batches,
+        compute_first_mint, compute_idle_sweep_shares, compute_mint_amount,
+        compute_redelegations_for_inactive, compute_redelegations_for_rebalancing,
+        compute_redelegations_for_removal, compute_unbond_amount, compute_undelegations,
+        cumulative_share, reconcile_batches, total_delegated,
     },
-    state::{NATIVE_RESERVED, RECONCILE_OBSERVED_HEIGHTS, RESERVE_INIT, ReserveInit, State},
+    state::{
+        CHAIN_REPORTED_END, DEAD_SHARES, NATIVE_RESERVED, RECONCILE_OBSERVED_HEIGHTS, RESERVE_INIT,
+        ReserveInit, SUBMITTED_BATCH, State,
+    },
     types::{Coins, Delegation, Redelegation},
 };
 //--------------------------------------------------------------------------------------------------
@@ -166,16 +171,43 @@ pub fn bond(
 
     // Query the current supply of Steak and compute the amount to mint
     let usteak_supply = query_cw20_total_supply(&deps.querier, &steak_token)?;
-    if !usteak_supply.is_zero() && all_delegations.iter().all(|d| d.amount == 0) {
+    // Dead shares (see `compute_first_mint`) are nobody's; only other supply needs backing.
+    let dead_now = DEAD_SHARES.may_load(deps.storage)?.unwrap_or_default();
+    if usteak_supply > dead_now && all_delegations.iter().all(|d| d.amount == 0) {
         return Err(StdError::generic_err(
             "cannot bond while derivative supply exists without delegated backing",
         ));
     }
-    let usteak_to_mint = compute_mint_amount(usteak_supply, amount_to_bond, &all_delegations)?;
-    state.prev_denom.save(
-        deps.storage,
-        &get_denom_balance(&deps.querier, env.contract.address.clone(), denom.clone())?,
-    )?;
+    let pending =
+        pending_rewards_net(deps.as_ref(), &env, &all_delegations, &denom, amount_to_bond)?;
+    // Only dead shares left and nothing tracked behind them (e.g. their stake was slashed away):
+    // they are worthless, so burn them and bond into an empty hub.
+    let tracked = Uint128::new(total_delegated(&all_delegations)?).checked_add(pending)?;
+    let burn_dead = !dead_now.is_zero() && usteak_supply <= dead_now && tracked.is_zero();
+    let usteak_supply = if burn_dead {
+        DEAD_SHARES.save(deps.storage, &Uint128::zero())?;
+        usteak_supply.checked_sub(dead_now)?
+    } else {
+        usteak_supply
+    };
+    let (usteak_to_mint, dead_shares) = if usteak_supply.is_zero() {
+        // Untracked idle is deliberately absent here. It is excluded from public bond pricing
+        // and receives its own proportional dead shares if and when the owner delegates it.
+        // Counting it now as well would lock the same idle twice and dilute this first bonder.
+        compute_first_mint(amount_to_bond, tracked)?
+    } else {
+        (
+            compute_mint_amount(usteak_supply, amount_to_bond, &all_delegations, pending)?,
+            Uint128::zero(),
+        )
+    };
+    if !dead_shares.is_zero() {
+        let dead = DEAD_SHARES.may_load(deps.storage)?.unwrap_or_default();
+        DEAD_SHARES.save(deps.storage, &dead.checked_add(dead_shares)?)?;
+    }
+    if usteak_to_mint.is_zero() {
+        return Err(StdError::generic_err("bond amount is too small to mint derivative tokens"));
+    }
 
     let delegate_submsg =
         SubMsg::reply_on_success(new_delegation.to_cosmos_msg(), REPLY_REGISTER_RECEIVED_COINS);
@@ -259,7 +291,33 @@ pub fn bond(
         .add_attribute("steak_receiver", receiver)
         .add_attribute("denom_bonded", denom)
         .add_attribute("denom_amount", amount_to_bond)
-        .add_attribute("usteak_minted", usteak_to_mint);
+        .add_attribute("usteak_minted", usteak_to_mint)
+        .add_attribute("dead_shares", dead_shares);
+
+    let mut mint_msgs = mint_msgs;
+    if burn_dead {
+        mint_msgs.insert(
+            0,
+            CosmosMsg::Wasm(WasmMsg::Execute {
+                contract_addr: steak_token.to_string(),
+                msg: to_json_binary(&Cw20ExecuteMsg::Burn {
+                    amount: dead_now,
+                })?,
+                funds: vec![],
+            }),
+        );
+    }
+    if !dead_shares.is_zero() {
+        // Dead shares are minted to the hub itself and never redeemed.
+        mint_msgs.push(CosmosMsg::Wasm(WasmMsg::Execute {
+            contract_addr: steak_token.to_string(),
+            msg: to_json_binary(&Cw20ExecuteMsg::Mint {
+                recipient: env.contract.address.to_string(),
+                amount: dead_shares,
+            })?,
+            funds: vec![],
+        }));
+    }
 
     Ok(Response::new()
         .add_submessage(delegate_submsg)
@@ -270,13 +328,6 @@ pub fn bond(
 }
 
 pub fn harvest(deps: DepsMut, env: Env) -> StdResult<Response> {
-    let state = State::default();
-    let denom = state.denom.load(deps.storage)?;
-    state.prev_denom.save(
-        deps.storage,
-        &get_denom_balance(&deps.querier, env.contract.address.clone(), denom)?,
-    )?;
-
     let withdraw_submsgs = deps
         .querier
         .query_all_delegations(&env.contract.address)?
@@ -291,7 +342,12 @@ pub fn harvest(deps: DepsMut, env: Env) -> StdResult<Response> {
         })
         .collect::<Vec<_>>();
 
-    let callback_msg = CallbackMsg::Reinvest {}.into_cosmos_msg(&env.contract.address)?;
+    // Skip, rather than revert the harvest, when nothing can be bonded (no rewards, or the
+    // reserve initialisation is pending, or matured batches are owed the balance).
+    let callback_msg = CallbackMsg::ReinvestIfNeeded {
+        exclude: vec![],
+    }
+    .into_cosmos_msg(&env.contract.address)?;
 
     Ok(Response::new()
         .add_submessages(withdraw_submsgs)
@@ -299,10 +355,10 @@ pub fn harvest(deps: DepsMut, env: Env) -> StdResult<Response> {
         .add_attribute("action", "steakhub/harvest"))
 }
 
-/// Complete reward processing after inactive-validator redelegations. The caller captured
-/// `prev_denom` before those redelegations; preserve that baseline, withdraw rewards from every
-/// remaining delegation, then reinvest the complete balance delta. Withdrawing first also prevents
-/// the final delegation from surfacing an active validator's older rewards after reinvestment.
+/// Complete reward processing after inactive-validator redelegations: withdraw rewards from every
+/// remaining delegation (registered in `unlocked_coins` like the redelegations' own automatic
+/// withdrawals), then reinvest everything registered. Withdrawing first also keeps the final
+/// delegation from surfacing an active validator's older rewards after reinvestment.
 pub fn harvest_after_redelegation(
     deps: DepsMut,
     env: Env,
@@ -334,13 +390,21 @@ pub fn harvest_after_redelegation(
 }
 
 pub fn reinvest_if_needed(deps: DepsMut, env: Env, exclude: Vec<String>) -> StdResult<Response> {
-    let state = State::default();
-    let denom = state.denom.load(deps.storage)?;
-    let prev_coin = state.prev_denom.load(deps.storage)?;
-    let current_coin = get_denom_balance(&deps.querier, env.contract.address.clone(), denom)?;
-
-    if current_coin <= prev_coin {
+    let denom = State::default().denom.load(deps.storage)?;
+    // Same cap as `reinvest`: recorded rewards may exist that cannot be bonded yet (matured
+    // batches are owed the balance). Skip instead of failing, which would revert the
+    // redelegations this follows.
+    let (_, amount) = reinvestable(deps.as_ref(), &env, &denom, Uint128::zero())?;
+    if amount.is_zero() {
         return Ok(Response::new().add_attribute("action", "steakhub/reinvest_not_needed"));
+    }
+    // Likewise when every active validator is jailed or unbonded: keep the rewards recorded for a
+    // later harvest rather than revert this one.
+    let fee = State::default().fee_rate.load(deps.storage)?;
+    if fee < Decimal::one() && bonded_active_targets(deps.as_ref(), &exclude).is_err() {
+        return Ok(Response::new()
+            .add_attribute("action", "steakhub/reinvest_not_needed")
+            .add_attribute("reason", "no bonded active validator"));
     }
 
     reinvest_excluding(deps, env, &exclude)
@@ -365,45 +429,14 @@ fn reinvest_excluding(deps: DepsMut, env: Env, exclude: &[String]) -> StdResult<
     let denom = state.denom.load(deps.storage)?;
     let fee = state.fee_rate.load(deps.storage)?;
 
-    let validators_active = state.validators_active.load(deps.storage)?;
-    let bonded: Vec<String> =
-        deps.querier.query_all_validators()?.into_iter().map(|v| v.address).collect();
-    let validators: Vec<String> = validators_active
-        .into_iter()
-        .filter(|v| bonded.contains(v) && !exclude.contains(v))
-        .collect();
-    if validators.is_empty() {
-        return Err(StdError::generic_err("cannot reinvest without a bonded active validator"));
-    }
-    let prev_coin = state.prev_denom.load(deps.storage)?;
-    let current_coin =
-        get_denom_balance(&deps.querier, env.contract.address.clone(), denom.clone())?;
-
-    if current_coin <= prev_coin {
-        return Err(StdError::generic_err("no rewards"));
-    }
-    let amount_to_bond = current_coin.saturating_sub(prev_coin);
+    // Every staking message registers the rewards it withdraws (harvest's withdrawals, and the
+    // automatic withdrawals of delegate / undelegate / redelegate) in `unlocked_coins`; bond all of
+    // them. Never bond funds that matured unbonding batches are owed.
     let mut unlocked_coins = state.unlocked_coins.load(deps.storage)?;
-
-    /*
-
-        if unlocked_coins.is_empty() {
-            return Err(StdError::generic_err("no rewards"));
-        }
-        let amount_to_bond = unlocked_coins
-            .iter()
-            .find(|coin| coin.denom == denom)
-            .ok_or_else(|| StdError::generic_err("no native amount available to be bonded"))?
-            .amount;
-    */
-    let delegations = query_delegations(&deps.querier, &validators, &env.contract.address, &denom)?;
-    let mut validator = &delegations[0].validator;
-    let mut amount = delegations[0].amount;
-    for d in &delegations[1..] {
-        if d.amount < amount {
-            validator = &d.validator;
-            amount = d.amount;
-        }
+    let (unlocked_native, amount_to_bond) =
+        reinvestable(deps.as_ref(), &env, &denom, Uint128::zero())?;
+    if amount_to_bond.is_zero() {
+        return Err(StdError::generic_err("no rewards"));
     }
     let fee_amount = if fee.is_zero() {
         Uint128::zero()
@@ -412,9 +445,30 @@ fn reinvest_excluding(deps: DepsMut, env: Env, exclude: &[String]) -> StdResult<
     };
     let amount_to_bond_minus_fees = amount_to_bond.saturating_sub(fee_amount);
 
-    let new_delegation = Delegation::new(validator, amount_to_bond_minus_fees.u128(), &denom);
+    // A 100% fee is valid configuration. In that case there is nothing to delegate, and emitting
+    // a zero-amount staking message would make the chain reject and roll back the whole harvest.
+    let new_delegation = if amount_to_bond_minus_fees.is_zero() {
+        None
+    } else {
+        let validators = bonded_active_targets(deps.as_ref(), exclude)?;
+        let delegations =
+            query_delegations(&deps.querier, &validators, &env.contract.address, &denom)?;
+        let mut validator = &delegations[0].validator;
+        let mut amount = delegations[0].amount;
+        for d in &delegations[1..] {
+            if d.amount < amount {
+                validator = &d.validator;
+                amount = d.amount;
+            }
+        }
+        Some(Delegation::new(validator, amount_to_bond_minus_fees.u128(), &denom))
+    };
 
     unlocked_coins.retain(|coin| coin.denom != denom);
+    let native_left = unlocked_native - amount_to_bond;
+    if !native_left.is_zero() {
+        unlocked_coins.push(Coin::new(native_left.u128(), &denom));
+    }
     state.unlocked_coins.save(deps.storage, &unlocked_coins)?;
 
     let event = Event::new("steakhub/harvested")
@@ -424,7 +478,19 @@ fn reinvest_excluding(deps: DepsMut, env: Env, exclude: &[String]) -> StdResult<
         .add_attribute("fees_deducted", fee_amount)
         .add_attribute("denom_bonded", amount_to_bond_minus_fees);
 
-    if fee_amount > Uint128::zero() {
+    let mut response =
+        Response::new().add_event(event).add_attribute("action", "steakhub/reinvest");
+
+    if let Some(new_delegation) = new_delegation {
+        // Delegating withdraws the target's pending rewards; register them like every other
+        // staking message does.
+        response = response.add_submessage(SubMsg::reply_on_success(
+            new_delegation.to_cosmos_msg(),
+            REPLY_REGISTER_RECEIVED_COINS,
+        ));
+    }
+
+    if !fee_amount.is_zero() {
         let fee_account = state.fee_account.load(deps.storage)?;
         let fee_type = state.fee_account_type.load(deps.storage)?;
 
@@ -441,17 +507,245 @@ fn reinvest_excluding(deps: DepsMut, env: Env, exclude: &[String]) -> StdResult<
                 vec![msg.into_cosmos_msg(fee_account, vec![Coin::new(fee_amount.into(), &denom)])?]
             },
         };
-        Ok(Response::new()
-            .add_message(new_delegation.to_cosmos_msg())
-            .add_messages(send_msgs)
-            .add_event(event)
-            .add_attribute("action", "steakhub/reinvest"))
-    } else {
-        Ok(Response::new()
-            .add_message(new_delegation.to_cosmos_msg())
-            .add_event(event)
-            .add_attribute("action", "steakhub/reinvest"))
+        response = response.add_messages(send_msgs);
     }
+
+    Ok(response)
+}
+
+/// What the backing that bonds are priced against holds beyond delegated stake: the holders'
+/// after-fee share of rewards not yet restaked (recorded ones, as far as the balance backs them,
+/// plus those still accruing on each delegation). Only what the contract tracks counts: untracked
+/// native (see `idle_native`) is left out, since anyone could raise it with a plain transfer to
+/// inflate the price bonders pay. `deposit` is the native that arrived with the current message.
+pub(crate) fn pending_rewards_net(
+    deps: cosmwasm_std::Deps,
+    env: &Env,
+    delegations: &[Delegation],
+    denom: &str,
+    deposit: Uint128,
+) -> StdResult<Uint128> {
+    let fee = State::default().fee_rate.load(deps.storage)?;
+    // Recorded rewards are in the balance and belong to existing holders, whatever batches are
+    // owed at the moment (e.g. a matured batch whose payout lands at the end of this block): count
+    // them up to what the balance holds. Only the actual reinvest needs the conservative cap.
+    let unlocked = Coins(State::default().unlocked_coins.load(deps.storage)?).find(denom).amount;
+    let mut gross = unlocked.min(
+        get_denom_balance(&deps.querier, env.contract.address.clone(), denom.into())?
+            .saturating_sub(deposit),
+    );
+    for d in delegations {
+        if let Some(full) = deps.querier.query_delegation(&env.contract.address, &d.validator)? {
+            gross += full
+                .accumulated_rewards
+                .iter()
+                .filter(|c| c.denom == denom)
+                .map(|c| c.amount)
+                .sum::<Uint128>();
+        }
+    }
+    let fee_amount = if fee.is_zero() {
+        Uint128::zero()
+    } else {
+        fee.checked_mul_uint(gross)?
+    };
+    Ok(gross.saturating_sub(fee_amount))
+}
+
+/// Which unbonding batches count as owed out of the current balance.
+#[derive(Clone, Copy)]
+pub(crate) enum Owed {
+    /// Batches whose payout is due by `now` (reconciled, or unreconciled with their end at or
+    /// before `now`). Used to cap bonding recorded rewards: those are tracked and really in the
+    /// balance, so only funds a due batch needs must be left alone.
+    DueBy(u64),
+    /// Every batch whose funds could already be in the balance: all unreconciled batches except
+    /// one whose end was reported by the chain (`CHAIN_REPORTED_END`) and is still after `now`. A
+    /// batch whose end is only the configured estimate may have been paid early. Used before
+    /// treating any untracked balance as idle.
+    PossiblyPaid(u64),
+}
+
+/// Native that unbonding batches are owed out of the balance (see `Owed`). Reconciled batches
+/// come from the running `NATIVE_RESERVED` total; unreconciled ones (few: only those still
+/// unbonding or awaiting `Reconcile`) are summed. Returns `None` while the one-time reserve
+/// initialisation is pending, when what is owed is not known yet.
+pub(crate) fn native_owed_to_batches(
+    storage: &dyn cosmwasm_std::Storage,
+    mode: Owed,
+) -> StdResult<Option<Uint128>> {
+    let reserved = match NATIVE_RESERVED.may_load(storage)? {
+        Some(reserved) => reserved,
+        None => return Ok(None),
+    };
+    let unreconciled = State::default()
+        .previous_batches
+        .idx
+        .reconciled
+        .prefix(false.into())
+        .range(storage, None, None, Order::Ascending)
+        .map(|item| item.map(|(_, b)| b))
+        .collect::<StdResult<Vec<Batch>>>()?;
+    let mut owed = reserved;
+    for batch in unreconciled {
+        let counts = match mode {
+            Owed::DueBy(now) => batch.est_unbond_end_time <= now,
+            Owed::PossiblyPaid(now) => {
+                batch.est_unbond_end_time <= now
+                    || !CHAIN_REPORTED_END.may_load(storage, batch.id)?.unwrap_or(false)
+            },
+        };
+        if counts {
+            owed = owed.checked_add(batch.amount_unclaimed)?;
+        }
+    }
+    Ok(Some(owed))
+}
+
+/// The recorded native rewards, and how much of them may be bonded now: never funds that matured
+/// or reconciled batches are owed (nothing while the reserve initialisation is pending), and never
+/// `deposit` (funds that arrived with the current message).
+pub(crate) fn reinvestable(
+    deps: cosmwasm_std::Deps,
+    env: &Env,
+    denom: &str,
+    deposit: Uint128,
+) -> StdResult<(Uint128, Uint128)> {
+    let unlocked = Coins(State::default().unlocked_coins.load(deps.storage)?).find(denom).amount;
+    let available =
+        match native_owed_to_batches(deps.storage, Owed::DueBy(env.block.time.seconds()))? {
+            Some(owed) => {
+                get_denom_balance(&deps.querier, env.contract.address.clone(), denom.into())?
+                    .saturating_sub(deposit)
+                    .saturating_sub(owed)
+            },
+            None => Uint128::zero(),
+        };
+    Ok((unlocked, unlocked.min(available)))
+}
+
+/// Where reinvested or swept funds may be delegated: active validators the chain has bonded right
+/// now (stake on a jailed or unbonded validator earns nothing), minus `exclude`.
+pub(crate) fn bonded_active_targets(
+    deps: cosmwasm_std::Deps,
+    exclude: &[String],
+) -> StdResult<Vec<String>> {
+    let active = State::default().validators_active.load(deps.storage)?;
+    let bonded: Vec<String> =
+        deps.querier.query_all_validators()?.into_iter().map(|v| v.address).collect();
+    let targets: Vec<String> =
+        active.into_iter().filter(|v| bonded.contains(v) && !exclude.contains(v)).collect();
+    if targets.is_empty() {
+        return Err(StdError::generic_err("cannot reinvest without a bonded active validator"));
+    }
+    Ok(targets)
+}
+
+/// Native sitting in the contract that nothing accounts for: not delegated, not recorded as
+/// rewards waiting to be reinvested, and not owed to a batch whose funds can already be here
+/// (reconciled, or matured). It comes from rewards
+/// withdrawn as a side effect of staking messages before they were recorded, and from unbonding
+/// funds that arrived after their batch was written down. Zero while the reserve initialisation is
+/// pending (what is owed is not known yet).
+pub(crate) fn idle_native(deps: cosmwasm_std::Deps, env: &Env) -> StdResult<IdleFundsResponse> {
+    idle_native_with_deposit(deps, env, Uint128::zero())
+}
+
+fn idle_native_with_deposit(
+    deps: cosmwasm_std::Deps,
+    env: &Env,
+    deposit: Uint128,
+) -> StdResult<IdleFundsResponse> {
+    let state = State::default();
+    let denom = state.denom.load(deps.storage)?;
+    let balance = get_denom_balance(&deps.querier, env.contract.address.clone(), denom.clone())?
+        .saturating_sub(deposit);
+    let unlocked = Coins(state.unlocked_coins.load(deps.storage)?).find(&denom).amount;
+    // Only batches whose funds can already be in the balance (reconciled, or matured by now):
+    // batches still unbonding have not been paid yet. This relies on accurate batch end times.
+    let owed_to_batches =
+        native_owed_to_batches(deps.storage, Owed::PossiblyPaid(env.block.time.seconds()))?
+            .unwrap_or(balance);
+    Ok(IdleFundsResponse {
+        denom,
+        balance,
+        unlocked,
+        owed_to_batches,
+        idle: balance.saturating_sub(unlocked).saturating_sub(owed_to_batches),
+    })
+}
+
+/// Owner only: delegate idle native (see `idle_native`) to the active validator with the smallest
+/// delegation. Proportional shares are locked in the hub so moving previously unpriced idle into
+/// delegated backing cannot raise the exchange rate. No fee is taken: idle funds are not all
+/// rewards.
+pub fn reinvest_idle(
+    deps: DepsMut,
+    env: Env,
+    sender: Addr,
+    amount: Option<Uint128>,
+) -> StdResult<Response> {
+    let state = State::default();
+    state.assert_owner(deps.storage, &sender)?;
+
+    let idle = idle_native(deps.as_ref(), &env)?;
+    let amount = amount.unwrap_or(idle.idle);
+    if amount.is_zero() {
+        return Err(StdError::generic_err("no idle funds to reinvest"));
+    }
+    if amount > idle.idle {
+        return Err(StdError::generic_err(format!(
+            "amount exceeds idle funds: {} > {}",
+            amount, idle.idle
+        )));
+    }
+
+    let all_delegations = query_all_delegations(&deps.querier, &env.contract.address)?;
+    let steak_token = state.steak_token.load(deps.storage)?;
+    let share_supply = query_cw20_total_supply(&deps.querier, &steak_token)?;
+    let pending =
+        pending_rewards_net(deps.as_ref(), &env, &all_delegations, &idle.denom, Uint128::zero())?;
+    let tracked_backing = Uint128::new(total_delegated(&all_delegations)?).checked_add(pending)?;
+    let dead_shares = compute_idle_sweep_shares(share_supply, amount, tracked_backing)?;
+
+    let validators = bonded_active_targets(deps.as_ref(), &[])?;
+    let target_delegations =
+        query_delegations(&deps.querier, &validators, &env.contract.address, &idle.denom)?;
+    let target =
+        target_delegations.iter().min_by_key(|d| d.amount).map(|d| d.validator.clone()).unwrap();
+
+    let dead_share_mint = if dead_shares.is_zero() {
+        None
+    } else {
+        Some(CosmosMsg::Wasm(WasmMsg::Execute {
+            contract_addr: steak_token.to_string(),
+            msg: to_json_binary(&Cw20ExecuteMsg::Mint {
+                recipient: env.contract.address.to_string(),
+                amount: dead_shares,
+            })?,
+            funds: vec![],
+        }))
+    };
+    if !dead_shares.is_zero() {
+        let dead = DEAD_SHARES.may_load(deps.storage)?.unwrap_or_default();
+        DEAD_SHARES.save(deps.storage, &dead.checked_add(dead_shares)?)?;
+    }
+
+    let event = Event::new("steakhub/reinvested_idle")
+        .add_attribute("validator", &target)
+        .add_attribute("amount", amount)
+        .add_attribute("idle_before", idle.idle)
+        .add_attribute("dead_shares", dead_shares);
+
+    let mut response = Response::new().add_submessage(SubMsg::reply_on_success(
+        Delegation::new(&target, amount.u128(), &idle.denom).to_cosmos_msg(),
+        REPLY_REGISTER_RECEIVED_COINS,
+    ));
+    if let Some(dead_share_mint) = dead_share_mint {
+        response = response.add_message(dead_share_mint);
+    }
+
+    Ok(response.add_event(event).add_attribute("action", "steakhub/reinvest_idle"))
 }
 
 /// NOTE: a `SubMsgResponse` may contain multiple coin-receiving events, must handle them
@@ -466,9 +760,16 @@ pub fn register_received_coins(
         return Ok(Response::new());
     }
 
+    // An event this cannot parse is skipped and counted rather than failing the reply, which
+    // would revert the staking message (and, for `RedelegateInactive`, the whole run). Native it
+    // carried then shows up as idle and can be restaked with `ReinvestIdle`.
     let mut received_coins = Coins(vec![]);
+    let mut unparsed = 0u32;
     for event in &events {
-        received_coins.add_many(&parse_coin_receiving_event(&env, event)?)?;
+        match parse_coin_receiving_event(&env, event) {
+            Ok(coins) => received_coins.add_many(&coins)?,
+            Err(_) => unparsed += 1,
+        }
     }
 
     let state = State::default();
@@ -478,7 +779,11 @@ pub fn register_received_coins(
         Ok(coins.0)
     })?;
 
-    Ok(Response::new().add_attribute("action", "steakhub/register_received_coins"))
+    let mut response = Response::new().add_attribute("action", "steakhub/register_received_coins");
+    if unparsed > 0 {
+        response = response.add_attribute("unparsed_coin_received", unparsed.to_string());
+    }
+    Ok(response)
 }
 
 fn parse_coin_receiving_event(env: &Env, event: &Event) -> StdResult<Coins> {
@@ -496,8 +801,26 @@ fn parse_coin_receiving_event(env: &Env, event: &Event) -> StdResult<Coins> {
         .ok_or_else(|| StdError::generic_err("cannot find `amount` attribute"))?
         .value;
 
+    // Parse coin by coin: an amount like `12uxyz,3<denom the parser rejects>` must still record
+    // the native 12 rather than drop the whole event.
     let amount = if *receiver == env.contract.address {
-        Coins::from_str(amount_str)?
+        match Coins::from_str(amount_str) {
+            Ok(coins) => coins,
+            Err(err) => {
+                let mut coins = Coins(vec![]);
+                let mut parsed_any = false;
+                for part in amount_str.split(',') {
+                    if let Ok(coin) = Coins::from_str(part.trim()) {
+                        coins.add_many(&coin)?;
+                        parsed_any = true;
+                    }
+                }
+                if !parsed_any {
+                    return Err(err);
+                }
+                coins
+            },
+        }
     } else {
         Coins(vec![])
     };
@@ -574,6 +897,40 @@ pub fn submit_batch_deferred(reply: cosmwasm_std::Reply) -> Response {
         .add_event(Event::new("steakhub/submit_batch_deferred").add_attribute("reason", reason))
 }
 
+/// Reply for each undelegation `SubmitBatch` sends. The staking module reports when the unbonding
+/// actually completes (`unbond` event, `completion_time`); that, not `submit time +
+/// unbond_period`, is when the funds arrive. Set the batch's `est_unbond_end_time` to the latest
+/// completion among its undelegations, so a configured `unbond_period` that differs from the
+/// chain's cannot make `Reconcile` write the batch down before its funds are paid (or keep them
+/// waiting longer than needed). If the chain reports no completion time, the estimate stays.
+pub fn register_undelegation(deps: DepsMut, env: Env, reply: Reply) -> StdResult<Response> {
+    let events = match reply.result {
+        SubMsgResult::Ok(response) => response.events,
+        SubMsgResult::Err(err) => return Err(StdError::generic_err(err)),
+    };
+    let mut response = Response::new();
+    if let Some(completion) = latest_unbond_completion(&events) {
+        let (batch_id, seen) = SUBMITTED_BATCH.load(deps.storage)?;
+        let completion = seen.map_or(completion, |seen| seen.max(completion));
+        SUBMITTED_BATCH.save(deps.storage, &(batch_id, Some(completion)))?;
+        CHAIN_REPORTED_END.save(deps.storage, batch_id, &true)?;
+        let mut batch = State::default().previous_batches.load(deps.storage, batch_id)?;
+        if batch.est_unbond_end_time != completion {
+            response = response.add_event(
+                Event::new("steakhub/unbond_completion_time")
+                    .add_attribute("id", batch_id.to_string())
+                    .add_attribute("estimated", batch.est_unbond_end_time.to_string())
+                    .add_attribute("completion_time", completion.to_string()),
+            );
+            batch.est_unbond_end_time = completion;
+            State::default().previous_batches.save(deps.storage, batch_id, &batch)?;
+        }
+    }
+    // Undelegating also withdraws the delegation's pending rewards; register them as usual.
+    let registered = register_received_coins(deps, env, events)?;
+    Ok(response.add_attributes(registered.attributes))
+}
+
 pub fn submit_batch(deps: DepsMut, env: Env) -> StdResult<Response> {
     let state = State::default();
     let denom = state.denom.load(deps.storage)?;
@@ -629,13 +986,11 @@ pub fn submit_batch(deps: DepsMut, env: Env) -> StdResult<Response> {
         usteak_to_burn: Uint128::zero(),
         est_unbond_start_time: current_time + epoch_period,
     })?;
-    state
-        .prev_denom
-        .save(deps.storage, &get_denom_balance(&deps.querier, env.contract.address, denom)?)?;
 
+    SUBMITTED_BATCH.save(deps.storage, &(pending_batch.id, None))?;
     let undelegate_submsgs = new_undelegations
         .iter()
-        .map(|d| SubMsg::reply_on_success(d.to_cosmos_msg(), REPLY_REGISTER_RECEIVED_COINS))
+        .map(|d| SubMsg::reply_on_success(d.to_cosmos_msg(), REPLY_UNDELEGATE))
         .collect::<Vec<_>>();
 
     let event = Event::new("steakhub/unbond_submitted")
@@ -775,6 +1130,7 @@ pub fn reconcile(mut deps: DepsMut, env: Env) -> StdResult<Response> {
         batch.reconciled = true;
         state.previous_batches.save(deps.storage, batch.id, batch)?;
         RECONCILE_OBSERVED_HEIGHTS.remove(deps.storage, batch.id);
+        CHAIN_REPORTED_END.remove(deps.storage, batch.id);
     }
     let newly_reserved: Uint128 = batches.iter().map(|b| b.amount_unclaimed).sum();
     let native_reserved = native_reserved.checked_add(newly_reserved)?;
@@ -999,6 +1355,7 @@ pub(crate) fn advance_reserve_initialization(
             if !batch.reconciled {
                 batch.reconciled = true;
                 RECONCILE_OBSERVED_HEIGHTS.remove(deps.storage, batch.id);
+                CHAIN_REPORTED_END.remove(deps.storage, batch.id);
             }
             state.previous_batches.save(deps.storage, batch.id, &batch)?;
         }
@@ -1206,7 +1563,6 @@ pub fn withdraw_unbonded(
 
 pub fn rebalance(deps: DepsMut, env: Env, minimum: Uint128) -> StdResult<Response> {
     let state = State::default();
-    let denom = state.denom.load(deps.storage)?;
     //let validators = state.validators.load(deps.storage)?;
     let validators_active = state.validators_active.load(deps.storage)?;
     if validators_active.is_empty() {
@@ -1217,10 +1573,6 @@ pub fn rebalance(deps: DepsMut, env: Env, minimum: Uint128) -> StdResult<Respons
 
     let new_redelegations =
         compute_redelegations_for_rebalancing(validators_active, &delegations, minimum);
-
-    state
-        .prev_denom
-        .save(deps.storage, &get_denom_balance(&deps.querier, env.contract.address, denom)?)?;
 
     let redelegate_submsgs = new_redelegations
         .iter()
@@ -1343,13 +1695,6 @@ pub fn redelegate_inactive(
         .sum();
     let planned_total: u128 = new_redelegations.iter().map(|rd| rd.amount).sum();
 
-    if !new_redelegations.is_empty() {
-        state.prev_denom.save(
-            deps.storage,
-            &get_denom_balance(&deps.querier, env.contract.address.clone(), denom)?,
-        )?;
-    }
-
     let mut submsgs = Vec::with_capacity(new_redelegations.len());
     let mut events = Vec::with_capacity(new_redelegations.len() + 1);
     for (index, rd) in new_redelegations.iter().enumerate() {
@@ -1452,10 +1797,6 @@ pub fn remove_validator(
         query_delegation(&deps.querier, &validator, &env.contract.address, &denom)?;
     let new_redelegations =
         compute_redelegations_for_removal(&delegation_to_remove, &delegations, &denom);
-
-    state
-        .prev_denom
-        .save(deps.storage, &get_denom_balance(&deps.querier, env.contract.address, denom)?)?;
 
     let redelegate_submsgs = new_redelegations
         .iter()
@@ -1698,10 +2039,6 @@ pub fn redelegate(
             .to_cosmos_msg(),
         REPLY_REGISTER_RECEIVED_COINS,
     );
-
-    state
-        .prev_denom
-        .save(deps.storage, &get_denom_balance(&deps.querier, env.contract.address, denom)?)?;
 
     let event = Event::new("steak/redelegate")
         .add_attribute("validator_from", validator_from)

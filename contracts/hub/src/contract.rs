@@ -25,6 +25,8 @@ pub const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const REPLY_INSTANTIATE_TOKEN: u64 = 1;
 pub const REPLY_REGISTER_RECEIVED_COINS: u64 = 2;
 pub const REPLY_SUBMIT_BATCH: u64 = 3;
+/// Each undelegation `SubmitBatch` sends; its reply carries the real unbonding completion time.
+pub const REPLY_UNDELEGATE: u64 = 5;
 /// `RedelegateInactive` uses one reply id per planned redelegation, starting here, so the reply
 /// handler can say which redelegation the staking module refused.
 pub const REPLY_REDELEGATE_INACTIVE_BASE: u64 = 1_000;
@@ -93,6 +95,15 @@ pub fn execute(deps: DepsMut, env: Env, info: MessageInfo, msg: ExecuteMsg) -> S
             validator_from,
             validator_to,
         } => execute::redelegate(deps, env, info.sender, validator_from, validator_to),
+        ExecuteMsg::ReinvestIdle {
+            amount,
+        } => {
+            // Attached funds would count as idle and be swept (and locked) with it.
+            if !info.funds.is_empty() {
+                return Err(StdError::generic_err("ReinvestIdle does not accept funds"));
+            }
+            execute::reinvest_idle(deps, env, info.sender, amount)
+        },
         ExecuteMsg::RedelegateInactive {
             limit,
             exclude,
@@ -212,11 +223,12 @@ pub fn reply(deps: DepsMut, env: Env, reply: Reply) -> StdResult<Response> {
             execute::register_received_coins(deps, env, unwrap_reply(reply)?.events)
         },
         REPLY_SUBMIT_BATCH => Ok(execute::submit_batch_deferred(reply)),
+        REPLY_UNDELEGATE => execute::register_undelegation(deps, env, reply),
         id if is_redelegate_inactive_reply(id) => {
             execute::redelegate_inactive_reply(deps, env, reply)
         },
         id => Err(StdError::generic_err(format!(
-            "invalid reply id: {}; must be 1-3 or a redelegate-inactive id",
+            "invalid reply id: {}; must be 1-3, 5 or a redelegate-inactive id",
             id
         ))),
     }
@@ -227,6 +239,7 @@ pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
     match msg {
         QueryMsg::Config {} => to_json_binary(&queries::config(deps)?),
         QueryMsg::State {} => to_json_binary(&queries::state(deps, env)?),
+        QueryMsg::IdleFunds {} => to_json_binary(&execute::idle_native(deps, &env)?),
         QueryMsg::PendingBatch {} => to_json_binary(&queries::pending_batch(deps)?),
         QueryMsg::PreviousBatch(id) => to_json_binary(&queries::previous_batch(deps, id)?),
         QueryMsg::PreviousBatches {

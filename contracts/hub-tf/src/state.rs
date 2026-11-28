@@ -22,6 +22,15 @@ pub(crate) const RECONCILE_OBSERVED_HEIGHTS: Map<u64, u64> =
 /// unbond requests are never claimed. Initialised by `migrate`.
 pub(crate) const NATIVE_RESERVED: Item<Uint128> = Item::new("native_reserved_001");
 
+/// Derivative tokens the hub minted to itself at zero supply or while sweeping idle native. They
+/// are held by the hub and never redeemed; burning stray tokens must leave them alone.
+pub(crate) const DEAD_SHARES: Item<Uint128> = Item::new("dead_shares_001");
+
+/// Batches whose `est_unbond_end_time` came from the chain (the staking module's reported
+/// unbonding completion, see `register_undelegation`) rather than `submit time + unbond_period`.
+/// Only for those is "not yet past its end" proof that the funds have not arrived.
+pub(crate) const CHAIN_REPORTED_END: Map<u64, bool> = Map::new("chain_reported_end_001");
+
 /// Progress of the one-time, paginated initialisation of `NATIVE_RESERVED` (see
 /// `advance_reserve_initialization`). Removed once the reserve exists.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -61,6 +70,10 @@ pub(crate) const VALIDATORS_ACTIVE: Set<&str> =
     Set::new("validators_active_001", "validator_active_counter_001");
 
 // pub(crate) const BATCH_KEY_RECONCILED_V101: &str = "previous_batches__reconciled_101";
+
+/// The batch `SubmitBatch` is undelegating, and the latest unbonding completion time the staking
+/// module reported for it so far (see `register_undelegation`).
+pub(crate) const SUBMITTED_BATCH: Item<(u64, Option<u64>)> = Item::new("submitted_batch_001");
 
 pub(crate) struct State<'a> {
     /// Account who can call certain privileged functions

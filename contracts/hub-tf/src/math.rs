@@ -12,12 +12,24 @@ use crate::types::{Delegation, Redelegation, Undelegation};
 /// Compute the amount of Steak token to mint for a specific Luna stake amount. If current total
 /// staked amount is zero, we use 1 usteak = 1 native; otherwise, we calculate base on the current
 /// native per ustake ratio.
+///
+/// `pending_rewards` is the holders' share (after fee) of rewards earned but not yet restaked.
+/// It belongs to existing holders, so it is part of the backing a new bonder buys into; leaving
+/// it out would hand the bonder a cut of rewards earned before they arrived.
 pub(crate) fn compute_mint_amount(
     usteak_supply: Uint128,
     native_to_bond: Uint128,
     all_delegations: &[Delegation],
+    pending_rewards: Uint128,
 ) -> StdResult<Uint128> {
-    let native_bonded = total_delegated(all_delegations)?;
+    // With no supply there is nobody to price against: mint 1:1 regardless of any native the
+    // contract already holds (pricing against it would mint 0 for the first bonder).
+    if usteak_supply.is_zero() {
+        return Ok(native_to_bond);
+    }
+    let native_bonded = total_delegated(all_delegations)?
+        .checked_add(pending_rewards.u128())
+        .ok_or_else(|| StdError::generic_err("delegation total overflow"))?;
     if native_bonded == 0 {
         if usteak_supply.is_zero() {
             Ok(native_to_bond)
@@ -51,7 +63,62 @@ pub(crate) fn compute_unbond_amount(
         .map_err(|err| StdError::generic_err(format!("failed to compute unbond amount: {err}")))
 }
 
-fn total_delegated(delegations: &[Delegation]) -> StdResult<u128> {
+/// Derivative tokens locked in the hub, at least, when it mints at zero supply.
+pub(crate) const MIN_DEAD_SHARES: u128 = 1_000;
+
+/// The first mint at zero supply. There is no price to go by, so dead shares, minted to the hub
+/// itself and never redeemable, are locked alongside the bonder's: worth `existing_backing`
+/// (tracked stake or rewards left from earlier holders) so the bonder cannot claim what was
+/// already there, and at least `MIN_DEAD_SHARES`. Untracked idle is excluded: it receives
+/// proportional dead shares only if it is later swept into delegated backing. Whatever part of
+/// the minimum no existing backing covers comes out of the bonder's own mint, so the exchange
+/// rate stays exactly 1:1 and the bonder's cost is at most `MIN_DEAD_SHARES`; a deposit too small
+/// to cover it is refused.
+///
+/// Returns (minted to the bonder, dead shares).
+pub(crate) fn compute_first_mint(
+    native_to_bond: Uint128,
+    existing_backing: Uint128,
+) -> StdResult<(Uint128, Uint128)> {
+    let dead = existing_backing.max(Uint128::new(MIN_DEAD_SHARES));
+    let unbacked = dead - existing_backing;
+    if native_to_bond <= unbacked {
+        return Err(StdError::generic_err(format!(
+            "the first bond into an empty hub must exceed {} base units",
+            unbacked
+        )));
+    }
+    Ok((native_to_bond - unbacked, dead))
+}
+
+/// Shares to lock when idle native becomes delegated backing.
+///
+/// Idle is deliberately excluded from bond pricing because anyone can increase it with a plain
+/// transfer. Delegating it without increasing supply would nevertheless raise the exchange rate,
+/// letting a bonder immediately before the sweep capture some of it. Minting these shares to the
+/// hub keeps the priced backing per share from increasing. Round up so integer truncation cannot
+/// leave even a one-unit upward jump.
+pub(crate) fn compute_idle_sweep_shares(
+    share_supply: Uint128,
+    idle_to_delegate: Uint128,
+    tracked_backing: Uint128,
+) -> StdResult<Uint128> {
+    // With no supply there is nobody to front-run. With no tracked backing, public bonds are
+    // already refused, so the owner may use the sweep to restore backing without a cheap mint.
+    if share_supply.is_zero() || idle_to_delegate.is_zero() || tracked_backing.is_zero() {
+        return Ok(Uint128::zero());
+    }
+
+    let numerator = Uint256::from(share_supply).checked_mul(Uint256::from(idle_to_delegate))?;
+    let denominator = Uint256::from(tracked_backing);
+    let rounded_up = numerator
+        .checked_add(denominator.checked_sub(Uint256::from(1u128))?)?
+        .checked_div(denominator)?;
+    Uint128::try_from(rounded_up)
+        .map_err(|err| StdError::generic_err(format!("idle sweep share amount overflow: {err}")))
+}
+
+pub(crate) fn total_delegated(delegations: &[Delegation]) -> StdResult<u128> {
     delegations.iter().try_fold(0u128, |total, delegation| {
         total
             .checked_add(delegation.amount)
