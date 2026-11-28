@@ -117,7 +117,9 @@ pub enum ExecuteMsg {
     AcceptOwnership {},
     /// Claim staking rewards, swap all for Luna, and restake
     Harvest {},
-    /// Use redelegations to balance the amounts of Luna delegated to validators
+    /// Owner only. Use redelegations to even out stake across the active validators the chain has
+    /// bonded, draining paused, removed and unbonded validators. Each move is an isolated
+    /// submessage (refusals are reported as `steakhub/redelegation_skipped`); at most 50 per call.
     Rebalance {
         minimum: Uint128,
     },

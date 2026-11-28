@@ -264,83 +264,99 @@ pub(crate) fn compute_redelegations_for_inactive(
     new_redelegations
 }
 
-/// Compute redelegation moves that will make each validator's delegation the targeted amount
-/// (hopefully this sentence makes sense)
+/// Compute redelegation moves that even out stake across `targets`.
 ///
-/// This algorithm does not guarantee the minimal number of moves, but is the best I can some up
-/// with...
+/// Every delegation on a validator that is not a target (paused, removed, or not currently bonded
+/// on chain) is moved off in full. Each target is brought to `total / targets` (remainder to the
+/// first ones), counting targets that hold nothing yet. Moves into or out of a target smaller than
+/// `min_difference` are skipped; draining a non-target ignores it.
+///
+/// This does not guarantee the minimal number of moves.
 pub(crate) fn compute_redelegations_for_rebalancing(
-    validators_active: Vec<String>,
+    targets: Vec<String>,
     current_delegations: &[Delegation],
     min_difference: Uint128,
+    denom: &str,
 ) -> Vec<Redelegation> {
+    if targets.is_empty() {
+        return vec![];
+    }
     let native_staked: u128 = current_delegations.iter().map(|d| d.amount).sum();
-    let validator_count = validators_active.len() as u128;
-
+    let validator_count = targets.len() as u128;
     let native_per_validator = native_staked / validator_count;
     let remainder = native_staked % validator_count;
 
-    // If a validator's current delegated amount is greater than the target amount, native will be
-    // redelegated _from_ them. They will be put in `src_validators` vector
-    // If a validator's current delegated amount is smaller than the target amount, native will be
-    // redelegated _to_ them. They will be put in `dst_validators` vector
-    let mut src_delegations: Vec<Delegation> = vec![];
+    let mut src_delegations: Vec<Delegation> = current_delegations
+        .iter()
+        .filter(|d| d.amount > 0 && !targets.contains(&d.validator))
+        .cloned()
+        .collect();
+    let non_target_stake: u128 = src_delegations.iter().map(|d| d.amount).sum();
     let mut dst_delegations: Vec<Delegation> = vec![];
-    for (i, d) in current_delegations.iter().enumerate() {
-        let remainder_for_validator: u128 = u128::from((i + 1) as u128 <= remainder);
-        let native_for_validator = native_per_validator + remainder_for_validator;
-        // eprintln!("{} amount ={} native={} min={}", d.validator, d.amount, native_for_validator,
-        // min_difference);
-        match d.amount.cmp(&native_for_validator) {
-            Ordering::Greater => {
-                if d.amount - native_for_validator > min_difference.u128() {
-                    src_delegations.push(Delegation::new(
-                        &d.validator,
-                        d.amount - native_for_validator,
-                        &d.denom,
-                    ));
-                }
+    let mut small_dst_delegations: Vec<Delegation> = vec![];
+    let mut selected_destination_capacity = 0u128;
+    for (i, validator) in targets.iter().enumerate() {
+        let native_for_validator = native_per_validator + u128::from((i + 1) as u128 <= remainder);
+        let current: u128 = current_delegations
+            .iter()
+            .filter(|d| d.validator == *validator)
+            .map(|d| d.amount)
+            .sum();
+        match current.cmp(&native_for_validator) {
+            Ordering::Greater if current - native_for_validator > min_difference.u128() => {
+                src_delegations.push(Delegation::new(
+                    validator,
+                    current - native_for_validator,
+                    denom,
+                ));
             },
             Ordering::Less => {
-                if validators_active.contains(&d.validator)
-                    && native_for_validator - d.amount > min_difference.u128()
-                {
-                    dst_delegations.push(Delegation::new(
-                        &d.validator,
-                        native_for_validator - d.amount,
-                        &d.denom,
-                    ));
+                let deficit = native_for_validator - current;
+                let destination = Delegation::new(validator, deficit, denom);
+                if deficit > min_difference.u128() {
+                    selected_destination_capacity += deficit;
+                    dst_delegations.push(destination);
+                } else {
+                    small_dst_delegations.push(destination);
                 }
             },
-            Ordering::Equal => (),
+            _ => (),
         }
+    }
+
+    // Large destinations are enough in the usual case. If they cannot absorb all stake from
+    // non-target validators, admit only as many sub-threshold destinations as are needed to drain
+    // that mandatory source; the threshold still suppresses optional target-to-target dust.
+    for mut destination in small_dst_delegations {
+        if selected_destination_capacity >= non_target_stake {
+            break;
+        }
+        destination.amount =
+            destination.amount.min(non_target_stake - selected_destination_capacity);
+        selected_destination_capacity += destination.amount;
+        dst_delegations.push(destination);
     }
 
     let mut new_redelegations: Vec<Redelegation> = vec![];
     while !src_delegations.is_empty() && !dst_delegations.is_empty() {
-        let src_delegation = src_delegations[0].clone();
-        let dst_delegation = dst_delegations[0].clone();
-        let native_to_redelegate = cmp::min(src_delegation.amount, dst_delegation.amount);
-
-        if src_delegation.amount == native_to_redelegate {
+        let native_to_redelegate = cmp::min(src_delegations[0].amount, dst_delegations[0].amount);
+        new_redelegations.push(Redelegation::new(
+            &src_delegations[0].validator,
+            &dst_delegations[0].validator,
+            native_to_redelegate,
+            denom,
+        ));
+        if src_delegations[0].amount == native_to_redelegate {
             src_delegations.remove(0);
         } else {
             src_delegations[0].amount -= native_to_redelegate;
         }
-
-        if dst_delegation.amount == native_to_redelegate {
+        if dst_delegations[0].amount == native_to_redelegate {
             dst_delegations.remove(0);
         } else {
             dst_delegations[0].amount -= native_to_redelegate;
         }
-        new_redelegations.push(Redelegation::new(
-            &src_delegation.validator,
-            &dst_delegation.validator,
-            native_to_redelegate,
-            &src_delegation.denom,
-        ));
     }
-    // eprintln!("new redelegations ={:?}", new_redelegations);
 
     new_redelegations
 }

@@ -1329,15 +1329,15 @@ fn removing_validator() {
     assert_eq!(res.messages.len(), 2);
     assert_eq!(res.messages[0], SubMsg {
         msg: Redelegation::new("charlie", "alice", 170833, "uxyz").to_cosmos_msg(),
-        id: REPLY_REGISTER_RECEIVED_COINS,
+        id: REPLY_REDELEGATE_INACTIVE_BASE,
         gas_limit: None,
-        reply_on: ReplyOn::Success
+        reply_on: ReplyOn::Always
     },);
     assert_eq!(res.messages[1], SubMsg {
         msg: Redelegation::new("charlie", "bob", 170833, "uxyz").to_cosmos_msg(),
-        id: REPLY_REGISTER_RECEIVED_COINS,
+        id: REPLY_REDELEGATE_INACTIVE_BASE + 1,
         gas_limit: None,
-        reply_on: ReplyOn::Success
+        reply_on: ReplyOn::Always
     },);
 
     assert!(VALIDATORS.contains(deps.as_ref().storage, "alice"));
@@ -1762,7 +1762,8 @@ fn computing_redelegations_for_rebalancing() {
         compute_redelegations_for_rebalancing(
             active_validators,
             &current_delegations,
-            Uint128::from(10u64)
+            Uint128::from(10u64),
+            "uxyz",
         ),
         expected,
     );
@@ -1770,31 +1771,67 @@ fn computing_redelegations_for_rebalancing() {
     let partially_active =
         vec!["alice".to_string(), "charlie".to_string(), "dave".to_string(), "evan".to_string()];
 
+    // bob is not a target, so his 1234 is drained in full (it used to be left behind because it
+    // was below the per-validator target).
+    // per target = 202358 / 4 = 50589, remainder 2: alice 50590, charlie 50590, dave/evan 50589
+    // sources: bob 1234 (all), alice 18830, charlie 38298; destinations: dave 10118, evan 48244
     let partially_expected = vec![
-        Redelegation::new("alice", "dave", 10118, "uxyz"),
-        Redelegation::new("alice", "evan", 8712, "uxyz"),
-        Redelegation::new("charlie", "evan", 38299, "uxyz"),
+        Redelegation::new("bob", "dave", 1234, "uxyz"),
+        Redelegation::new("alice", "dave", 8884, "uxyz"),
+        Redelegation::new("alice", "evan", 9946, "uxyz"),
+        Redelegation::new("charlie", "evan", 38298, "uxyz"),
     ];
     assert_eq!(
         compute_redelegations_for_rebalancing(
             partially_active.clone(),
             &current_delegations,
-            Uint128::from(10u64)
+            Uint128::from(10u64),
+            "uxyz",
         ),
         partially_expected,
     );
 
+    // dave's 10118 shortfall is under the minimum, so only evan receives; bob is still drained.
     let partially_expected_minimums = vec![
+        Redelegation::new("bob", "evan", 1234, "uxyz"),
         Redelegation::new("alice", "evan", 18830, "uxyz"),
-        Redelegation::new("charlie", "evan", 29414, "uxyz"),
+        Redelegation::new("charlie", "evan", 28180, "uxyz"),
     ];
     assert_eq!(
         compute_redelegations_for_rebalancing(
             partially_active,
             &current_delegations,
-            Uint128::from(15_000u64)
+            Uint128::from(15_000u64),
+            "uxyz",
         ),
         partially_expected_minimums,
+    );
+
+    // A target with no delegation at all is topped up too.
+    assert_eq!(
+        compute_redelegations_for_rebalancing(
+            vec!["alice".to_string(), "frank".to_string()],
+            &[Delegation::new("alice", 1000, "uxyz")],
+            Uint128::zero(),
+            "uxyz",
+        ),
+        vec![Redelegation::new("alice", "frank", 500, "uxyz")],
+    );
+
+    // The threshold may suppress target-to-target dust, but it must not strand a non-target. The
+    // only destination is short by one, below the threshold of ten.
+    assert_eq!(
+        compute_redelegations_for_rebalancing(
+            vec!["alice".to_string(), "bob".to_string()],
+            &[
+                Delegation::new("alice", 100, "uxyz"),
+                Delegation::new("bob", 100, "uxyz"),
+                Delegation::new("charlie", 1, "uxyz"),
+            ],
+            Uint128::new(10),
+            "uxyz",
+        ),
+        vec![Redelegation::new("charlie", "alice", 1, "uxyz")],
     );
 }
 
@@ -3883,4 +3920,193 @@ fn reinvest_idle_refuses_attached_funds() {
     )
     .unwrap_err();
     assert_eq!(err, StdError::generic_err("ReinvestIdle does not accept funds"));
+}
+
+#[test]
+fn bonding_and_reinvesting_skip_validators_that_are_not_bonded() {
+    let mut deps = setup_test();
+    let state = State::default();
+    deps.querier.set_staking_delegations(&[
+        Delegation::new("alice", 300, "uxyz"),
+        Delegation::new("bob", 100, "uxyz"),
+        Delegation::new("charlie", 200, "uxyz"),
+    ]);
+    state.steak_minted.save(deps.as_mut().storage, &Uint128::new(600)).unwrap();
+    // bob has the smallest delegation but is jailed (not in the chain's bonded set).
+    deps.querier.set_bonded_validators(&["alice", "charlie"]);
+    deps.querier.set_bank_balances(&[Coin::new(1000, "uxyz")]);
+
+    let res = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info("user_1", &[Coin::new(1000, "uxyz")]),
+        ExecuteMsg::Bond {
+            receiver: None,
+            exec_msg: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(res.messages[0].msg, Delegation::new("charlie", 1000, "uxyz").to_cosmos_msg());
+
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![Coin::new(100, "uxyz")]).unwrap();
+    let res = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info(MOCK_CONTRACT_ADDR, &[]),
+        ExecuteMsg::Callback(CallbackMsg::Reinvest {}),
+    )
+    .unwrap();
+    assert_eq!(res.messages[0].msg, Delegation::new("charlie", 90, "uxyz").to_cosmos_msg());
+}
+
+#[test]
+fn rebalancing_is_owner_only_drains_unbonded_and_isolates_moves() {
+    let mut deps = setup_test();
+    deps.querier.set_staking_delegations(&[
+        Delegation::new("alice", 100, "uxyz"),
+        Delegation::new("bob", 300, "uxyz"),
+        Delegation::new("charlie", 200, "uxyz"),
+    ]);
+    deps.querier.set_bonded_validators(&["alice", "bob"]);
+
+    let err = execute(deps.as_mut(), mock_env(), mock_info("jake", &[]), ExecuteMsg::Rebalance {
+        minimum: Uint128::zero(),
+    })
+    .unwrap_err();
+    assert_eq!(err, StdError::generic_err("unauthorized: sender is not owner"));
+
+    // charlie is active but not bonded: drained. Targets alice and bob get 300 each.
+    let res = execute(deps.as_mut(), mock_env(), mock_info("larry", &[]), ExecuteMsg::Rebalance {
+        minimum: Uint128::zero(),
+    })
+    .unwrap();
+    assert_eq!(res.messages, vec![SubMsg {
+        id: REPLY_REDELEGATE_INACTIVE_BASE,
+        msg: Redelegation::new("charlie", "alice", 200, "uxyz").to_cosmos_msg(),
+        gas_limit: None,
+        reply_on: ReplyOn::Always,
+    }]);
+    assert!(res.events.iter().any(|e| e.ty == "steakhub/redelegation_planned"));
+}
+
+#[test]
+fn removing_validator_redelegates_only_to_bonded_active_validators() {
+    let mut deps = setup_test();
+    deps.querier.set_bonded_validators(&["alice", "bob", "charlie"]);
+    execute(deps.as_mut(), mock_env(), mock_info("larry", &[]), ExecuteMsg::PauseValidator {
+        validator: "bob".to_string(),
+    })
+    .unwrap();
+    deps.querier.set_staking_delegations(&[
+        Delegation::new("alice", 100, "uxyz"),
+        Delegation::new("bob", 100, "uxyz"),
+        Delegation::new("charlie", 300, "uxyz"),
+    ]);
+
+    // bob is paused, so all of charlie's stake goes to alice.
+    let res =
+        execute(deps.as_mut(), mock_env(), mock_info("larry", &[]), ExecuteMsg::RemoveValidator {
+            validator: "charlie".to_string(),
+        })
+        .unwrap();
+    assert_eq!(res.messages.len(), 1);
+    assert_eq!(
+        res.messages[0].msg,
+        Redelegation::new("charlie", "alice", 300, "uxyz").to_cosmos_msg()
+    );
+}
+
+#[test]
+fn staking_operations_fail_closed_when_no_active_validator_is_bonded() {
+    let mut deps = setup_test();
+    let state = State::default();
+    deps.querier.set_staking_delegations(&[
+        Delegation::new("alice", 300, "uxyz"),
+        Delegation::new("bob", 100, "uxyz"),
+        Delegation::new("charlie", 200, "uxyz"),
+    ]);
+    state.steak_minted.save(deps.as_mut().storage, &Uint128::new(600)).unwrap();
+    deps.querier.set_bonded_validators(&[]);
+    deps.querier.set_bank_balances(&[Coin::new(1000, "uxyz")]);
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![]).unwrap();
+    let expected = StdError::generic_err("cannot send stake without a bonded active validator");
+
+    let bond_err = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info("user_1", &[Coin::new(1000, "uxyz")]),
+        ExecuteMsg::Bond {
+            receiver: None,
+            exec_msg: None,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(bond_err, expected);
+
+    let idle_err =
+        execute(deps.as_mut(), mock_env(), mock_info("larry", &[]), ExecuteMsg::ReinvestIdle {
+            amount: Some(Uint128::new(1)),
+        })
+        .unwrap_err();
+    assert_eq!(idle_err, expected);
+
+    let rebalance_err =
+        execute(deps.as_mut(), mock_env(), mock_info("larry", &[]), ExecuteMsg::Rebalance {
+            minimum: Uint128::zero(),
+        })
+        .unwrap_err();
+    assert_eq!(rebalance_err, expected);
+
+    // Use fresh state because unit-test storage does not model transaction rollback after the
+    // removal mutates the validator sets and then discovers there is no safe destination.
+    let mut remove_deps = setup_test();
+    remove_deps.querier.set_bonded_validators(&[]);
+    // charlie holds stake that would need a destination.
+    remove_deps.querier.set_staking_delegations(&[Delegation::new("charlie", 200, "uxyz")]);
+    let remove_err = execute(
+        remove_deps.as_mut(),
+        mock_env(),
+        mock_info("larry", &[]),
+        ExecuteMsg::RemoveValidator {
+            validator: "charlie".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(remove_err, expected);
+}
+
+#[test]
+fn removing_a_validator_without_stake_needs_no_bonded_destination() {
+    let mut deps = setup_test();
+    // Nothing bonded on chain, and charlie holds nothing: there is nothing to move, so the
+    // removal goes through.
+    deps.querier.set_bonded_validators(&[]);
+    deps.querier.set_staking_delegations(&[]);
+    let res =
+        execute(deps.as_mut(), mock_env(), mock_info("larry", &[]), ExecuteMsg::RemoveValidator {
+            validator: "charlie".to_string(),
+        })
+        .unwrap();
+    assert!(res.messages.is_empty());
+}
+
+#[test]
+fn returned_dust_is_recorded_when_no_validator_is_bonded() {
+    let mut deps = setup_test();
+    let state = State::default();
+    state.unlocked_coins.save(deps.as_mut().storage, &vec![]).unwrap();
+    deps.querier.set_bonded_validators(&[]);
+    // The dust collector hands back swapped dust while every active validator is jailed: it is
+    // recorded for the next harvest instead of reverting the dust return.
+    let res = execute(
+        deps.as_mut(),
+        mock_env(),
+        mock_info("dust_collector", &[Coin::new(77, "uxyz")]),
+        ExecuteMsg::ReturnDenom {},
+    )
+    .unwrap();
+    assert!(res.messages.is_empty());
+    assert_eq!(state.unlocked_coins.load(deps.as_ref().storage).unwrap(), vec![Coin::new(
+        77, "uxyz"
+    )]);
 }
